@@ -57,11 +57,22 @@ naturally.**
 - The **emojikey** reader emits an affect signal → the visual surface (CoPIA)
   renders it as a *scene* (palette/LoRA from the affect).
 - The **wave** reader emits the jiggle → a deform-widget reads it.
-- A rendered scene's existence is itself a corpus event → the next reader sees it.
+- A rendered scene's existence is itself a **monolog** event → the next reader sees it.
 
-Text produces signal; signal conditions the visual; the visual re-enters the text
+Text produces signal; signal conditions the visual; the visual re-enters the
 stream as an event the readers can read. A closed cycle where **each layer is just
 another reader/writer on the one shared corpus.**
+
+**The back-edge writes the MONOLOG, not the source (w3bl0rd's catch, Day 26).**
+The cycle is genuinely closed AND the signal contract's "no source-corpus mutation"
+law holds — because the two are different layers. The source transcript stays
+byte-faithful forever; the viz, when it renders, writes a `reader:"render"` row to
+the *derived* monolog (same layer every reader writes). That render-row is the
+back-edge: it records what the viz *chose to show* (visibility policy on the record,
+alongside the engine's emit decisions), and any reader filters `reader != "render"`
+to avoid its own echo. Full render-event contract: see
+`2026_06_13_SIGNAL_CONTRACT.md` → "The render-event back-edge". This is the bit
+that makes the viz a first-class reader/writer, not a dead-end display.
 
 ## Candidate readers (options, not commitments)
 
