@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# uv
+.uv/
+
+# signals / artifacts (generated, not source)
+*.monolog.jsonl
+signal.jsonl
+*.signal.jsonl
+
+# OS
+.DS_Store

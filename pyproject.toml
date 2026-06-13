@@ -1,0 +1,26 @@
+[project]
+name = "weave"
+version = "0.1.0"
+description = "The semantic-wave engine behind CoPIA's alive-text interface — diff-over-shape, shape-provider-agnostic."
+readme = "README.md"
+authors = [
+    { name = "spaceGOAT", email = "spacegoatai@gmail.com" },
+    { name = "w3bl0rd" },
+    { name = "LSPy" },
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+# Shape-provider arms are optional installs so the engine core never hard-depends
+# on a heavy embedding/graph stack. Pick the arm(s) you're calibrating.
+embedding = [
+    "sentence-transformers>=3.0",
+]
+amr = [
+    "amrlib>=0.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"
