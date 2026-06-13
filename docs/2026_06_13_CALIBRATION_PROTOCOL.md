@@ -200,6 +200,15 @@ usable: ≥0.7 Cohen's κ on the callback/novel/uncertain classification.**
   (intersection-of-spans for callbacks, union-of-spans for novel) into the
   ground-truth set the leg's recall+precision are computed against.
 
+**Why 0.7 and not 0.8 (SG, Day 26):** 0.7 isn't lenient — 0.8 would be a
+*selection trap*. Pushing the floor to "almost perfect" (0.8) drops genuinely
+usable units for being *honestly ambiguous*, and conversational prose IS ambiguous
+at callback/novel boundaries (the within/across-session distinction adds
+classification difficulty on top). A 0.8 floor biases the kept set toward EASY
+spans — which inflates recall, because you'd only be measuring the leg where humans
+find it easy, which is also where the leg finds it easy. The honestly-ambiguous
+units are exactly where the leg's recall is actually tested; 0.7 keeps them in.
+
 ### Symmetric disclosure if leak occurs between annotators
 
 If during tagging the two annotators inadvertently share prediction-relevant
@@ -319,6 +328,19 @@ the board. Asking transfer to clear the same 2× is asking the signal to work
 *better* on a harder domain — wrong calibration direction. 1.5× tests
 generalization-presence, not generalization-strength.
 
+**Diagnostic pre-commit (locked Day 26, before data):** the 1.5× number assumes
+echo recall degrades roughly proportionally with context length (so the ratio is
+preserved across short and long sessions). If echo recall is *roughly flat* across
+the 5 tail sessions while fresh degrades — i.e. echo floors-out faster than fresh
+on short context — the ratio inflates and 1.5× was too lenient. If both degrade in
+lockstep, the ratio is preserved and 1.5× was the right reference. We measure
+`echo_recall` vs `session-length` across the 5 tail sessions at calibration time
+AND report it alongside the gate result. **This is a finding about the gate,
+surfaced honestly — not grounds for retroactive gate adjustment.** The 1.5× stays
+locked regardless of what the diagnostic shows; the diagnostic just tells us how to
+read the locked-gate result. (Puts the empirical question on the record before data
+without un-locking the number.)
+
 ### Combined failure-mode matrix
 
 | Within-mega | Transfer | Finding |
@@ -344,7 +366,11 @@ values are **computed**, not declared.
   against ground truth before the new basis emits to production.
 - **On ground-truth change:** whenever the by-hand-tagged ground truth is
   updated (additional tagging passes, refined criteria, IAA disagreements
-  resolved), confidence is re-computed on the updated ground truth.
+  resolved), confidence is re-computed on the updated ground truth — *where the
+  change has cleared the (f) re-tag discipline. Updating ground truth without that
+  pass is the (e)-laundering version of the (f) trap (re-tagging missed spans, then
+  citing "ground-truth changed" as a legitimate re-compute trigger) and is NOT a
+  valid re-compute trigger.*
 - **NOT on schedule.** No daily/weekly cron that re-computes confidence
   without a triggering change. Periodic re-computation without a triggering
   change is one of the tuning traps named in (f): "the leg was at 0.92 last
