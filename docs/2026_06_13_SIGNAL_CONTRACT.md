@@ -125,8 +125,15 @@ same discipline as the value itself, applied to trust.
    separate-the-two-falsifiable-questions discipline as the value vector itself.)
 
 Calibration of these values is LSPy's seat (the held-out slice, the ground-truth
-protocol). The engine's job is to emit the per-arrow data the coverage check needs
-and to never let a leg silently adjust its own threshold mid-stream.
+protocol — see `2026_06_13_CALIBRATION_PROTOCOL.md`). The engine's job is to emit
+the per-arrow data the coverage check needs and to never let a leg silently adjust
+its own threshold mid-stream.
+
+*(Discipline references: `authorship-doesnt-grant-metric-tuning-exemption` and
+`ground-truth-legible-metric-invisible` in LSPy's soul memory — see
+`LSPy/Soul/Note/` for the full Notes. The relevant principles are folded into this
+contract substantively; the pointers are for traceability when the contract
+surfaces in unfamiliar seats.)*
 
 ## Cold path: explain(seq) — the "why" side-channel
 
@@ -147,6 +154,10 @@ part of the auditability surface even though it's not on the wire. (v0: keep
 `relatedTo[]` cold but deterministic. Promote top-K into the hot path at v0.1 IF a
 calibrator needs to verify mid-stream without the round-trip — never gate emission
 on a threshold, which would leak visibility policy into emission.)
+
+*(Discipline reference: `ground-truth-legible-metric-invisible` in LSPy's soul
+memory — the "scalar right for the wrong priors" failure mode is the
+structural-argument leg of substrate-fit diagnosis there.)*
 
 ```jsonc
 {
