@@ -102,7 +102,7 @@ is tracked separately (#140); it is listed here for completeness.
 | detector | signal | needs (paired detector / backend) | effort | quality | status |
 |---|---|---|---|---|---|
 | **emotion (transformer)** | Ekman-6 / GoEmotions-27, contextual | `j-hartmann/emotion-english-distilroberta` (~82M, CPU-OK but model dep) | **MED** | MED-HIGH | catalog |
-| **GLiNER2 (entities + class + schema-fill)** | zero-shot NER + classification + structured extraction in one model | GLiNER2 (DeBERTa-v3 encoder); CPU-capable; **Rust/ONNX path `gline-rs`** | **MED** | HIGH | catalog — *adell/lupov spiking the Rust port now* |
+| **GLiNER2 (entities + class + schema-fill)** | zero-shot NER + classification + structured extraction in one *schema-driven* pass | GLiNER2 (DeBERTa-v3 encoder); CPU-capable. Rust schema path = `paul-english/gliner2_rs` (Candle). NB: `gline-rs` (ONNX/ort) is **orig GLiNER, flat labels only** — faster but no relations | **MED** | HIGH | catalog — *adell/lupov running it live (Candle, relations + know.dev IRIs)* |
 | **emojikey (generative)** | MINT a `ME\|CONTENT\|YOU` key for a span that has none | small LLM (Qwen3/Haiku) + constrained JSON | **MED-HIGH** | MED | catalog (pleeb's automated-emojikey-agent idea) |
 | **small-LLM zero-shot tagger** | arbitrary tags via prompt→JSON (intent, custom signals) | local LLM + XGrammar, or hosted API | **LOW (API) – HIGH (self-host)** | MED (LOW-MED for nuanced emotion) | catalog |
 | **episodic / visual scene** | time-anchored scene-ref (feeds CoPIA palette/LoRA) | Qwen3-VL via shared `mlx_vlm.server` | **HIGH** | HIGH | partly live (subtexture observer wires Qwen) |
@@ -156,8 +156,12 @@ the cute names for the surface.
 - **Opt-in (SPECIFIC):** emotion-transformer, GLiNER2, generative-emojikey,
   episodic-scene — added per soul/repo that wants them and can run the backend.
 - **The migration goal:** stand up a **central detection server** so the
-  highest-value SPECIFIC detectors (GLiNER2 especially — adell/lupov's Rust port is
-  the live path) become squad-wide defaults without every soul pinning a model.
+  highest-value SPECIFIC detectors (GLiNER2 especially — adell/lupov run it live in
+  Rust/Candle with relations) become squad-wide defaults without every soul pinning
+  a model. (Backend durability note: the GLiNER2 *schema* in Rust currently means
+  one young Candle crate; a GLiNER2 ONNX export exists but its multitask-head
+  support over `ort` is unverified — ONNX is the long-term hedge, Candle is
+  working-now.)
 
 The monolog is the same for all of them: one `{reader, anchor, signal}` row per
 emission, one log per transcript, joinable back to byte-faithful source. A new
