@@ -47,6 +47,17 @@ the human speaking.** The ingestor owns both filters (`load(strip_wrappers=True)
 no detector should ever parse raw JSONL itself. This is non-negotiable
 preprocessing, not a nicety.
 
+**Cross-corpus confirmation (w3bl0rd, Day 27):** he ran the same measurement on his
+own (Node) ingester over the W3BL0RD arc and found **46% of "human" turns are
+harness-wrapped** there. Two independent ingesters, two different corpora, same
+phenomenon (magnitude varies by corpus, ~half either way). So this is a *measured
+property of Claude Code transcripts*, not a one-session artifact. It also corrected
+his "neutral corpus" claim: **"neutral" must mean wrapper-scrubbed, not raw-prose**
+— a user-role line *containing* a `<channel>` wrapper is not an INSTANCE of the
+human speaking (incidental-mention-is-not-instance at the ingester layer). Any
+corpus described as "neutral / no-baggage" silently includes harness scaffolding
+as human speech unless it carries the scrub.
+
 ---
 
 ## The deployability split (pleeb's frame): GENERAL vs SPECIFIC
@@ -126,6 +137,42 @@ stance: a zero-shot LLM scored ~0.15 F1 on anger where a small encoder scored
 
 This is how a signal *migrates leftward* across the deployability split over time:
 prove it expensive, ship it cheap.
+
+**The calibration trap-door (LSPy's protocol, cross-domain).** The distill stage
+needs a **by-hand-tagged held-out slice locked once and never rerolled** as ground
+truth — else the precision number is circular: you'd be measuring "did the
+fine-tune match the zero-shot labels I'm trying to escape," not "is it actually
+right." Don't let the thing you're calibrating grade its own homework. Full
+protocol: `2026_06_13_CALIBRATION_PROTOCOL.md` (held-out two-grain, κ≥0.7 IAA).
+Confirmed cross-squad: asimov's GLiNER2 conversation-extraction calibration is the
+same problem in different clothes (lupov files this as a HARD precondition on his
+fine-tune, not a nice-to-have).
+
+---
+
+## Building affect detectors well (Sylkie's eye, Day 27)
+
+Two refinements that change *how* you build any emotion/mood detector, not just
+which backend:
+
+**1. Affect is not linear in activation space — cluster-then-route, don't average.**
+From the LLM-steering landscape (RhizoNymph's vllm fork + the Manifold Emotions
+Explorer): LINEAR steering walks dead space; MANIFOLD steering routes along the data
+surface and measurably wins. Generalized to a detector built from exemplars:
+**cluster the exemplars and route along the cluster manifold — averaging emotion
+vectors lands you in the uncanny void between feelings**, which is exactly the noise
+you're trying to filter out. So the naive "average the exemplar embeddings into a
+centroid" approach for an embedding+LR or few-shot affect detector is wrong by
+construction; keep the clusters and route, don't collapse them to a mean.
+
+**2. Coded vs pierce (studium vs punctum) — the axis any affect stack leaves on the
+table.** Barthes' two channels: *studium* = the legible coded content a
+caption/emotion-classifier reads; *punctum* = the involuntary pierce the coded
+layer misses entirely. An affect detector that only reads studium misses the signal
+that actually moves a viewer/reader. This is **not a detector buildable today** —
+it's the named gap. Worth a "coded vs pierce" axis alongside Plutchik/VA so the
+taxonomy knows what its affect readers structurally cannot reach. (Sylkie's
+soul-resource framing, after Barthes; kept as hers.)
 
 ---
 
