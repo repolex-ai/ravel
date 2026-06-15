@@ -1,0 +1,194 @@
+"""Tests for the transcript ingester (src/weave/ingest).
+
+Synthetic fixtures only — no dependency on any private corpus, so this runs
+anywhere. Each test pins one layer's behavior.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from weave.ingest import (
+    load,
+    extract_prose_blocks,
+    strip_harness_wrappers,
+    iter_raw_lines,
+)
+
+
+# --- fixture builders -------------------------------------------------------
+
+def _line(**kw) -> str:
+    return json.dumps(kw)
+
+
+def _user_text(text, uuid, parent=None, ts="2026-06-15T00:00:00Z") -> str:
+    return _line(type="user", uuid=uuid, parentUuid=parent, timestamp=ts,
+                 message={"role": "user", "content": text})
+
+
+def _user_blocks(blocks, uuid, parent=None) -> str:
+    return _line(type="user", uuid=uuid, parentUuid=parent,
+                 message={"role": "user", "content": blocks})
+
+
+def _asst_blocks(blocks, uuid, parent=None) -> str:
+    return _line(type="assistant", uuid=uuid, parentUuid=parent,
+                 message={"role": "assistant", "content": blocks})
+
+
+@pytest.fixture
+def transcript(tmp_path) -> Path:
+    """A small transcript exercising every line/block type."""
+    p = tmp_path / "session.jsonl"
+    lines = [
+        # noise line-types that must be dropped wholesale
+        _line(type="system", subtype="meta", uuid="sys1"),
+        _line(type="permission-mode", permissionMode="default"),
+        _line(type="file-history-snapshot", messageId="m1", snapshot={}),
+        # real human turn (string content)
+        _user_text("hello goat", uuid="u1"),
+        # assistant turn with a text block AND a tool_use block (drop the tool_use)
+        _asst_blocks(
+            [{"type": "text", "text": "on it"},
+             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}],
+            uuid="a1", parent="u1",
+        ),
+        # "user" line that is actually a tool_result (drop it entirely)
+        _user_blocks(
+            [{"type": "tool_result", "tool_use_id": "x", "content": "file1\nfile2"}],
+            uuid="u2", parent="a1",
+        ),
+        # human turn whose text is ENTIRELY a harness-injected peer message
+        _user_text('<channel source="plugin:subtext:subtext" from_id="zzz">hi</channel>',
+                   uuid="u3"),
+        # human turn: real prose with a trailing system-reminder to scrub
+        _user_text("do the thing\n<system-reminder>ctx</system-reminder>", uuid="u4"),
+        # empty assistant text block (drop — nothing said)
+        _asst_blocks([{"type": "text", "text": "   "}], uuid="a2"),
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+# --- layer 1: raw read ------------------------------------------------------
+
+def test_iter_raw_tolerates_torn_trailing_line(tmp_path):
+    p = tmp_path / "torn.jsonl"
+    p.write_text(_user_text("ok", "u1") + "\n" + '{"type":"user","message":{"rol',
+                 encoding="utf-8")
+    objs = list(iter_raw_lines(p))
+    assert len(objs) == 1  # the half-written line is skipped, not fatal
+    assert objs[0]["uuid"] == "u1"
+
+
+def test_iter_raw_skips_blank_lines(tmp_path):
+    p = tmp_path / "blanks.jsonl"
+    p.write_text("\n\n" + _user_text("hi", "u1") + "\n\n", encoding="utf-8")
+    assert len(list(iter_raw_lines(p))) == 1
+
+
+# --- layer 2: structural filter ---------------------------------------------
+
+def test_extract_drops_non_prose_line_types():
+    assert extract_prose_blocks({"type": "system"}) == []
+    assert extract_prose_blocks({"type": "queue-operation"}) == []
+    assert extract_prose_blocks({"type": "attachment"}) == []
+
+
+def test_extract_keeps_text_drops_tool_use():
+    obj = json.loads(_asst_blocks(
+        [{"type": "text", "text": "hi"},
+         {"type": "tool_use", "name": "X", "input": {}}],
+        uuid="a1"))
+    blocks = extract_prose_blocks(obj)
+    assert len(blocks) == 1
+    assert blocks[0]["voice"] == "assistant"
+    assert blocks[0]["text"] == "hi"
+
+
+def test_extract_drops_tool_result_user_line():
+    obj = json.loads(_user_blocks(
+        [{"type": "tool_result", "tool_use_id": "x", "content": "out"}], uuid="u1"))
+    assert extract_prose_blocks(obj) == []
+
+
+def test_extract_string_content_is_human_prose():
+    obj = json.loads(_user_text("hello", "u1", parent="p0"))
+    blocks = extract_prose_blocks(obj)
+    assert blocks == [{"voice": "human", "text": "hello", "src_uuid": "u1",
+                       "turn_id": "p0", "ts": "2026-06-15T00:00:00Z"}]
+
+
+# --- layer 3: content filter ------------------------------------------------
+
+def test_strip_channel_block():
+    t = '<channel source="x" from_id="y">peer said hi</channel>'
+    assert strip_harness_wrappers(t) == ""
+
+
+def test_strip_keeps_real_prose_around_reminder():
+    t = "do the thing\n<system-reminder>injected ctx</system-reminder>"
+    assert strip_harness_wrappers(t) == "do the thing"
+
+
+def test_strip_command_wrappers_and_caveat():
+    t = ("Caveat: The messages below were generated by the user\n"
+         "<command-name>/compact</command-name>\nactual content")
+    out = strip_harness_wrappers(t)
+    assert "Caveat" not in out
+    assert "command-name" not in out
+    assert "actual content" in out
+
+
+# --- layer 4: load (full + append) ------------------------------------------
+
+def test_load_structural_only(transcript):
+    recs = list(load(transcript))
+    # u1(human), a1.text(asst), u3(human-but-channel-kept-as-text), u4(human)
+    # u2 tool_result dropped, a2 empty dropped, all noise types dropped
+    texts = [(r.voice, r.text) for r in recs]
+    assert ("human", "hello goat") in texts
+    assert ("assistant", "on it") in texts
+    assert ("human", "do the thing\n<system-reminder>ctx</system-reminder>") in texts
+    # structural filter does NOT scrub: the channel turn survives as raw text
+    assert any("channel" in t for _, t in texts)
+    # seq contiguous
+    assert [r.seq for r in recs] == list(range(len(recs)))
+
+
+def test_load_with_wrapper_scrub_drops_pure_injection(transcript):
+    plain = list(load(transcript))
+    scrubbed = list(load(transcript, strip_wrappers=True))
+    # the wholly-channel human turn (u3) disappears under scrub
+    assert len(scrubbed) == len(plain) - 1
+    assert not any("channel" in r.text for r in scrubbed)
+    # the mixed turn (u4) survives, reminder gone
+    assert any(r.text == "do the thing" for r in scrubbed)
+    # seq re-contiguous over the scrubbed stream
+    assert [r.seq for r in scrubbed] == list(range(len(scrubbed)))
+
+
+def test_load_append_after_uuid(transcript):
+    recs = list(load(transcript))
+    anchor = recs[1].src_uuid  # after the 2nd prose record
+    tail = list(load(transcript, after=anchor))
+    assert len(tail) == len(recs) - 2
+    # tail seq restarts at 0 (anchor is the filtered stream, fresh numbering)
+    assert tail[0].seq == 0
+
+
+def test_load_append_unknown_uuid_yields_all(transcript):
+    """Safety: an unmatched anchor yields the whole file, never silently empty."""
+    recs = list(load(transcript))
+    tail = list(load(transcript, after="does-not-exist"))
+    assert len(tail) == len(recs)
+
+
+def test_poserecord_repr_is_compact(transcript):
+    rec = next(iter(load(transcript)))
+    r = repr(rec)
+    assert "PoseRecord" in r and "seq=" in r
