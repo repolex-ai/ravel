@@ -17,6 +17,7 @@ are catalogued in the taxonomy and added as the calibration warrants.
 from __future__ import annotations
 
 from .base import Reader
+from .cadence import CadenceReader
 from .emojikey import EmojikeyReader
 
-__all__ = ["Reader", "EmojikeyReader"]
+__all__ = ["Reader", "CadenceReader", "EmojikeyReader"]
