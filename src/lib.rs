@@ -12,7 +12,9 @@
 //! to pass as `partition` — the engine is invariant under it.
 
 pub mod adapter;
+pub mod annotate;
 pub mod project;
+pub mod reader;
 
 /// A generic transcript event — the engine's unit. Dialect-agnostic.
 #[derive(Debug, Clone)]
