@@ -20,6 +20,13 @@ embedding = [
 amr = [
     "amrlib>=0.8",
 ]
+# The RDF projection arm: project a .monolog.jsonl into RDF 1.2 N-Triples and
+# bulk-load it for SPARQL cross-reader queries. Optional because the monolog
+# hot path (JSONL) never needs a triple store — the graph is a derived cache.
+# pyoxigraph 0.5.x speaks RDF 1.2 triple terms natively (verified on 0.5.6).
+graph = [
+    "pyoxigraph>=0.5.6",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.15,<0.12.0"]

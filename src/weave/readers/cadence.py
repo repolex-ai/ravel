@@ -130,6 +130,7 @@ class CadenceReader:
     def read(self, records: Iterable[PoseRecord]) -> Iterator[MonologRow]:
         prev_ts: Optional[datetime] = None
         prev_voice: Optional[str] = None
+        prev_seq: Optional[int] = None
 
         for rec in records:
             cur_ts = _parse_ts(rec.ts)
@@ -142,9 +143,28 @@ class CadenceReader:
             voice_switch = prev_voice is not None and rec.voice != prev_voice
 
             text = rec.text
+            # what was looked at (prov:used): this record always; the PREVIOUS
+            # record too whenever a relational fact was computed from it — so the
+            # provenance honestly reflects the relational legs, not just the turn.
+            evidence_seqs = [rec.seq]
+            if prev_seq is not None and (latency_s is not None or prev_voice is not None):
+                evidence_seqs.insert(0, prev_seq)
+
             yield MonologRow(
                 reader=self.name,
-                anchor={"seq": rec.seq, "src_uuid": rec.src_uuid},
+                event_type="rhythm/turn",
+                ts=rec.ts or "",
+                # whole-turn anchor: cadence reads the entire record, so the span
+                # is the full prose (0..len) — the oa:TextPositionSelector covers
+                # the turn, not a substring.
+                anchor={
+                    "seq": rec.seq,
+                    "src_uuid": rec.src_uuid,
+                    "turn_id": rec.turn_id,
+                    "start": 0,
+                    "end": len(text),
+                },
+                evidence={"seqs": evidence_seqs},
                 signal={
                     "voice": rec.voice,
                     "words": len(text.split()),
@@ -162,3 +182,4 @@ class CadenceReader:
             if cur_ts is not None:
                 prev_ts = cur_ts
             prev_voice = rec.voice
+            prev_seq = rec.seq

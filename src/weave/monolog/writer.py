@@ -29,23 +29,59 @@ def monolog_path(transcript_path: str | Path) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class MonologRow:
-    """One signal emission. `anchor`/`signal` are reader-defined shapes."""
+    """One signal emission — a structured-log envelope around a reader's finding.
+
+    The shape is deliberately the OpenTelemetry-log / Elastic-Common-Schema
+    posture: a small stable envelope + an open per-reader payload. Each field
+    maps cleanly onto a W3C vocab when the monolog is projected to RDF (see
+    docs + the graph/ projector):
+
+      - `reader`     the detector's discriminator      -> prov:SoftwareAgent
+      - `event_type` what specifically fired (ECS       -> the asserted finding's
+                     event.action, e.g. "rhythm/burst")    predicate/type
+      - `ts`         ISO-8601 emit time                 -> prov:generatedAtTime
+      - `anchor`     WHERE in the source (the locator)  -> oa:hasTarget +
+                     {seq, src_uuid, turn_id, start, end}   oa:TextPositionSelector
+      - `evidence`   WHAT was looked at to decide       -> prov:used
+      - `signal`     the reader's payload (the finding) -> oa:hasBody
+
+    Only `reader`, `anchor`, `signal` are required — `event_type`, `ts`, and
+    `evidence` default empty and are OMITTED from the JSON when unset, so the
+    artifact stays minimal and OLD rows / OLD readers round-trip unchanged
+    (lossless-emit discipline: a reader emits the facts it has, nothing faked).
+    """
 
     reader: str
     anchor: dict[str, Any]
     signal: Any
+    event_type: str = ""
+    ts: str = ""
+    evidence: Any = None
 
     def to_json(self) -> str:
-        # compact, stable key order so rows diff cleanly and grep predictably
+        # compact, stable key order so rows diff cleanly and grep predictably.
+        # Envelope fields are emitted only when set, so the row never carries
+        # empty "event_type":"" noise and pre-envelope rows stay byte-identical.
+        obj: dict[str, Any] = {"reader": self.reader}
+        if self.event_type:
+            obj["event_type"] = self.event_type
+        if self.ts:
+            obj["ts"] = self.ts
+        obj["anchor"] = self.anchor
+        if self.evidence is not None:
+            obj["evidence"] = self.evidence
+        obj["signal"] = self.signal
         return json.dumps(
-            {"reader": self.reader, "anchor": self.anchor, "signal": self.signal},
-            ensure_ascii=False, separators=(",", ":"), sort_keys=False,
+            obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False,
         )
 
     @classmethod
     def from_obj(cls, obj: dict) -> "MonologRow":
         return cls(reader=obj["reader"], anchor=obj.get("anchor", {}),
-                   signal=obj.get("signal"))
+                   signal=obj.get("signal"),
+                   event_type=obj.get("event_type", ""),
+                   ts=obj.get("ts", ""),
+                   evidence=obj.get("evidence"))
 
 
 @dataclass
@@ -63,9 +99,16 @@ class Monolog:
         """Buffer a row. Call `flush()` to persist (one open per batch)."""
         self._rows.append(row)
 
-    def emit(self, reader: str, anchor: dict[str, Any], signal: Any) -> None:
-        """Convenience: build + buffer a row in one call."""
-        self.append(MonologRow(reader=reader, anchor=anchor, signal=signal))
+    def emit(self, reader: str, anchor: dict[str, Any], signal: Any,
+             *, event_type: str = "", ts: str = "", evidence: Any = None) -> None:
+        """Convenience: build + buffer a row in one call.
+
+        Envelope fields (`event_type`/`ts`/`evidence`) are keyword-only and
+        optional so the 3-arg call site stays valid; a reader fills them in when
+        it has them.
+        """
+        self.append(MonologRow(reader=reader, anchor=anchor, signal=signal,
+                               event_type=event_type, ts=ts, evidence=evidence))
 
     def flush(self) -> int:
         """Append all buffered rows to the file. Returns count written."""

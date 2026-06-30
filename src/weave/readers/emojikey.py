@@ -62,9 +62,24 @@ class EmojikeyReader:
         for rec in records:
             for m in _KEY.finditer(rec.text):
                 raw = m.group(0)
+                # span of the matched key WITHIN the record's prose — becomes the
+                # oa:TextPositionSelector start/end when projected to RDF. This is
+                # a genuine sub-record locator (emojikey is the one reader that
+                # matches a precise substring), so we carry it honestly.
+                start, end = m.span()
                 yield MonologRow(
                     reader=self.name,
-                    anchor={"seq": rec.seq, "src_uuid": rec.src_uuid},
+                    event_type="emojikey/harvest",
+                    ts=rec.ts or "",
+                    anchor={
+                        "seq": rec.seq,
+                        "src_uuid": rec.src_uuid,
+                        "turn_id": rec.turn_id,
+                        "start": start,
+                        "end": end,
+                    },
+                    # what was looked at to decide (prov:used): this record's text.
+                    evidence={"seq": rec.seq, "src_uuid": rec.src_uuid},
                     signal={
                         "raw": raw,
                         "me": m.group("me"),
