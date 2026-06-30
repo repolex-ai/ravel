@@ -14,3 +14,6 @@ signal.jsonl
 
 # OS
 .DS_Store
+
+# Rust
+/target
