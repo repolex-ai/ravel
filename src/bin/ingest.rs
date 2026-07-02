@@ -6,28 +6,53 @@
 //! query and prints what it found — the "see graphs of sessions" payoff.
 //!
 //! Run:
-//!   cargo run --bin weave-ingest -- <store-dir> <sessions-dir> [--authored-only]
+//!   cargo run --bin weave-ingest -- <store-dir> <sessions-dir> <soul-repo> [--authored-only]
 //!
 //! e.g.
 //!   cargo run --bin weave-ingest -- /tmp/weave-store \
-//!       ~/.claude/projects/-Users-dev-repos-SQUAD-spaceGOAT
+//!       ~/.claude/projects/-Users-dev-repos-SQUAD-spaceGOAT \
+//!       ~/repos/SQUAD/spaceGOAT
+//!
+//! The <soul-repo> supplies the REAL federation soul-sha (its `.lex/identity.yml`
+//! genesis_sha, resolved the SAME way Pool resolves it) — so the Turn subjects
+//! this mints carry the `urn:soul:<sha>:` prefix that cross-joins with Pool's
+//! Moments. No demo string.
 //!
 //! Idempotent: re-running over the same sessions replaces each session's graph
 //! in place (deterministic IRIs + per-transcript named-graph clear-on-reload).
 
 use anyhow::{Context, Result};
-use weave::{adapter, graph, reader};
+use std::path::Path;
+use weave::{adapter, graph, reader, soul};
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let store_dir = args.next().context("usage: weave-ingest <store-dir> <sessions-dir> [--authored-only]")?;
-    let sessions_dir = args.next().context("missing <sessions-dir>")?;
-    let authored_only = args.any(|a| a == "--authored-only");
+    let mut positional = Vec::new();
+    let mut authored_only = false;
+    for a in std::env::args().skip(1) {
+        if a == "--authored-only" {
+            authored_only = true;
+        } else {
+            positional.push(a);
+        }
+    }
+    let mut positional = positional.into_iter();
+    let store_dir = positional
+        .next()
+        .context("usage: weave-ingest <store-dir> <sessions-dir> <soul-repo> [--authored-only]")?;
+    let sessions_dir = positional.next().context("missing <sessions-dir>")?;
+    let soul_repo = positional
+        .next()
+        .context("missing <soul-repo> — the soul whose sessions these are (its .lex/identity.yml supplies the federation soul-sha)")?;
 
     let store = graph::open(&store_dir)?;
-    // Partition mirrors Pool's urn:soul:<sha>: shape; opaque to the engine. In a
-    // real soul adapter this is the soul sha; here one demo partition for the box.
-    let partition = "urn:soul:demo-ingest-sha:Weave/Turn/";
+    // The soul-adapter mints the REAL partition from the soul repo's pinned
+    // genesis sha (`.lex/identity.yml`), the SAME mechanism Pool uses — so Weave
+    // Turn subjects share the `urn:soul:<sha>:` prefix with Pool Moments and the
+    // cross-store join is trivial. No more demo string.
+    let partition = soul::soul_partition(Path::new(&soul_repo))
+        .with_context(|| format!("resolve soul partition from {soul_repo}"))?;
+    let partition = partition.as_str();
+    println!("[soul] federation partition: {partition}");
 
     // --- walk the session logs ---
     let mut sessions = 0usize;
@@ -54,7 +79,7 @@ fn main() -> Result<()> {
             continue;
         }
         let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
-        let n = graph::ingest_annotations(&store, &anns, transcript_id, partition)?;
+        let n = graph::ingest_annotations(&store, &events, &anns, transcript_id, partition)?;
         sessions += 1;
         total_keys += anns.len();
         println!(

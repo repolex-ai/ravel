@@ -16,6 +16,7 @@ pub mod annotate;
 pub mod graph;
 pub mod project;
 pub mod reader;
+pub mod soul;
 
 /// A generic transcript event — the engine's unit. Dialect-agnostic.
 #[derive(Debug, Clone)]

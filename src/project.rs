@@ -40,6 +40,22 @@ pub fn validate_event_id(event_id: &str) -> Result<()> {
 /// duplicates — the w4r3z idempotency discipline, at the triple level.
 pub fn project(events: &[Event], partition: &str) -> Result<Store> {
     let store = Store::new()?;
+    store.load_from_reader(
+        oxigraph::io::RdfFormat::NTriples,
+        project_nt(events, partition)?.as_bytes(),
+    )?;
+    Ok(store)
+}
+
+/// Project events to N-Triples (the Turn nodes: type, role, spine, timestamp,
+/// text). Exposed alongside `annotate::annotation_nt` so the persistent-graph
+/// ingest can load the Turn NODES into the same named graph as the annotations
+/// that reference them — without this, an annotation's soul-prefixed
+/// `weave:atEvent` / `prov:used` anchor points at a Turn that was never minted,
+/// and the federation TIME anchor (`weave:timestamp` xsd:dateTime) is absent, so
+/// a soul+time cross-store join has soul but not time. The Turn node is what
+/// carries the time half of the anchor contract.
+pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
     let mut nt = String::new();
 
     let turn_class = format!("{WEAVE_NS}Turn");
@@ -76,8 +92,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
         }
     }
 
-    store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
-    Ok(store)
+    Ok(nt)
 }
 
 /// N-Triples-escape a string and wrap as a plain literal.

@@ -20,8 +20,9 @@
 //!    on the same soul URN. The engine never invents it.
 
 use crate::annotate::annotation_nt;
+use crate::project::project_nt;
 use crate::reader::Annotation;
-use crate::WEAVE_NS;
+use crate::{Event, WEAVE_NS};
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphNameRef, NamedNode};
@@ -48,13 +49,22 @@ pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
         .with_context(|| format!("open read-only oxigraph store at {}", path.as_ref().display()))
 }
 
-/// Ingest one transcript's annotations into its named graph, idempotently.
+/// Ingest one transcript's Turn nodes AND its annotations into its named graph,
+/// idempotently.
+///
+/// Both halves go into the same graph on purpose: the annotations carry
+/// soul-prefixed `weave:atEvent` / `prov:used` references to Turn IRIs, and the
+/// Turn NODES carry the federation TIME anchor (`weave:timestamp` xsd:dateTime).
+/// Ingesting annotations alone would leave those references dangling and the
+/// soul+time cross-store join would have soul but not time — verified the hard
+/// way (a fed-probe found 32 soul-prefixed anchors but 0 actual Turn nodes).
 ///
 /// Clears the transcript's named graph first (so a dropped key doesn't ghost),
 /// then loads the freshly-projected N-Triples INTO that named graph via
 /// `with_default_graph`. Returns the triple count now in that graph.
 pub fn ingest_annotations(
     store: &Store,
+    events: &[Event],
     anns: &[Annotation],
     transcript_id: &str,
     partition: &str,
@@ -65,8 +75,19 @@ pub fn ingest_annotations(
     // (1)+(2): wipe this transcript's graph so re-ingest is a clean replace.
     store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
 
-    // project to N-Triples, retarget into the named graph on load.
-    let nt = annotation_nt(anns, transcript_id, partition)?;
+    // Turn nodes (the time anchor) + annotations (the signal), same graph. Only
+    // project events that an annotation actually references, so the store stays
+    // annotation-scoped — but every referenced Turn is present with its timestamp.
+    let referenced: std::collections::HashSet<&str> =
+        anns.iter().map(|a| a.event_id.as_str()).collect();
+    let anchor_events: Vec<Event> = events
+        .iter()
+        .filter(|e| referenced.contains(e.event_id.as_str()))
+        .cloned()
+        .collect();
+
+    let mut nt = project_nt(&anchor_events, partition)?;
+    nt.push_str(&annotation_nt(anns, transcript_id, partition)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
     store.flush()?;
@@ -182,14 +203,28 @@ mod tests {
     fn triple_term_survives_named_graph_and_reingest_is_idempotent() {
         let store = Store::new().unwrap(); // in-memory is the same API as on-disk
         let part = "urn:soul:test-sha:Weave/Turn/";
-        let anns = emojikey_read(&[ev("e1", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored)]);
+        let evs = vec![ev("e1", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored)];
+        let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1);
 
         // ingest twice — idempotent: triple count stable, no duplication.
-        let n1 = ingest_annotations(&store, &anns, "sess-A", part).unwrap();
-        let n2 = ingest_annotations(&store, &anns, "sess-A", part).unwrap();
+        let n1 = ingest_annotations(&store, &evs, &anns, "sess-A", part).unwrap();
+        let n2 = ingest_annotations(&store, &evs, &anns, "sess-A", part).unwrap();
         assert!(n1 > 0);
         assert_eq!(n1, n2, "re-ingest must not change the graph (idempotent)");
+
+        // the referenced Turn NODE must be present with its time anchor — else
+        // the soul+time federation join has soul but not time (the dangling-Turn
+        // bug this ingest fixes).
+        let turn_q = format!(
+            r#"PREFIX weave: <{WEAVE_NS}>
+               PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+               ASK {{ GRAPH ?g {{ ?t rdf:type weave:Turn ; weave:timestamp ?ts .
+                      FILTER(STRSTARTS(STR(?t), "urn:soul:test-sha:")) }} }}"#
+        );
+        let ask = SparqlEvaluator::new().parse_query(&turn_q).unwrap().on_store(&store).execute().unwrap();
+        assert!(matches!(ask, QueryResults::Boolean(true)),
+            "the soul-prefixed Turn node with its timestamp must be in the graph");
 
         // GOTCHA #2: the triple term must be readable THROUGH the named graph.
         let hits = query_emojikeys(&store, None).unwrap();
@@ -207,10 +242,12 @@ mod tests {
     fn two_sessions_accumulate_and_are_separable() {
         let store = Store::new().unwrap();
         let part = "urn:soul:test-sha:Weave/Turn/";
-        let a = emojikey_read(&[ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)]);
-        let b = emojikey_read(&[ev("e2", "[ME|x]~[CONTENT|y]~[YOU|z]", SourceKind::ToolResult)]);
-        ingest_annotations(&store, &a, "sess-A", part).unwrap();
-        ingest_annotations(&store, &b, "sess-B", part).unwrap();
+        let eva = vec![ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)];
+        let evb = vec![ev("e2", "[ME|x]~[CONTENT|y]~[YOU|z]", SourceKind::ToolResult)];
+        let a = emojikey_read(&eva);
+        let b = emojikey_read(&evb);
+        ingest_annotations(&store, &eva, &a, "sess-A", part).unwrap();
+        ingest_annotations(&store, &evb, &b, "sess-B", part).unwrap();
 
         let all = query_emojikeys(&store, None).unwrap();
         assert_eq!(all.len(), 2, "two sessions accumulate in one store");
