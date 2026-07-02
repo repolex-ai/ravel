@@ -12,7 +12,7 @@
 //! reader that matches a precise SUBSTRING, so its annotation gets a true
 //! `oa:TextPositionSelector` span — exercising the span-anchor path end to end.
 
-use crate::Event;
+use crate::{Event, SourceKind};
 use std::collections::BTreeMap;
 
 /// One finding: a detector observed a signal anchored to a span of one event.
@@ -32,6 +32,10 @@ pub struct Annotation {
     /// Sub-event span [start, end) in the event's text — a true locator.
     pub start: usize,
     pub end: usize,
+    /// Where in the source the match landed: AUTHORED (live emission) vs
+    /// TOOL_RESULT (quoted/pasted). None when the adapter didn't record
+    /// provenance. Carried, never dropped — downstream filters, not the reader.
+    pub source_kind: Option<SourceKind>,
     /// The signal payload: the verbatim finding, lossless. Ordered for stable IRIs.
     pub signal: BTreeMap<String, String>,
 }
@@ -69,6 +73,8 @@ pub fn emojikey_read(events: &[Event]) -> Vec<Annotation> {
                 event_id: e.event_id.clone(),
                 start,
                 end,
+                // classify by where the match STARTS (its origin block)
+                source_kind: e.source_kind_at(start),
                 signal,
             });
             // advance past this match so overlapping starts can't loop forever
@@ -172,12 +178,15 @@ mod tests {
     use super::*;
 
     fn ev(text: &str) -> Event {
+        // whole-text authored provenance, so source_kind resolves in tests
+        let span = crate::TextSpan { start: 0, end: text.len(), kind: SourceKind::Authored };
         Event {
             event_id: "e1".into(),
             parent_id: None,
             role: "assistant".into(),
             timestamp: Some("2026-06-30T00:00:00Z".into()),
             text: Some(text.into()),
+            text_provenance: vec![span],
         }
     }
 

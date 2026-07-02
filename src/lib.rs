@@ -29,6 +29,52 @@ pub struct Event {
     pub timestamp: Option<String>,
     /// The text content of this event, if any (concatenated text blocks).
     pub text: Option<String>,
+    /// Provenance map over `text`: which byte range came from which kind of
+    /// content block. Lossless-emit discipline — a reader that matches a span
+    /// looks up its `SourceKind` here, so downstream can tell an AUTHORED
+    /// emission from one merely QUOTED inside a tool result. Empty when unknown.
+    pub text_provenance: Vec<TextSpan>,
+}
+
+/// Where a slice of an event's concatenated `text` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// First-class authored prose: the human's typed message, the assistant's
+    /// text blocks. A signal found here is a LIVE emission.
+    Authored,
+    /// Text pasted back from a tool call (tool_result). A signal found here was
+    /// QUOTED, not emitted — e.g. an emojikey inside a pasted DB dump.
+    ToolResult,
+}
+
+impl SourceKind {
+    /// Stable lowercase tag for RDF projection (`weave:sourceKind "authored"`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            SourceKind::Authored => "authored",
+            SourceKind::ToolResult => "tool_result",
+        }
+    }
+}
+
+/// A `[start, end)` byte range within an event's `text`, tagged with its origin.
+#[derive(Debug, Clone, Copy)]
+pub struct TextSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SourceKind,
+}
+
+impl Event {
+    /// The `SourceKind` covering a byte offset in `text`, if provenance is known.
+    /// A match's `start` is used to classify it. Returns None when provenance is
+    /// empty (unknown) or the offset falls outside every recorded span.
+    pub fn source_kind_at(&self, offset: usize) -> Option<SourceKind> {
+        self.text_provenance
+            .iter()
+            .find(|s| offset >= s.start && offset < s.end)
+            .map(|s| s.kind)
+    }
 }
 
 /// The engine namespace for the weave ontology.

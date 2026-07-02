@@ -48,6 +48,8 @@ fn ann_hash(transcript_id: &str, a: &Annotation) -> String {
     h.update([0]);
     h.update(a.start.to_le_bytes());
     h.update(a.end.to_le_bytes());
+    h.update([0]);
+    h.update(a.source_kind.map(|k| k.tag()).unwrap_or("").as_bytes());
     // signal is a BTreeMap → stable iteration order → stable hash
     for (k, v) in &a.signal {
         h.update([0]);
@@ -96,6 +98,12 @@ pub fn project_annotations(
         triple(&mut nt, iri(&ann_iri), iri(&format!("{WEAVE_NS}eventType")), str_lit(&ann.event_type));
         if let Some(ts) = &ann.ts {
             triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}generatedAtTime")), typed_lit(ts, &format!("{XSD}dateTime")));
+        }
+        // provenance: was the signal AUTHORED (live emission) or found inside a
+        // TOOL_RESULT (quoted/pasted)? Carried on the annotation so a query can
+        // filter to live keys — the lossless-emit decision (don't drop at read).
+        if let Some(sk) = ann.source_kind {
+            triple(&mut nt, iri(&ann_iri), iri(&format!("{WEAVE_NS}sourceKind")), str_lit(sk.tag()));
         }
 
         // --- target: a span of the source. Matches the proven Python shape:
@@ -186,12 +194,14 @@ mod tests {
     use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
     fn ev(id: &str, text: &str) -> Event {
+        let span = crate::TextSpan { start: 0, end: text.len(), kind: crate::SourceKind::Authored };
         Event {
             event_id: id.into(),
             parent_id: None,
             role: "assistant".into(),
             timestamp: Some("2026-06-30T12:00:00Z".into()),
             text: Some(text.into()),
+            text_provenance: vec![span],
         }
     }
 

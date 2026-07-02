@@ -31,7 +31,14 @@ fn main() -> Result<()> {
 
     // --- reader: a REAL, proven reader. Harvest inline emojikeys. ---
     let anns = reader::emojikey_read(&events);
-    println!("[reader:emojikey] harvested {} emojikey(s)", anns.len());
+    let authored = anns.iter().filter(|a| a.source_kind == Some(weave::SourceKind::Authored)).count();
+    let quoted = anns.iter().filter(|a| a.source_kind == Some(weave::SourceKind::ToolResult)).count();
+    println!(
+        "[reader:emojikey] harvested {} emojikey(s)  ({} authored / {} quoted-in-tool-result)",
+        anns.len(),
+        authored,
+        quoted
+    );
     if anns.is_empty() {
         println!("(no emojikeys in this transcript — try one where the agent emits [ME|…]~[CONTENT|…]~[YOU|…])");
         return Ok(());
@@ -60,11 +67,12 @@ fn main() -> Result<()> {
         PREFIX weave: <{WEAVE_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         PREFIX oa: <{oa}>
-        SELECT ?det ?me ?content ?you ?start ?end WHERE {{
+        SELECT ?det ?me ?content ?you ?start ?end ?sk WHERE {{
             ?claim rdf:reifies <<( ?ann weave:exhibits "emojikey/harvest" )>> ;
                    weave:detector ?det .
             ?ann oa:hasBody ?body ;
                  oa:hasTarget ?t .
+            OPTIONAL {{ ?ann weave:sourceKind ?sk }}
             ?body weave:sig_me ?me ; weave:sig_content ?content ; weave:sig_you ?you .
             ?t oa:hasSelector ?sel .
             ?sel oa:start ?start ; oa:end ?end .
@@ -84,8 +92,10 @@ fn main() -> Result<()> {
         let sol = sol?;
         n += 1;
         let g = |k: &str| sol.get(k).map(|t| t.to_string()).unwrap_or_default();
+        let sk = g("sk");
+        let sk = if sk.is_empty() { "?".to_string() } else { unq(&sk) };
         println!(
-            "  ✓ emojikey {n}: [ME|{}]~[CONTENT|{}]~[YOU|{}]  span={}..{}  via {}",
+            "  ✓ emojikey {n} [{sk}]: [ME|{}]~[CONTENT|{}]~[YOU|{}]  span={}..{}  via {}",
             unq(&g("me")),
             unq(&g("content")),
             unq(&g("you")),
