@@ -66,7 +66,7 @@ pub fn ingest_annotations(
     store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
 
     // project to N-Triples, retarget into the named graph on load.
-    let nt = annotation_nt(anns, transcript_id, partition);
+    let nt = annotation_nt(anns, transcript_id, partition)?;
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
     store.flush()?;

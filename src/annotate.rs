@@ -80,7 +80,7 @@ pub fn project_annotations(
     partition: &str,
 ) -> Result<Store> {
     let store = Store::new()?;
-    let nt = annotation_nt(anns, transcript_id, partition);
+    let nt = annotation_nt(anns, transcript_id, partition)?;
     store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
     Ok(store)
 }
@@ -88,11 +88,22 @@ pub fn project_annotations(
 /// Build the N-Triples for a set of annotations (no store). Split out so the
 /// persistent-graph arm can retarget these into a per-transcript NAMED graph via
 /// `RdfParser::with_default_graph` — same triples, different graph home.
-pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) -> String {
+pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) -> Result<String> {
     let mut nt = String::new();
 
     let a_type = format!("{RDF}type");
     for ann in anns {
+        // Fail loud on an empty event_id: it would silently mint the bare
+        // partition prefix as the event IRI and reify a claim about a
+        // non-thing — a well-formed graph anchored to nothing. The adapter
+        // must never produce this; if it does, the run stops here, not in a
+        // downstream query returning wrong-but-plausible joins.
+        if ann.event_id.trim().is_empty() {
+            anyhow::bail!(
+                "annotation from reader '{}' (type '{}', span {}..{}) has an empty event_id — refusing to mint a claim anchored to a non-event",
+                ann.reader, ann.event_type, ann.start, ann.end
+            );
+        }
         let h = ann_hash(transcript_id, ann);
         let ann_iri = format!("{WEAVE_NS}ann/{h}");
         let claim_iri = format!("{WEAVE_NS}claim/{h}");
@@ -165,7 +176,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detectionType")), str_lit(&ann.event_type));
     }
 
-    nt
+    Ok(nt)
 }
 
 // --- N-Triples term builders -------------------------------------------------
@@ -223,6 +234,19 @@ mod tests {
             text: Some(text.into()),
             text_provenance: vec![span],
         }
+    }
+
+    #[test]
+    fn empty_event_id_fails_loud() {
+        // the flinch test (w3bl0rd's audit, Day 41): an empty event_id must
+        // REFUSE, not silently mint a claim anchored to the bare partition
+        // prefix. Healthy annotations continue to project fine.
+        let mut anns = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
+        anns[0].event_id = "  ".into();
+        let Err(e) = project_annotations(&anns, "t", "urn:soul:x:Weave/Turn/") else {
+            panic!("empty event_id must refuse to project");
+        };
+        assert!(e.to_string().contains("empty event_id"));
     }
 
     #[test]
