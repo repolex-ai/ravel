@@ -73,6 +73,15 @@ pub fn project_annotations(
     partition: &str,
 ) -> Result<Store> {
     let store = Store::new()?;
+    let nt = annotation_nt(anns, transcript_id, partition);
+    store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
+    Ok(store)
+}
+
+/// Build the N-Triples for a set of annotations (no store). Split out so the
+/// persistent-graph arm can retarget these into a per-transcript NAMED graph via
+/// `RdfParser::with_default_graph` — same triples, different graph home.
+pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) -> String {
     let mut nt = String::new();
 
     let a_type = format!("{RDF}type");
@@ -144,8 +153,7 @@ pub fn project_annotations(
         triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detectionType")), str_lit(&ann.event_type));
     }
 
-    store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
-    Ok(store)
+    nt
 }
 
 // --- N-Triples term builders -------------------------------------------------

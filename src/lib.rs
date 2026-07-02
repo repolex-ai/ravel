@@ -13,6 +13,7 @@
 
 pub mod adapter;
 pub mod annotate;
+pub mod graph;
 pub mod project;
 pub mod reader;
 

@@ -20,6 +20,11 @@ path = "src/bin/spike.rs"
 name = "weave-emojikey"
 path = "src/bin/emojikey.rs"
 
+# Ingest many sessions into ONE persistent on-disk graph + query across them.
+[[bin]]
+name = "weave-ingest"
+path = "src/bin/ingest.rs"
+
 [dependencies]
 # Same store as Pool — rdf-12 for triple terms (squad standard, not RDF-star).
 oxigraph = { version = "0.5.6", features = ["rdf-12"] }
