@@ -93,17 +93,19 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
 
     let a_type = format!("{RDF}type");
     for ann in anns {
-        // Fail loud on an empty event_id: it would silently mint the bare
-        // partition prefix as the event IRI and reify a claim about a
-        // non-thing — a well-formed graph anchored to nothing. The adapter
-        // must never produce this; if it does, the run stops here, not in a
-        // downstream query returning wrong-but-plausible joins.
-        if ann.event_id.trim().is_empty() {
-            anyhow::bail!(
-                "annotation from reader '{}' (type '{}', span {}..{}) has an empty event_id — refusing to mint a claim anchored to a non-event",
+        // Fail loud on an empty or malformed event_id: empty would silently
+        // mint the bare partition prefix as the event IRI and reify a claim
+        // about a non-thing; malformed would embed IRI-breaking bytes. Five
+        // triples depend on this id (eventId, atEvent, prov:used, and the
+        // reified claim's subject) — the run stops here, not in a downstream
+        // query returning wrong-but-plausible joins. (w3bl0rd flinch-audit,
+        // Day 41: empty caught by SG, malformed layer caught by the audit.)
+        crate::project::validate_event_id(&ann.event_id).map_err(|e| {
+            anyhow::anyhow!(
+                "annotation from reader '{}' (type '{}', span {}..{}): {e}",
                 ann.reader, ann.event_type, ann.start, ann.end
-            );
-        }
+            )
+        })?;
         let h = ann_hash(transcript_id, ann);
         let ann_iri = format!("{WEAVE_NS}ann/{h}");
         let claim_iri = format!("{WEAVE_NS}claim/{h}");
@@ -247,6 +249,15 @@ mod tests {
             panic!("empty event_id must refuse to project");
         };
         assert!(e.to_string().contains("empty event_id"));
+        // malformed layer (the audit's catch): non-empty but IRI-unsafe must
+        // also refuse — VALIDATED, not mangled (mangling identity keys can
+        // collide two distinct ids into one IRI)
+        let mut bad = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
+        bad[0].event_id = "e 1<".into();
+        let Err(e2) = project_annotations(&bad, "t", "urn:soul:x:Weave/Turn/") else {
+            panic!("malformed event_id must refuse to project");
+        };
+        assert!(e2.to_string().contains("malformed event_id"));
     }
 
     #[test]

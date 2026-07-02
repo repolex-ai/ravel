@@ -13,6 +13,27 @@ pub fn event_iri(partition: &str, event_id: &str) -> String {
     format!("{partition}{event_id}")
 }
 
+/// Validate an event_id before it's embedded in an IRI. VALIDATE, don't mangle:
+/// a `safe()`-style character mangle on an IDENTITY key can collide two
+/// distinct ids ("a b" and "a_b" → same IRI) — identity-loss hidden as
+/// robustness. Today's adapter sources event_id from JSONL uuids (hex +
+/// hyphens, always valid); the first non-UUID dialect adapter hits this gate
+/// instead of silently minting a broken or colliding IRI.
+pub fn validate_event_id(event_id: &str) -> Result<()> {
+    if event_id.trim().is_empty() {
+        anyhow::bail!("empty event_id — refusing to mint an IRI for a non-event");
+    }
+    if !event_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        anyhow::bail!(
+            "malformed event_id {event_id:?} — contains characters unsafe to embed in an IRI; fix the adapter, don't mangle the id"
+        );
+    }
+    Ok(())
+}
+
 /// Load events into a fresh in-memory Store, emitting the spine + scalar props.
 /// Returns the Store. Idempotent by construction: subject IRIs are deterministic
 /// (partition + event_id), so re-projecting the same events overwrites, never
@@ -29,6 +50,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
     let xsd_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
 
     for e in events {
+        validate_event_id(&e.event_id)?;
         let s = event_iri(partition, &e.event_id);
         // rdf:type weave:Turn
         nt.push_str(&format!(
