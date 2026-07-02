@@ -57,12 +57,15 @@ fn ann_hash(transcript_id: &str, a: &Annotation) -> String {
     h.update(a.end.to_le_bytes());
     h.update([0]);
     h.update(a.source_kind.map(|k| k.tag()).unwrap_or("").as_bytes());
-    // signal is a BTreeMap → stable iteration order → stable hash
+    // signal is a BTreeMap → stable iteration order → stable hash. Fold in the
+    // type tag so Text("8") and Int(8) hash to DISTINCT findings (they project
+    // to different literals — a string vs a number).
     for (k, v) in &a.signal {
         h.update([0]);
         h.update(k.as_bytes());
         h.update([1]);
-        h.update(v.as_bytes());
+        h.update([v.type_tag()]);
+        h.update(v.lexical().as_bytes());
     }
     let digest = h.finalize();
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -154,10 +157,16 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // --- evidence (prov:used): what the detector looked at = the event ---
         triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}used")), iri(&event_iri));
 
-        // --- body: the signal payload, flattened onto a body node ---
+        // --- body: the signal payload, flattened onto a body node. A leg the
+        // reader declared numeric projects as its xsd typed literal, so
+        // FILTER-by-magnitude compares as a NUMBER; text legs stay plain. ---
         triple(&mut nt, iri(&ann_iri), iri(&format!("{OA}hasBody")), iri(&body_iri));
         for (k, v) in &ann.signal {
-            triple(&mut nt, iri(&body_iri), iri(&format!("{WEAVE_NS}sig_{}", safe(k))), str_lit(v));
+            let obj = match v.xsd_datatype() {
+                Some(dt) => typed_lit(&v.lexical(), dt),
+                None => str_lit(&v.lexical()),
+            };
+            triple(&mut nt, iri(&body_iri), iri(&format!("{WEAVE_NS}sig_{}", safe(k))), obj);
         }
 
         // --- the CLAIM: an RDF 1.2 triple term, UNASSERTED, carrying meta ---
@@ -309,5 +318,70 @@ mod tests {
         }
         assert_eq!(n, 1, "exactly one emojikey detection should round-trip");
         let _ = GraphName::DefaultGraph; // keep import honest if unused above
+    }
+
+    #[test]
+    fn numeric_signal_leg_projects_typed_and_filters_as_a_number() {
+        use crate::reader::{Annotation, SignalValue};
+        use std::collections::BTreeMap;
+
+        // a synthetic wave-math annotation with a NUMERIC magnitude leg
+        let mut mk = |mag: i64| {
+            let mut sig: BTreeMap<String, SignalValue> = BTreeMap::new();
+            sig.insert("magnitude".into(), SignalValue::Int(mag));
+            sig.insert("label".into(), SignalValue::Text("flux".into()));
+            Annotation {
+                reader: "wavemath".into(),
+                event_type: "wave/flux".into(),
+                ts: Some("2026-06-30T12:00:00Z".into()),
+                event_id: format!("ev-{mag}"),
+                start: 0,
+                end: 1,
+                source_kind: None,
+                signal: sig,
+            }
+        };
+        let anns = vec![mk(3), mk(8)];
+        let store = project_annotations(&anns, "trans-num", "urn:soul:x:Weave/Turn/").unwrap();
+
+        // NUMERIC filter: legs projected as plain strings would compare
+        // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a
+        // typed xsd:integer makes `> 5` a real number comparison.
+        let q = format!(
+            r#"PREFIX weave: <{WEAVE_NS}>
+               SELECT (COUNT(*) AS ?big) WHERE {{
+                 ?body weave:sig_magnitude ?m . FILTER(?m > 5) }}"#
+        );
+        let res = SparqlEvaluator::new().parse_query(&q).unwrap().on_store(&store).execute().unwrap();
+        let QueryResults::Solutions(sols) = res else { panic!("expected solutions") };
+        let got: i64 = sols
+            .map(|s| s.unwrap().get("big").unwrap().to_string())
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .split('^')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .parse()
+            .unwrap();
+        assert_eq!(got, 1, "only magnitude 8 is > 5 (numeric compare, not string)");
+
+        // and the datatype is genuinely xsd:integer on the wire
+        let dump = String::from_utf8(
+            store
+                .dump_to_writer(
+                    oxigraph::io::RdfSerializer::from_format(oxigraph::io::RdfFormat::NQuads),
+                    Vec::new(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            dump.contains("XMLSchema#integer"),
+            "numeric leg must carry an xsd:integer datatype on the wire"
+        );
+        // text leg stays a plain literal (no datatype coercion)
+        assert!(dump.contains("\"flux\""));
     }
 }

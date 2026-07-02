@@ -15,10 +15,72 @@
 use crate::{Event, SourceKind};
 use std::collections::BTreeMap;
 
+/// A single signal-leg value, carrying its RDF datatype intent.
+///
+/// The projector must NOT guess a datatype from a string — "8" is a meaningful
+/// string in one reader (an emoji-count glyph) and a number in another (a wave
+/// magnitude); only the READER knows which. So a reader that emits a numeric leg
+/// declares it here, and text stays text by default (lossless, never coerced).
+/// Without this, a magnitude projected as a plain string literal makes
+/// `FILTER(?mag > 5)` a STRING comparison that silently returns wrong rows —
+/// the exact "looks-like-it-works" trap. `Decimal` holds its lexical form (not
+/// an f64) so precision is exact AND the value stays `Ord`/`Eq`/`Hash` for the
+/// deterministic-IRI discipline (f64 is neither `Ord` nor hashable).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SignalValue {
+    /// A verbatim text payload. The default — never coerced to a number.
+    Text(String),
+    /// An integer leg → projects as an `xsd:integer` typed literal.
+    Int(i64),
+    /// A decimal leg (lexical form preserved) → projects as `xsd:decimal`.
+    Decimal(String),
+}
+
+impl SignalValue {
+    /// The lexical form for hashing / N-Triples emission.
+    pub fn lexical(&self) -> String {
+        match self {
+            SignalValue::Text(s) => s.clone(),
+            SignalValue::Int(n) => n.to_string(),
+            SignalValue::Decimal(s) => s.clone(),
+        }
+    }
+    /// A stable type tag so `Text("8")` and `Int(8)` are DISTINCT findings —
+    /// folded into the annotation hash and the projected datatype.
+    pub fn type_tag(&self) -> u8 {
+        match self {
+            SignalValue::Text(_) => 0,
+            SignalValue::Int(_) => 1,
+            SignalValue::Decimal(_) => 2,
+        }
+    }
+    /// The xsd datatype IRI for a typed leg, or None for plain text.
+    pub fn xsd_datatype(&self) -> Option<&'static str> {
+        match self {
+            SignalValue::Text(_) => None,
+            SignalValue::Int(_) => Some("http://www.w3.org/2001/XMLSchema#integer"),
+            SignalValue::Decimal(_) => Some("http://www.w3.org/2001/XMLSchema#decimal"),
+        }
+    }
+}
+
+/// Convenience: a plain-text leg (the common case — keeps reader code terse).
+impl From<&str> for SignalValue {
+    fn from(s: &str) -> Self {
+        SignalValue::Text(s.to_string())
+    }
+}
+impl From<String> for SignalValue {
+    fn from(s: String) -> Self {
+        SignalValue::Text(s)
+    }
+}
+
 /// One finding: a detector observed a signal anchored to a span of one event.
 /// The Rust mirror of the Python `MonologRow`, trimmed to what the projector
-/// needs. `signal` is an ordered string→string map so projection is
-/// deterministic (BTreeMap = stable key order = stable hashes = idempotent IRIs).
+/// needs. `signal` is an ordered string→SignalValue map so projection is
+/// deterministic (BTreeMap = stable key order = stable hashes = idempotent IRIs)
+/// AND numeric legs carry their datatype (see `SignalValue`).
 #[derive(Debug, Clone)]
 pub struct Annotation {
     /// Which reader produced this (the detector name).
@@ -36,8 +98,10 @@ pub struct Annotation {
     /// TOOL_RESULT (quoted/pasted). None when the adapter didn't record
     /// provenance. Carried, never dropped — downstream filters, not the reader.
     pub source_kind: Option<SourceKind>,
-    /// The signal payload: the verbatim finding, lossless. Ordered for stable IRIs.
-    pub signal: BTreeMap<String, String>,
+    /// The signal payload: the verbatim finding, lossless. Ordered for stable
+    /// IRIs. Values are `SignalValue` so numeric legs carry their datatype;
+    /// text legs (the emojikey case) are `SignalValue::Text`, unchanged in wire.
+    pub signal: BTreeMap<String, SignalValue>,
 }
 
 /// The emojikey shape: three `[LABEL|payload]` segments (ME, CONTENT, YOU) joined
@@ -60,12 +124,15 @@ pub fn emojikey_read(events: &[Event]) -> Vec<Annotation> {
         let Some(text) = &e.text else { continue };
         let mut search_from = 0;
         while let Some((start, end, me, content, you)) = next_key(text, search_from) {
-            let mut signal = BTreeMap::new();
-            signal.insert("raw".to_string(), text[start..end].to_string());
-            signal.insert("me".to_string(), me);
-            signal.insert("content".to_string(), content);
-            signal.insert("you".to_string(), you);
-            signal.insert("voice".to_string(), e.role.clone());
+            // emojikey legs are all TEXT payloads (the emoji/glyph strings are
+            // meaningfully strings, not numbers — a magnitude reader would emit
+            // SignalValue::Int/Decimal instead). Lossless, no coercion.
+            let mut signal: BTreeMap<String, SignalValue> = BTreeMap::new();
+            signal.insert("raw".to_string(), text[start..end].into());
+            signal.insert("me".to_string(), me.into());
+            signal.insert("content".to_string(), content.into());
+            signal.insert("you".to_string(), you.into());
+            signal.insert("voice".to_string(), e.role.clone().into());
             out.push(Annotation {
                 reader: "emojikey".to_string(),
                 event_type: "emojikey/harvest".to_string(),
@@ -195,19 +262,21 @@ mod tests {
         let anns = emojikey_read(&[ev("wrap up 🐐 [ME|🧠🎨8∠45]~[CONTENT|💻🧩9∠15]~[YOU|🎓🌱8∠35] done")]);
         assert_eq!(anns.len(), 1);
         let a = &anns[0];
-        assert_eq!(a.signal["me"], "🧠🎨8∠45");
-        assert_eq!(a.signal["content"], "💻🧩9∠15");
-        assert_eq!(a.signal["you"], "🎓🌱8∠35");
+        assert_eq!(a.signal["me"].lexical(), "🧠🎨8∠45");
+        assert_eq!(a.signal["content"].lexical(), "💻🧩9∠15");
+        assert_eq!(a.signal["you"].lexical(), "🎓🌱8∠35");
+        // emojikey legs stay TEXT (never coerced to numbers)
+        assert_eq!(a.signal["me"], SignalValue::Text("🧠🎨8∠45".into()));
         // the span recovers the exact key substring
         let src = "wrap up 🐐 [ME|🧠🎨8∠45]~[CONTENT|💻🧩9∠15]~[YOU|🎓🌱8∠35] done";
-        assert_eq!(&src[a.start..a.end], a.signal["raw"]);
+        assert_eq!(&src[a.start..a.end], a.signal["raw"].lexical());
     }
 
     #[test]
     fn case_insensitive_and_minimal() {
         let anns = emojikey_read(&[ev("[me|🐐]~[content|⚙️🌊]~[you|🤝]")]);
         assert_eq!(anns.len(), 1);
-        assert_eq!(anns[0].signal["me"], "🐐");
+        assert_eq!(anns[0].signal["me"].lexical(), "🐐");
     }
 
     #[test]
@@ -223,7 +292,7 @@ mod tests {
             "[ME|a]~[CONTENT|b]~[YOU|c] ... later ... [ME|x]~[CONTENT|y]~[YOU|z]",
         )]);
         assert_eq!(anns.len(), 2);
-        assert_eq!(anns[0].signal["you"], "c");
-        assert_eq!(anns[1].signal["me"], "x");
+        assert_eq!(anns[0].signal["you"].lexical(), "c");
+        assert_eq!(anns[1].signal["me"].lexical(), "x");
     }
 }
