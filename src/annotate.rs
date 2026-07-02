@@ -11,13 +11,20 @@
 //!                        weave:eventId … ] ;
 //!         oa:hasBody [ weave:sig_* … ] ;
 //!         prov:used <evidence> .
-//!   claim rdf:reifies <<( ann weave:exhibits "event_type" )>> ;   # UNASSERTED
-//!         weave:detector ; weave:detectionType .                  #   belief form
+//!   claim rdf:reifies <<( event weave:exhibits "event_type" )>> ;  # UNASSERTED
+//!         prov:wasDerivedFrom ann ;                                #   belief form
+//!         weave:detector ; weave:detectionType .
 //!
-//! The base proposition is NOT separately asserted: a detection is an unasserted
-//! CLAIM carrying detector metadata, which is exactly the belief semantics we
-//! want (the Day-37 thesis). RDF 1.2 triple term = `<<( s p o )>>` (PARENS,
-//! object-position) + `rdf:reifies` — squad standard, NOT RDF-star `<< >>`.
+//! The reified proposition is the WORLD-claim — "this event exhibits X" — and it
+//! is never asserted: a detection is an unasserted CLAIM carrying detector
+//! metadata, which is exactly the belief semantics we want (the Day-37 thesis).
+//! The subject must be the EVENT, not the annotation: reifying a statement about
+//! the annotation would just restate metadata the annotation already asserts,
+//! leaving the actual detection asserted-by-implication. (The original spike had
+//! this right — `<<( turn weave:detected ... )>>` — the emojikey promotion
+//! drifted.) claim → ann via prov:wasDerivedFrom joins belief to evidence.
+//! RDF 1.2 triple term = `<<( s p o )>>` (PARENS, object-position) +
+//! `rdf:reifies` — squad standard, NOT RDF-star `<< >>`.
 //!
 //! Identity is deterministic (sha256 over the annotation's defining fields), so
 //! re-projecting the same findings overwrites rather than duplicating — the
@@ -141,14 +148,19 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         }
 
         // --- the CLAIM: an RDF 1.2 triple term, UNASSERTED, carrying meta ---
-        // <<( ann weave:exhibits "event_type" )>> as the reified proposition.
+        // <<( event weave:exhibits "event_type" )>> — the world-claim ("this
+        // turn exhibits X"), never asserted. Subject is the EVENT: reifying a
+        // statement about the annotation would restate already-asserted
+        // metadata and the belief semantics would protect nothing.
         let proposition = format!(
             "<<( {} {} {} )>>",
-            iri(&ann_iri),
+            iri(&event_iri),
             iri(&format!("{WEAVE_NS}exhibits")),
             str_lit(&ann.event_type),
         );
         triple(&mut nt, iri(&claim_iri), iri(&format!("{RDF}reifies")), proposition);
+        // belief → evidence: the claim is derived from the annotation wrapper
+        triple(&mut nt, iri(&claim_iri), iri(&format!("{PROV}wasDerivedFrom")), iri(&ann_iri));
         triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detector")), str_lit(&ann.reader));
         triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detectionType")), str_lit(&ann.event_type));
     }
@@ -241,8 +253,10 @@ mod tests {
             PREFIX weave: <{WEAVE_NS}>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             PREFIX oa: <{OA}>
-            SELECT ?ann ?det ?me WHERE {{
-                ?claim rdf:reifies <<( ?ann weave:exhibits "emojikey/harvest" )>> ;
+            PREFIX prov: <{PROV}>
+            SELECT ?event ?det ?me WHERE {{
+                ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+                       prov:wasDerivedFrom ?ann ;
                        weave:detector ?det .
                 ?ann oa:hasBody ?body .
                 ?body weave:sig_me ?me .

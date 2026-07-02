@@ -72,6 +72,12 @@ def test_row_emits_oa_prov_and_rdf12_triple_term():
     # RDF 1.2 triple term (PARENS — the 1.2 syntax, not RDF-star) + rdf:reifies
     assert "rdf-syntax-ns#reifies" in body
     assert "<<(" in body and ")>>" in body
+    # the reified proposition's subject is the WORLD-side event (src_uuid wins),
+    # never the annotation node — otherwise belief semantics protect nothing
+    assert "<<( <https://weave.repolex.ai/ns#transcript/sess/event/a2>" in body
+    assert "<<( <https://weave.repolex.ai/ns#ann/" not in body
+    # claim → evidence wrapper join
+    assert "http://www.w3.org/ns/prov#wasDerivedFrom" in body
 
 
 def test_reifier_iri_is_deterministic():

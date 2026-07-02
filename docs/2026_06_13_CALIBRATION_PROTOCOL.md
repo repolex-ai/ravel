@@ -350,6 +350,105 @@ without un-locking the number.)
 | fail | pass | Surprising. Generalizes without being calibrated. Flag for inspection — likely ground-truth-tagging artifact (tail sessions tagged with different criteria than mega). |
 | fail | fail | Null result. Same shape as Day 22 cite-by-salience finding (`LSPy/Soul/Note/2026-06-06-ground-truth-legible-metric-invisible.md`). The metric class may be mismatched; consider the diagnosis-of-last-resort move. |
 
+### (d.iii) APPEND 2026-07-02 — the recall-is-threshold-dependent hole, and how it closes
+
+**The hole (SG's catch, this session).** The (d.i) and (d.ii) gates above compare
+`fresh_recall / echo_recall`. Recall is threshold-dependent: an engine that flags
+more spans buys recall for free. So the fresh/echo ratio can move with
+operating-point placement alone — nothing about the underlying signal has to
+change for a leg to appear to "pass 2×" or "fail 1.5×". This is exactly the
+species of trap section (f) hunts. Leaving it uncorrected would make the whole
+gate structure vulnerable to threshold-tuning while still calling itself
+pre-committed.
+
+**Why we're not silently rewriting (d.i)/(d.ii).** The 2× and 1.5× thresholds
+were locked Day 26 before data. Rewriting them retroactively would break the
+pre-commit discipline the doc exists to enforce. Instead: the original numbers
+stay locked verbatim above, this subsection amends the *comparison method* they
+operate on, dated. `evolution_of_a_claim_pattern` in the LSPy memory family —
+top-callout the fold, leave the prior text intact so the reasoning-history is
+readable.
+
+**Closing pre-commit (locked 2026-07-02, before by-hand pass runs):** the ratio
+comparison in (d.i) and (d.ii) is evaluated at **matched flag-rate**, with the
+following three pre-committed conventions:
+
+1. **Unit of the rate — flagged-spans per 1,000 prose words** (not per turn).
+   Turn lengths in the corpus vary from single-line to multi-thousand-word
+   assistant messages; per-turn rates would let a verbose-turn engine hide flag
+   volume behind message length. Prose-word normalization is the same unit the
+   (a) held-out slice uses, keeping the calibration frame internally consistent.
+
+2. **Matching direction — external anchor to by-hand ground-truth positive
+   rate.** Both fresh and echo engines have their flagging thresholds tuned
+   (up or down) until each engine's flag-rate matches the by-hand-tagged
+   ground-truth positive rate for the same slice, in flagged-spans-per-1k-words.
+   Not fresh-tuned-to-echo. Not echo-tuned-to-fresh. Both tuned to the external
+   anchor that neither engine controls. This closes the "echo's threshold is
+   the hidden reference and echo is ours to set" trap.
+
+3. **Tolerance band — `max(±10%, ±1 span)`, with an underpowered-regime
+   escape.** A leg's flag-rate is "matched" to ground-truth when it falls
+   within the larger of ±10% or ±1 span. The floor exists because if
+   ground-truth positive rate is low (e.g. 4 spans / 1k words), ±10% is
+   <0.5 spans and the tolerance eats the whole signal on integer rounding.
+   Floor is ±1, not ±2, because ±2 at low counts would readmit the
+   flag-rate-tuning hole this amendment closes.
+
+   **BUT — underpowered escape (SG catch, same session):** if a held-out
+   unit has fewer than **10 ground-truth positive spans total**, the unit
+   is reported as "underpowered at matched-rate" and does NOT gate. It
+   contributes to descriptive reporting only. Rationale: at n<10 positives,
+   a ±1-span floor is a 10%+ tolerance wearing a 10% costume — better to
+   name the low-N regime honestly than to stretch the band and pretend the
+   gate ran. Pre-committed here so the escape can't be invoked selectively
+   at analysis time.
+
+**PR-AUC as corroborating secondary.** Matched-flag-rate is the primary gate.
+Precision-recall AUC (`sklearn.metrics.average_precision_score` over the
+per-word confidence scores) is computed and reported alongside as a
+rate-invariant corroboration. **Interpretation rule (pre-committed):** if
+matched-flag-rate says pass but PR-AUC gap between fresh and echo is <0.05,
+the leg is flagged for inspection (matched-flag-rate found a real ordering, but
+the rate-invariant view says it's fragile). If matched-flag-rate says fail
+but PR-AUC gap is >0.15, same flag — pre-commit-breaker, surface honestly, do
+not use PR-AUC to overrule the primary gate.
+
+**Binary-only legs — no silent omission (SG catch, same session).** PR-AUC is
+undefined for a leg that emits only binary flags (no graded per-word score),
+because there is no ranking to sweep a threshold over. Such a leg reports
+**matched-flag-rate only, and explicitly names the absence of the corroborating
+secondary in its report**, in the form: `"pr_auc": null, "pr_auc_reason":
+"leg emits binary flags; no graded score to sweep"`. Silent omission would let
+a binary leg's report look identical to a graded leg's report whose PR-AUC was
+accidentally dropped — engine design choice hidden as data-absence. The (f)
+trap it prevents: a maintainer who removes a leg's graded output to escape a
+disappointing PR-AUC flag would have to also *emit the reason*, making the
+choice visible on the record.
+
+**What this changes about the (d.i)/(d.ii) gates above.** The `2.0` and
+`1.5` numbers stay locked exactly. The interpretation of `fresh_recall` and
+`echo_recall` in those formulas is now: **recall measured after matched-
+flag-rate calibration per the (d.iii) pre-commit, not raw recall at engine
+default thresholds.** The gate isn't relaxed; the comparison is made honest.
+
+**Failure mode this specifically prevents.** An engine that reads its priors
+(the `fresh ≈ echo ≫ null` case in (d.i)) but places its flag-threshold more
+aggressively than the echo baseline: at raw thresholds it would show a 2.1×
+recall ratio and appear to pass; at matched flag-rate it collapses to the
+`fresh ≈ echo` shape the (d.i) failure-mode table already catches. Without
+(d.iii), the doc catches this failure mode in prose while allowing a
+threshold-tuned engine through in practice. With (d.iii), catch and gate line up.
+
+**Provenance.** This hole was surfaced by SG this session, immediately routed
+back to LSPy as the discipline-owner rather than folded by SG unilaterally —
+because section (f) hunts exactly this class of trap, and if the amendment
+were authored by the section-f-writer's collaborator, section (f) would fail
+as a live discipline. The fix crossing the section-(f) test is more important
+than the fix itself. `authorship_doesnt_grant_exemption` runs both ways: the
+leg-maintainer isn't exempt from tuning discipline, and the discipline-writer
+isn't exempt from having their own gates checked.
+
 ## (e) Confidence re-compute schedule
 
 The contract emits `confidence: {recall, precision}` per leg per word. These

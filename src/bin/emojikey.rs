@@ -67,8 +67,10 @@ fn main() -> Result<()> {
         PREFIX weave: <{WEAVE_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         PREFIX oa: <{oa}>
+        PREFIX prov: <http://www.w3.org/ns/prov#>
         SELECT ?det ?me ?content ?you ?start ?end ?sk WHERE {{
-            ?claim rdf:reifies <<( ?ann weave:exhibits "emojikey/harvest" )>> ;
+            ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+                   prov:wasDerivedFrom ?ann ;
                    weave:detector ?det .
             ?ann oa:hasBody ?body ;
                  oa:hasTarget ?t .

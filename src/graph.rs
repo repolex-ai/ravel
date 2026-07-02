@@ -109,7 +109,8 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
         PREFIX prov: <http://www.w3.org/ns/prov#>
         SELECT ?g ?sk ?me ?content ?you ?ts WHERE {{
             GRAPH ?g {{
-                ?claim rdf:reifies <<( ?ann weave:exhibits "emojikey/harvest" )>> .
+                ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+                       prov:wasDerivedFrom ?ann .
                 ?ann oa:hasBody ?body .
                 OPTIONAL {{ ?ann weave:sourceKind ?sk }}
                 OPTIONAL {{ ?ann prov:generatedAtTime ?ts }}

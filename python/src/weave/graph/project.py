@@ -10,6 +10,13 @@ The RDF 1.2 syntax here is verified against pyoxigraph 0.5.6:
   - reification predicate  `rdf:reifies`
   - the base triple is NOT separately asserted (the detection is an unasserted
     CLAIM carrying a confidence, which is exactly the belief semantics we want).
+
+The reified proposition is the WORLD-claim — `<<( event weave:exhibits type )>>`
+with the EVENT (the thing the detection is about) as subject, never the
+annotation. Reifying a statement about the annotation would restate metadata
+the annotation already asserts, and the belief semantics would protect nothing
+(2026-07-02 fix, synchronized with the Rust engine's annotate.rs). The claim
+joins to its evidence wrapper via `prov:wasDerivedFrom`.
 """
 
 from __future__ import annotations
@@ -87,6 +94,20 @@ def _transcript_iri(transcript_id: str) -> str:
     return f"{WEAVE}transcript/{transcript_id}"
 
 
+def _event_subject_iri(transcript_id: str, row: MonologRow) -> str:
+    """The world-side subject of the claim: the most durable identity the anchor
+    carries for the thing the detection is ABOUT (not the annotation node).
+    Priority: source-event uuid > turn id > seq position > whole transcript."""
+    base = _transcript_iri(transcript_id)
+    if row.anchor.get("src_uuid"):
+        return f"{base}/event/{row.anchor['src_uuid']}"
+    if row.anchor.get("turn_id"):
+        return f"{base}/event/{row.anchor['turn_id']}"
+    if "seq" in row.anchor:
+        return f"{base}/seq/{row.anchor['seq']}"
+    return base
+
+
 # --- the per-row projection --------------------------------------------------
 
 def row_to_triples(transcript_id: str, row: MonologRow) -> Iterator[str]:
@@ -98,7 +119,8 @@ def row_to_triples(transcript_id: str, row: MonologRow) -> Iterator[str]:
            oa:hasBody [ <signal fields> ] ;
            prov:wasAttributedTo <detector> ; prov:generatedAtTime ts ;
            prov:used <evidence seqs...>
-      claim rdf:reifies <<( ann weave:exhibits event_type )>> ;
+      claim rdf:reifies <<( event weave:exhibits event_type )>> ;
+            prov:wasDerivedFrom ann ;
             weave:detector ; weave:confidence ; ...        (UNASSERTED belief)
     """
     ann = _iri(annotation_iri(transcript_id, row))
@@ -157,10 +179,13 @@ def row_to_triples(transcript_id: str, row: MonologRow) -> Iterator[str]:
         yield _triple(body, _iri(WEAVE + "sigValue"), _lit(row.signal))
 
     # --- the CLAIM: an RDF 1.2 triple term, UNASSERTED, carrying detector meta ---
-    # << ann weave:exhibits event_type >> as the reified proposition.
+    # <<( event weave:exhibits event_type )>> — the world-claim, with the EVENT
+    # as subject (see module docstring). claim → ann via prov:wasDerivedFrom.
     et = _str_lit(row.event_type or "signal")
-    triple_term = f"<<( {ann} {_iri(WEAVE + 'exhibits')} {et} )>>"
+    event = _iri(_event_subject_iri(transcript_id, row))
+    triple_term = f"<<( {event} {_iri(WEAVE + 'exhibits')} {et} )>>"
     yield _triple(claim, _iri(RDF + "reifies"), triple_term)
+    yield _triple(claim, _iri(PROV + "wasDerivedFrom"), ann)
     yield _triple(claim, _iri(WEAVE + "detector"), _str_lit(row.reader))
     # detector_version / detection_type / confidence: read from signal if the
     # reader put them there; always emit detection_type from event_type.
