@@ -80,6 +80,22 @@ def test_row_emits_oa_prov_and_rdf12_triple_term():
     assert "http://www.w3.org/ns/prov#wasDerivedFrom" in body
 
 
+def test_empty_identity_key_falls_through_loudly():
+    """turn_id PRESENT BUT EMPTY must not silently resolve by position: the
+    claim carries a weave:resolvedBy tag naming the degradation (LSPy, d.iii-
+    adjacent: identity-loss must never hide as data-completeness)."""
+    row = MonologRow(reader="cadence", event_type="rhythm/turn",
+                     anchor={"seq": 3, "turn_id": "", "start": 0, "end": 10},
+                     signal={"words": 4})
+    body = "\n".join(row_to_triples("sess", row))
+    assert "<<( <https://weave.repolex.ai/ns#transcript/sess/seq/3>" in body
+    assert 'resolvedBy> "seq (turn_id was empty)"' in body
+    # and a HEALTHY anchor emits no resolvedBy tag at all
+    ok = MonologRow(reader="cadence", event_type="rhythm/turn",
+                    anchor={"seq": 3, "turn_id": "u9"}, signal={"words": 4})
+    assert "resolvedBy" not in "\n".join(row_to_triples("sess", ok))
+
+
 def test_reifier_iri_is_deterministic():
     """Same row -> same reifier IRI -> idempotent re-import (no blank-node dup)."""
     row = MonologRow(reader="cadence", event_type="rhythm/turn",
@@ -112,12 +128,14 @@ def test_monolog_to_ntriples_covers_both_readers(tmp_path):
 
 
 # --- store round-trip (needs the optional graph extra) -----------------------
-
-pyoxigraph = pytest.importorskip("pyoxigraph",
-                                 reason="graph extra (pyoxigraph) not installed")
+# importorskip must live INSIDE these tests, not at module level: a module-level
+# skip silently disables the pure-stdlib projection tests above too (found
+# 2026-07-02 — the file had been collecting ZERO tests whenever pyoxigraph was
+# absent, while the suite's green total made it look covered).
 
 
 def test_bulk_load_and_cross_reader_join(tmp_path):
+    pytest.importorskip("pyoxigraph", reason="graph extra (pyoxigraph) not installed")
     from weave.graph.store import load_monolog, query
     transcript = _transcript(tmp_path)
     _build_monolog(transcript)
@@ -147,6 +165,7 @@ def test_bulk_load_and_cross_reader_join(tmp_path):
 
 
 def test_rdf12_triple_term_claim_is_queryable(tmp_path):
+    pytest.importorskip("pyoxigraph", reason="graph extra (pyoxigraph) not installed")
     from weave.graph.store import load_monolog, query
     transcript = _transcript(tmp_path)
     _build_monolog(transcript)

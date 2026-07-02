@@ -94,18 +94,30 @@ def _transcript_iri(transcript_id: str) -> str:
     return f"{WEAVE}transcript/{transcript_id}"
 
 
-def _event_subject_iri(transcript_id: str, row: MonologRow) -> str:
+def _event_subject_iri(transcript_id: str, row: MonologRow) -> tuple[str, str | None]:
     """The world-side subject of the claim: the most durable identity the anchor
     carries for the thing the detection is ABOUT (not the annotation node).
-    Priority: source-event uuid > turn id > seq position > whole transcript."""
+    Priority: source-event uuid > turn id > seq position > whole transcript.
+    (Containers are identity, positions are addresses — identity survives
+    operations that renumber positions, so turn_id outranks seq.)
+
+    Returns (iri, resolved_by_note). The note is non-None when an identity key
+    was PRESENT BUT EMPTY and resolution fell through to a positional address —
+    that fallthrough must be loud (a `weave:resolvedBy` tag on the claim), never
+    silent: missing-identity hidden as data-completeness is identity-loss."""
     base = _transcript_iri(transcript_id)
+    degraded = [k for k in ("src_uuid", "turn_id")
+                if k in row.anchor and not str(row.anchor[k] or "").strip()]
     if row.anchor.get("src_uuid"):
-        return f"{base}/event/{row.anchor['src_uuid']}"
+        return f"{base}/event/{row.anchor['src_uuid']}", None
     if row.anchor.get("turn_id"):
-        return f"{base}/event/{row.anchor['turn_id']}"
+        note = f"turn_id ({degraded[0]} was empty)" if degraded else None
+        return f"{base}/event/{row.anchor['turn_id']}", note
     if "seq" in row.anchor:
-        return f"{base}/seq/{row.anchor['seq']}"
-    return base
+        note = f"seq ({' and '.join(degraded)} was empty)" if degraded else None
+        return f"{base}/seq/{row.anchor['seq']}", note
+    note = f"transcript ({' and '.join(degraded)} was empty)" if degraded else None
+    return base, note
 
 
 # --- the per-row projection --------------------------------------------------
@@ -182,10 +194,14 @@ def row_to_triples(transcript_id: str, row: MonologRow) -> Iterator[str]:
     # <<( event weave:exhibits event_type )>> — the world-claim, with the EVENT
     # as subject (see module docstring). claim → ann via prov:wasDerivedFrom.
     et = _str_lit(row.event_type or "signal")
-    event = _iri(_event_subject_iri(transcript_id, row))
+    event_subject, resolved_by = _event_subject_iri(transcript_id, row)
+    event = _iri(event_subject)
     triple_term = f"<<( {event} {_iri(WEAVE + 'exhibits')} {et} )>>"
     yield _triple(claim, _iri(RDF + "reifies"), triple_term)
     yield _triple(claim, _iri(PROV + "wasDerivedFrom"), ann)
+    if resolved_by:
+        # loud fallthrough: identity key present-but-empty, resolution degraded
+        yield _triple(claim, _iri(WEAVE + "resolvedBy"), _str_lit(resolved_by))
     yield _triple(claim, _iri(WEAVE + "detector"), _str_lit(row.reader))
     # detector_version / detection_type / confidence: read from signal if the
     # reader put them there; always emit detection_type from event_type.
