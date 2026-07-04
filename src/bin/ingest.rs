@@ -57,6 +57,7 @@ fn main() -> Result<()> {
     // --- walk the session logs ---
     let mut sessions = 0usize;
     let mut total_keys = 0usize;
+    let mut total_turns = 0usize;
     let entries = std::fs::read_dir(&sessions_dir)
         .with_context(|| format!("reading sessions dir {sessions_dir}"))?;
     let mut paths: Vec<_> = entries
@@ -74,23 +75,28 @@ fn main() -> Result<()> {
             }
         };
         let events = adapter::parse_transcript(&jsonl)?;
+        // FULL SPINE: run the reader for annotations, but ingest EVERY session's
+        // turns regardless — the spine is the deliverable, not the annotations. A
+        // session with zero emojikeys is still a conversation worth storing.
         let anns = reader::emojikey_read(&events);
-        if anns.is_empty() {
+        if events.is_empty() {
             continue;
         }
         let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
-        let n = graph::ingest_annotations(&store, &events, &anns, transcript_id, partition)?;
+        let n = graph::ingest_transcript(&store, &events, &anns, transcript_id, partition)?;
         sessions += 1;
+        total_turns += events.len();
         total_keys += anns.len();
         println!(
-            "  ingested {:>3} annotation-triples from {} ({} key(s))",
+            "  {:>6} turns  →  {:>6} triples   {}  ({} key(s))",
+            events.len(),
             n,
             transcript_id,
             anns.len()
         );
     }
     println!(
-        "\n[ingest] {sessions} session(s) with emojikeys → persistent store at {store_dir}  ({total_keys} keys total)"
+        "\n[ingest] {sessions} session(s), {total_turns} turns → persistent store at {store_dir}  ({total_keys} emojikeys)"
     );
 
     // --- the payoff: query the graph of sessions ---
