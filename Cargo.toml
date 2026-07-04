@@ -25,6 +25,10 @@ path = "src/bin/emojikey.rs"
 name = "weave-ingest"
 path = "src/bin/ingest.rs"
 
+[[bin]]
+name = "weave-stats"
+path = "src/bin/stats.rs"
+
 [dependencies]
 # Same store as Pool — rdf-12 for triple terms (squad standard, not RDF-star).
 oxigraph = { version = "0.5.6", features = ["rdf-12"] }
