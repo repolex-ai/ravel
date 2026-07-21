@@ -68,8 +68,8 @@ fn main() -> Result<()> {
     }
 
     println!("\n--- FEDERATION ANCHORS ---");
-    println!("soul-prefixed subjects (urn:soul:*):  {}",
-        scalar(&store, "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?s), \"urn:soul:\")) }")?);
+    println!("Turn subjects (…/ravel/Turn/*):       {}",
+        scalar(&store, "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?s), \"https://repolex.ai/ravel/Turn/\")) }")?);
     println!("Turn nodes carrying xsd:dateTime:     {}",
         scalar(&store, "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?ts ?t } FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime>) }")?);
     println!("earliest timestamp: {}",

@@ -53,12 +53,19 @@ famous, same-space projects).
 - **ONE live site constructs this prefix** (`src/soul.rs:65`, now
   `ravel_partition_prefix()`) — verified Day 44; every other hit is
   doc-comment/test-fixture/read-side FILTER (`stats.rs`).
-- **OPEN QUESTION FOR ROB (raised by trip.lex 2026-07-21, pre-federation window):**
-  the `urn:` scheme itself. git-lex was swept this month from opaque identifiers to
-  resolvable https IRIs; the Day-38 anchor contract predates that ruling. If Rob
-  re-rules the anchor as an https IRI, that's the SAME one-line change + re-ingest —
-  but it should be decided BEFORE the store cut (step 3) so the store is re-derived
-  exactly once. If `urn:soul:` stands as deliberate design, nothing changes here.
+- **RESOLVED (Rob ruled, 2026-07-21): no urns, anywhere.** And per git-lex's own
+  cut (`nquad.rs`: "no soul identity in the subject", Day-50), the fix is not
+  urn→https-with-sha — it is dropping soul identity from subjects entirely. Turn
+  subjects are now `https://repolex.ai/ravel/Turn/<event_id>` (git-lex's machinery
+  shape); soul scoping is BY STORE (one soul repo, one store; the distributor
+  routes). Session graph names moved out of the ontology NS in the same pass
+  (`…/ravel/NamedGraph/<id>`, mirroring git-lex's NamedGraph move) — vocabulary
+  and instance data no longer share a prefix. The genesis-sha resolution left the
+  code with the urn; soul identity lives in `.lex/identity.yml` / souls.toml,
+  consulted by whoever routes to a store, never stamped inside one. The Day-38
+  contract's soul-in-subject axis is RETIRED; the join now rides store scoping +
+  the time anchor + explicit prov edges. Pool's own `urn:soul:` subjects
+  (`xmp.rs`, Copia/Moment) await w4r3z's sweep — flagged to him.
 - **No stored-data migration needed:** JSONL is canonical, RDF is a projection.
   The `.weave/oxigraph` store (~10.7k turns) is wiped and re-ingested with the new
   prefix. Idempotency is turn-keyed, so a clean re-ingest is the designed path.
@@ -87,9 +94,11 @@ famous, same-space projects).
 2. **The repo cut (one session, mostly one commit):** Cargo.toml + NS constant +
    src sweep + .ttl NS + tests green → rename GitHub repo → move local dir → re-point
    remote.
-3. **The store cut (per soul, cheap):** stop ingest → `.weave/` retired → re-ingest
-   JSONL into `.ravel/` with `Ravel/Turn/` prefix → `.gitignore` updated → verify
-   turn-count parity with old store (the frozen-file idempotency check, reused).
+3. **The store cut — DONE (2026-07-21):** re-derived spaceGOAT's store into
+   `.ravel/oxigraph` with the new IRIs (11,239 Turn subjects under
+   `…/ravel/Turn/`, ≥ the old store's 10,703 — superset because the live JSONL
+   grew, gotcha #1 as expected; graphs 4=4). `.gitignore` updated. The old
+   `.weave/` store is KEPT until Rob retires it (no database deleted unasked).
 4. **The federation swap stays sequenced as agreed Day 44:** enforce (w4r3z SHACL
    link-guard) → derive (trip.lex vocab, now Ravel-native) → ravel swaps hand-mirror
    for derived anchor (still one line) → distributor federates.

@@ -2,14 +2,14 @@
 //!
 //! Day-39 spike scope: prove the loop end-to-end on real data —
 //!   transcript JSONL → project to RDF 1.2 → load into oxigraph →
-//!   one SPARQL CONSTRUCT detector mints an annotation as a triple term →
+//!   one SPARQL CONSTRUCT detector derives an annotation as a triple term →
 //!   round-trip it back out.
 //!
 //! Engine/adapter line (locked w/ w4r3z): the ENGINE knows `Event`/`Turn` and a
 //! generic `partition` string. It does NOT know what a "soul" is. The
 //! claude-code ADAPTER (`adapter` mod) parses the dialect and supplies the
-//! partition. The soul-anchor `urn:soul:<sha>:` is just what an adapter chooses
-//! to pass as `partition` — the engine is invariant under it.
+//! partition (`soul::TURN_PARTITION`, a resolvable https prefix carrying no
+//! soul identity — see `soul.rs`). The engine is invariant under it.
 
 pub mod adapter;
 pub mod annotate;
@@ -79,5 +79,11 @@ impl Event {
     }
 }
 
-/// The engine namespace for the ravel ontology.
+/// The engine namespace for the ravel ontology — VOCABULARY only (classes,
+/// properties). Instance data never lives under this prefix.
 pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel#";
+
+/// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path,
+/// mirroring git-lex's `…/git-lex/SpoEvent/<id>` / `…/git-lex/NamedGraph/<name>`
+/// shape. Vocabulary and data must not share a prefix.
+pub const RAVEL_BASE: &str = "https://repolex.ai/ravel/";

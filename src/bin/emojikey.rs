@@ -10,23 +10,19 @@
 //!
 //! This is the promotion the gate demanded: not the spike's FAKE STRLEN>2000
 //! "Verbose" detector, but a real reader proven green in the Python lab, ported
-//! and wired through the engine to mint genuine annotations anchored to true
+//! and wired through the engine to derive genuine annotations anchored to true
 //! source spans. The emojikeys are real keys the conversation already carried.
 
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
-use std::path::Path;
 use ravel::{adapter, annotate, reader, soul, RAVEL_NS};
 
 fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .context("usage: ravel-emojikey <transcript.jsonl> [soul-repo]")?;
-    // Optional soul-repo → the REAL federation partition. Without it, this stays
-    // a self-contained single-file demo on a clearly-labelled demo partition.
-    let soul_repo = std::env::args().nth(2);
+        .context("usage: ravel-emojikey <transcript.jsonl>")?;
     let jsonl = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
 
     // --- adapter: dialect → generic events ---
@@ -49,21 +45,9 @@ fn main() -> Result<()> {
     }
 
     // --- project: annotations → oxigraph as RDF 1.2 (oa:+prov:+triple term) ---
-    // Real soul partition when a soul-repo is given (the federation seam); else a
-    // clearly-labelled demo prefix so the single-file demo still runs standalone.
-    let partition = match &soul_repo {
-        Some(repo) => {
-            let p = soul::soul_partition(Path::new(repo))
-                .with_context(|| format!("resolve soul partition from {repo}"))?;
-            println!("[soul] federation partition: {p}");
-            p
-        }
-        None => {
-            println!("[soul] no soul-repo given — using demo partition (pass a soul-repo for the real federation seam)");
-            "urn:soul:demo-emojikey-sha:Ravel/Turn/".to_string()
-        }
-    };
-    let partition = partition.as_str();
+    // The constant partition: subjects carry no soul identity; soul scoping is
+    // the store, not the subject (see soul.rs).
+    let partition = soul::TURN_PARTITION;
     let transcript_id = std::path::Path::new(&path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -127,7 +111,7 @@ fn main() -> Result<()> {
         println!("  (nothing read back — the triple-term query found no detections)");
     } else {
         println!(
-            "\n[READER FIRES] {n} REAL emojikey annotation(s) minted as RDF 1.2 triple terms, \
+            "\n[READER FIRES] {n} REAL emojikey annotation(s) derived as RDF 1.2 triple terms, \
              anchored to true source spans, survived store→query→store."
         );
     }

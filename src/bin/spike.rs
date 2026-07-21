@@ -3,13 +3,13 @@
 //!   real transcript JSONL
 //!     → adapter::parse_transcript  (dialect → generic Events)
 //!     → project::project           (Events → oxigraph, RDF 1.2, partition-scoped)
-//!     → ONE SPARQL CONSTRUCT detector mints an annotation as a TRIPLE TERM
-//!     → round-trip the minted triple term back out and print it
+//!     → ONE SPARQL CONSTRUCT detector derives an annotation as a TRIPLE TERM
+//!     → round-trip the derived triple term back out and print it
 //!
 //! Run:  cargo run --bin ravel-spike -- <path-to-transcript.jsonl>
 //!
 //! The detector here is deliberately trivial (flags long assistant turns) —
-//! the POINT is not the detection, it's proving the mint+round-trip of a
+//! the POINT is not the detection, it's proving the derive+round-trip of a
 //! genuine RDF 1.2 triple term (`rdf:reifies <<( s p o )>>`, the UNASSERTED /
 //! belief form for a detection) works in Rust/oxigraph, against real triples.
 
@@ -34,13 +34,14 @@ fn main() -> Result<()> {
     }
 
     // --- engine: project under a partition. The engine doesn't know this is a
-    // "soul"; the adapter chose it. Mirrors Pool's urn:soul:<sha>: shape. ---
-    let partition = "urn:soul:demo-spike-sha:Ravel/Turn/";
+    // "soul"; the adapter chose it (soul scoping is the store, not the
+    // subject — see soul.rs). ---
+    let partition = ravel::soul::TURN_PARTITION;
     let store = project::project(&events, partition)?;
     println!("[project] store holds {} triples", store.len()?);
 
-    // --- detector: ONE SPARQL CONSTRUCT that MINTS an annotation as a triple
-    // term. "Long assistant turn" = text longer than 2000 chars. We mint an
+    // --- detector: ONE SPARQL CONSTRUCT that DERIVES an annotation as a triple
+    // term. "Long assistant turn" = text longer than 2000 chars. We derive an
     // unasserted belief: a reifier node that rdf:reifies the (turn, detected,
     // "verbose") proposition, carrying detector metadata + confidence. ---
     let detected = format!("{RAVEL_NS}detected");
@@ -68,7 +69,7 @@ fn main() -> Result<()> {
         "#
     );
 
-    let minted = match SparqlEvaluator::new()
+    let derived = match SparqlEvaluator::new()
         .parse_query(&construct)?
         .on_store(&store)
         .execute()?
@@ -83,21 +84,21 @@ fn main() -> Result<()> {
         _ => anyhow::bail!("CONSTRUCT did not return a graph"),
     };
     println!(
-        "[detector] CONSTRUCT minted {} triples ({} detection(s))",
-        minted.len(),
-        minted.len() / 3 // each detection = reifier + detector + confidence
+        "[detector] CONSTRUCT derived {} triples ({} detection(s))",
+        derived.len(),
+        derived.len() / 3 // each detection = reifier + detector + confidence
     );
 
-    // --- round-trip: load the minted triples back into a fresh store and read
+    // --- round-trip: load the derived triples back into a fresh store and read
     // them out via SELECT, proving the triple term survives store→query→store. ---
     let store2 = oxigraph::store::Store::new()?;
-    for t in &minted {
+    for t in &derived {
         // a Store is a quad store — drop the triple into the default graph
         store2.insert(t.clone().in_graph(GraphName::DefaultGraph).as_ref())?;
     }
     println!("[round-trip] re-loaded into fresh store: {} triples", store2.len()?);
 
-    // Read the minted detections back: find reifiers, follow rdf:reifies to the
+    // Read the derived detections back: find reifiers, follow rdf:reifies to the
     // triple term, and pull out the subject + detector + confidence.
     let select = format!(
         r#"
@@ -127,7 +128,7 @@ fn main() -> Result<()> {
         if n == 0 {
             println!("  (no detections fired — try a transcript with a >2000-char assistant turn)");
         } else {
-            println!("\n[SPIKE PASS] triple term minted by CONSTRUCT survived store→query→store round-trip.");
+            println!("\n[SPIKE PASS] triple term derived by CONSTRUCT survived store→query→store round-trip.");
         }
     }
 

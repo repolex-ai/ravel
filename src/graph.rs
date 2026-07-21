@@ -15,14 +15,15 @@
 //!    will NOT see them; every query here wraps in `GRAPH ?g { … }`. (Pool learned
 //!    this the hard way — chevron.rs:707.)
 //!
-//! 3. **Same registry / partition.** The partition string (`urn:soul:<sha>:…`)
-//!    is the adapter's, threaded through unchanged, so a Ravel⋈Pool join lines up
-//!    on the same soul URN. The engine never invents it.
+//! 3. **Same registry / partition.** The partition string
+//!    (`https://repolex.ai/ravel/Turn/` from the soul adapter) is threaded
+//!    through unchanged; the engine never invents it. Soul scoping is BY STORE,
+//!    not by subject — see `soul.rs`.
 
 use crate::annotate::annotation_nt;
 use crate::project::project_nt;
 use crate::reader::Annotation;
-use crate::{Event, RAVEL_NS};
+use crate::{Event, RAVEL_BASE, RAVEL_NS};
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphNameRef, NamedNode};
@@ -30,9 +31,11 @@ use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use std::path::Path;
 
-/// The named graph for one transcript's annotations.
+/// The named graph for one transcript's annotations. Lives under the
+/// instance base (`…/ravel/NamedGraph/<id>`, git-lex's shape) — NOT the
+/// ontology namespace, which is vocabulary-only.
 pub fn transcript_graph_iri(transcript_id: &str) -> String {
-    format!("{RAVEL_NS}graph/{}", safe(transcript_id))
+    format!("{RAVEL_BASE}NamedGraph/{}", safe(transcript_id))
 }
 
 /// Open (or create) the persistent store at `path`. Read-WRITE — takes the
@@ -186,7 +189,7 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
     let QueryResults::Solutions(solutions) = results else {
         anyhow::bail!("expected SELECT solutions");
     };
-    let prefix = format!("{RAVEL_NS}graph/");
+    let prefix = format!("{RAVEL_BASE}NamedGraph/");
     let mut hits = Vec::new();
     for sol in solutions {
         let sol = sol?;
@@ -242,7 +245,7 @@ mod tests {
     #[test]
     fn triple_term_survives_named_graph_and_reingest_is_idempotent() {
         let store = Store::new().unwrap(); // in-memory is the same API as on-disk
-        let part = "urn:soul:test-sha:Ravel/Turn/";
+        let part = "https://repolex.ai/ravel/Turn/";
         let evs = vec![ev("e1", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored)];
         let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1);
@@ -254,17 +257,17 @@ mod tests {
         assert_eq!(n1, n2, "re-ingest must not change the graph (idempotent)");
 
         // the referenced Turn NODE must be present with its time anchor — else
-        // the soul+time federation join has soul but not time (the dangling-Turn
-        // bug this ingest fixes).
+        // the federation join has the anchor edge but not time (the
+        // dangling-Turn bug this ingest fixes).
         let turn_q = format!(
             r#"PREFIX ravel: <{RAVEL_NS}>
                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
                ASK {{ GRAPH ?g {{ ?t rdf:type ravel:Turn ; ravel:timestamp ?ts .
-                      FILTER(STRSTARTS(STR(?t), "urn:soul:test-sha:")) }} }}"#
+                      FILTER(STRSTARTS(STR(?t), "https://repolex.ai/ravel/Turn/")) }} }}"#
         );
         let ask = SparqlEvaluator::new().parse_query(&turn_q).unwrap().on_store(&store).execute().unwrap();
         assert!(matches!(ask, QueryResults::Boolean(true)),
-            "the soul-prefixed Turn node with its timestamp must be in the graph");
+            "the Turn node with its timestamp must be in the graph");
 
         // GOTCHA #2: the triple term must be readable THROUGH the named graph.
         let hits = query_emojikeys(&store, None).unwrap();
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn two_sessions_accumulate_and_are_separable() {
         let store = Store::new().unwrap();
-        let part = "urn:soul:test-sha:Ravel/Turn/";
+        let part = "https://repolex.ai/ravel/Turn/";
         let eva = vec![ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)];
         let evb = vec![ev("e2", "[ME|x]~[CONTENT|y]~[YOU|z]", SourceKind::ToolResult)];
         let a = emojikey_read(&eva);
@@ -305,7 +308,7 @@ mod tests {
         // three turns carry no emojikey — annotation-scoped ingest would drop
         // them; full-spine keeps all three.
         let store = Store::new().unwrap();
-        let part = "urn:soul:test-sha:Ravel/Turn/";
+        let part = "https://repolex.ai/ravel/Turn/";
         let evs = vec![
             ev("e1", "just some prose, no key here", SourceKind::Authored),
             ev("e2", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored),

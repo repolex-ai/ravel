@@ -1,7 +1,8 @@
 //! Project generic `Event`s into an oxigraph Store as RDF 1.2.
 //!
 //! Subject URNs are partition-scoped: `<partition><event_id>` where the adapter
-//! supplies `partition` (for the soul adapter, `urn:soul:<sha>:`). The engine
+//! supplies `partition` (for the soul adapter, `https://repolex.ai/ravel/Turn/`,
+//! carrying no soul identity — soul scoping is the store). The engine
 //! treats `partition` as an opaque prefix — it does not know it means "soul".
 
 use crate::{Event, RAVEL_NS};
@@ -18,10 +19,10 @@ pub fn event_iri(partition: &str, event_id: &str) -> String {
 /// distinct ids ("a b" and "a_b" → same IRI) — identity-loss hidden as
 /// robustness. Today's adapter sources event_id from JSONL uuids (hex +
 /// hyphens, always valid); the first non-UUID dialect adapter hits this gate
-/// instead of silently minting a broken or colliding IRI.
+/// instead of silently deriving a broken or colliding IRI.
 pub fn validate_event_id(event_id: &str) -> Result<()> {
     if event_id.trim().is_empty() {
-        anyhow::bail!("empty event_id — refusing to mint an IRI for a non-event");
+        anyhow::bail!("empty event_id — refusing to derive an IRI for a non-event");
     }
     if !event_id
         .chars()
@@ -51,7 +52,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
 /// text). Exposed alongside `annotate::annotation_nt` so the persistent-graph
 /// ingest can load the Turn NODES into the same named graph as the annotations
 /// that reference them — without this, an annotation's soul-prefixed
-/// `ravel:atEvent` / `prov:used` anchor points at a Turn that was never minted,
+/// `ravel:atEvent` / `prov:used` anchor points at a Turn that was never derived,
 /// and the federation TIME anchor (`ravel:timestamp` xsd:dateTime) is absent, so
 /// a soul+time cross-store join has soul but not time. The Turn node is what
 /// carries the time half of the anchor contract.

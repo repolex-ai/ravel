@@ -74,7 +74,7 @@ fn ann_hash(transcript_id: &str, a: &Annotation) -> String {
 /// Project annotations for one transcript into a fresh in-memory store.
 ///
 /// `partition` is the engine-opaque prefix the adapter chose (for the soul
-/// adapter, `urn:soul:<sha>:Ravel/Turn/`). Event-anchor IRIs are
+/// adapter, `https://repolex.ai/ravel/Turn/`). Event-anchor IRIs are
 /// `<partition><event_id>` so the annotation's target resolves back to the same
 /// turn node the projector emits.
 pub fn project_annotations(
@@ -97,7 +97,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
     let a_type = format!("{RDF}type");
     for ann in anns {
         // Fail loud on an empty or malformed event_id: empty would silently
-        // mint the bare partition prefix as the event IRI and reify a claim
+        // derive the bare partition prefix as the event IRI and reify a claim
         // about a non-thing; malformed would embed IRI-breaking bytes. Five
         // triples depend on this id (eventId, atEvent, prov:used, and the
         // reified claim's subject) — the run stops here, not in a downstream
@@ -250,11 +250,11 @@ mod tests {
     #[test]
     fn empty_event_id_fails_loud() {
         // the flinch test (w3bl0rd's audit, Day 41): an empty event_id must
-        // REFUSE, not silently mint a claim anchored to the bare partition
+        // REFUSE, not silently derive a claim anchored to the bare partition
         // prefix. Healthy annotations continue to project fine.
         let mut anns = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         anns[0].event_id = "  ".into();
-        let Err(e) = project_annotations(&anns, "t", "urn:soul:x:Ravel/Turn/") else {
+        let Err(e) = project_annotations(&anns, "t", "https://repolex.ai/ravel/Turn/") else {
             panic!("empty event_id must refuse to project");
         };
         assert!(e.to_string().contains("empty event_id"));
@@ -263,7 +263,7 @@ mod tests {
         // collide two distinct ids into one IRI)
         let mut bad = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         bad[0].event_id = "e 1<".into();
-        let Err(e2) = project_annotations(&bad, "t", "urn:soul:x:Ravel/Turn/") else {
+        let Err(e2) = project_annotations(&bad, "t", "https://repolex.ai/ravel/Turn/") else {
             panic!("malformed event_id must refuse to project");
         };
         assert!(e2.to_string().contains("malformed event_id"));
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn projects_and_reads_back_through_triple_term() {
-        let part = "urn:soul:test-sha:Ravel/Turn/";
+        let part = "https://repolex.ai/ravel/Turn/";
         let anns = emojikey_read(&[ev("e1", "key [ME|🧠]~[CONTENT|💻]~[YOU|🎓] here")]);
         assert_eq!(anns.len(), 1);
         let store = project_annotations(&anns, "trans-1", part).unwrap();
@@ -326,7 +326,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         // a synthetic wave-math annotation with a NUMERIC magnitude leg
-        let mut mk = |mag: i64| {
+        let mk = |mag: i64| {
             let mut sig: BTreeMap<String, SignalValue> = BTreeMap::new();
             sig.insert("magnitude".into(), SignalValue::Int(mag));
             sig.insert("label".into(), SignalValue::Text("flux".into()));
@@ -342,7 +342,7 @@ mod tests {
             }
         };
         let anns = vec![mk(3), mk(8)];
-        let store = project_annotations(&anns, "trans-num", "urn:soul:x:Ravel/Turn/").unwrap();
+        let store = project_annotations(&anns, "trans-num", "https://repolex.ai/ravel/Turn/").unwrap();
 
         // NUMERIC filter: legs projected as plain strings would compare
         // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a

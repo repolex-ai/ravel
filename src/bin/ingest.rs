@@ -6,23 +6,20 @@
 //! query and prints what it found — the "see graphs of sessions" payoff.
 //!
 //! Run:
-//!   cargo run --bin ravel-ingest -- <store-dir> <sessions-dir> <soul-repo> [--authored-only]
+//!   cargo run --bin ravel-ingest -- <store-dir> <sessions-dir> [--authored-only]
 //!
 //! e.g.
 //!   cargo run --bin ravel-ingest -- /tmp/ravel-store \
-//!       ~/.claude/projects/-Users-dev-repos-SQUAD-spaceGOAT \
-//!       ~/repos/SQUAD/spaceGOAT
+//!       ~/.claude/projects/-Users-dev-repos-SQUAD-spaceGOAT
 //!
-//! The <soul-repo> supplies the REAL federation soul-sha (its `.lex/identity.yml`
-//! genesis_sha, resolved the SAME way Pool resolves it) — so the Turn subjects
-//! this mints carry the `urn:soul:<sha>:` prefix that cross-joins with Pool's
-//! Moments. No demo string.
+//! Turn subjects carry NO soul identity (`https://repolex.ai/ravel/Turn/<id>`);
+//! the soul scope IS the store you point this at — one soul repo, one store.
+//! See `soul.rs` for the ruling.
 //!
 //! Idempotent: re-running over the same sessions replaces each session's graph
 //! in place (deterministic IRIs + per-transcript named-graph clear-on-reload).
 
 use anyhow::{Context, Result};
-use std::path::Path;
 use ravel::{adapter, graph, reader, soul};
 
 fn main() -> Result<()> {
@@ -38,21 +35,14 @@ fn main() -> Result<()> {
     let mut positional = positional.into_iter();
     let store_dir = positional
         .next()
-        .context("usage: ravel-ingest <store-dir> <sessions-dir> <soul-repo> [--authored-only]")?;
+        .context("usage: ravel-ingest <store-dir> <sessions-dir> [--authored-only]")?;
     let sessions_dir = positional.next().context("missing <sessions-dir>")?;
-    let soul_repo = positional
-        .next()
-        .context("missing <soul-repo> — the soul whose sessions these are (its .lex/identity.yml supplies the federation soul-sha)")?;
 
     let store = graph::open(&store_dir)?;
-    // The soul-adapter mints the REAL partition from the soul repo's pinned
-    // genesis sha (`.lex/identity.yml`), the SAME mechanism Pool uses — so Ravel
-    // Turn subjects share the `urn:soul:<sha>:` prefix with Pool Moments and the
-    // cross-store join is trivial. No more demo string.
-    let partition = soul::soul_partition(Path::new(&soul_repo))
-        .with_context(|| format!("resolve soul partition from {soul_repo}"))?;
-    let partition = partition.as_str();
-    println!("[soul] federation partition: {partition}");
+    // The soul-adapter's constant partition: subjects carry no soul identity;
+    // the store you opened IS the soul scope (see soul.rs).
+    let partition = soul::TURN_PARTITION;
+    println!("[soul] turn partition: {partition}");
 
     // --- walk the session logs ---
     let mut sessions = 0usize;
