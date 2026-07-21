@@ -1,4 +1,4 @@
-//! Weave — first REAL reader fires.
+//! Ravel — first REAL reader fires.
 //!
 //!   real transcript JSONL
 //!     → adapter::parse_transcript      (dialect → generic Events)
@@ -6,7 +6,7 @@
 //!     → annotate::project_annotations  (oa: + prov: + RDF-1.2 triple-term claims)
 //!     → round-trip + SPARQL read-back through the triple term
 //!
-//! Run:  cargo run --bin weave-emojikey -- <path-to-transcript.jsonl>
+//! Run:  cargo run --bin ravel-emojikey -- <path-to-transcript.jsonl>
 //!
 //! This is the promotion the gate demanded: not the spike's FAKE STRLEN>2000
 //! "Verbose" detector, but a real reader proven green in the Python lab, ported
@@ -18,12 +18,12 @@ use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use std::path::Path;
-use weave::{adapter, annotate, reader, soul, WEAVE_NS};
+use ravel::{adapter, annotate, reader, soul, RAVEL_NS};
 
 fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .context("usage: weave-emojikey <transcript.jsonl> [soul-repo]")?;
+        .context("usage: ravel-emojikey <transcript.jsonl> [soul-repo]")?;
     // Optional soul-repo → the REAL federation partition. Without it, this stays
     // a self-contained single-file demo on a clearly-labelled demo partition.
     let soul_repo = std::env::args().nth(2);
@@ -35,8 +35,8 @@ fn main() -> Result<()> {
 
     // --- reader: a REAL, proven reader. Harvest inline emojikeys. ---
     let anns = reader::emojikey_read(&events);
-    let authored = anns.iter().filter(|a| a.source_kind == Some(weave::SourceKind::Authored)).count();
-    let quoted = anns.iter().filter(|a| a.source_kind == Some(weave::SourceKind::ToolResult)).count();
+    let authored = anns.iter().filter(|a| a.source_kind == Some(ravel::SourceKind::Authored)).count();
+    let quoted = anns.iter().filter(|a| a.source_kind == Some(ravel::SourceKind::ToolResult)).count();
     println!(
         "[reader:emojikey] harvested {} emojikey(s)  ({} authored / {} quoted-in-tool-result)",
         anns.len(),
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
         }
         None => {
             println!("[soul] no soul-repo given — using demo partition (pass a soul-repo for the real federation seam)");
-            "urn:soul:demo-emojikey-sha:Weave/Turn/".to_string()
+            "urn:soul:demo-emojikey-sha:Ravel/Turn/".to_string()
         }
     };
     let partition = partition.as_str();
@@ -81,18 +81,18 @@ fn main() -> Result<()> {
     let oa = "http://www.w3.org/ns/oa#";
     let select = format!(
         r#"
-        PREFIX weave: <{WEAVE_NS}>
+        PREFIX ravel: <{RAVEL_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         PREFIX oa: <{oa}>
         PREFIX prov: <http://www.w3.org/ns/prov#>
         SELECT ?det ?me ?content ?you ?start ?end ?sk WHERE {{
-            ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+            ?claim rdf:reifies <<( ?event ravel:exhibits "emojikey/harvest" )>> ;
                    prov:wasDerivedFrom ?ann ;
-                   weave:detector ?det .
+                   ravel:detector ?det .
             ?ann oa:hasBody ?body ;
                  oa:hasTarget ?t .
-            OPTIONAL {{ ?ann weave:sourceKind ?sk }}
-            ?body weave:sig_me ?me ; weave:sig_content ?content ; weave:sig_you ?you .
+            OPTIONAL {{ ?ann ravel:sourceKind ?sk }}
+            ?body ravel:sig_me ?me ; ravel:sig_content ?content ; ravel:sig_you ?you .
             ?t oa:hasSelector ?sel .
             ?sel oa:start ?start ; oa:end ?end .
         }}

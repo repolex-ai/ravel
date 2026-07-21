@@ -1,4 +1,4 @@
-//! Weave — transcript-graph engine (Rust core).
+//! Ravel — transcript-graph engine (Rust core).
 //!
 //! Day-39 spike scope: prove the loop end-to-end on real data —
 //!   transcript JSONL → project to RDF 1.2 → load into oxigraph →
@@ -50,7 +50,7 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    /// Stable lowercase tag for RDF projection (`weave:sourceKind "authored"`).
+    /// Stable lowercase tag for RDF projection (`ravel:sourceKind "authored"`).
     pub fn tag(self) -> &'static str {
         match self {
             SourceKind::Authored => "authored",
@@ -79,5 +79,5 @@ impl Event {
     }
 }
 
-/// The engine namespace for the weave ontology.
-pub const WEAVE_NS: &str = "https://repolex.ai/ontology/weave#";
+/// The engine namespace for the ravel ontology.
+pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel#";

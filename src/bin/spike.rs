@@ -1,4 +1,4 @@
-//! Weave Day-39 spike — prove the loop on REAL data.
+//! Ravel Day-39 spike — prove the loop on REAL data.
 //!
 //!   real transcript JSONL
 //!     → adapter::parse_transcript  (dialect → generic Events)
@@ -6,7 +6,7 @@
 //!     → ONE SPARQL CONSTRUCT detector mints an annotation as a TRIPLE TERM
 //!     → round-trip the minted triple term back out and print it
 //!
-//! Run:  cargo run --bin weave-spike -- <path-to-transcript.jsonl>
+//! Run:  cargo run --bin ravel-spike -- <path-to-transcript.jsonl>
 //!
 //! The detector here is deliberately trivial (flags long assistant turns) —
 //! the POINT is not the detection, it's proving the mint+round-trip of a
@@ -16,12 +16,12 @@
 use anyhow::{Context, Result};
 use oxigraph::model::GraphName;
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use weave::{adapter, project, WEAVE_NS};
+use ravel::{adapter, project, RAVEL_NS};
 
 fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .context("usage: weave-spike <transcript.jsonl>")?;
+        .context("usage: ravel-spike <transcript.jsonl>")?;
     let jsonl = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {path}"))?;
 
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
 
     // --- engine: project under a partition. The engine doesn't know this is a
     // "soul"; the adapter chose it. Mirrors Pool's urn:soul:<sha>: shape. ---
-    let partition = "urn:soul:demo-spike-sha:Weave/Turn/";
+    let partition = "urn:soul:demo-spike-sha:Ravel/Turn/";
     let store = project::project(&events, partition)?;
     println!("[project] store holds {} triples", store.len()?);
 
@@ -43,18 +43,18 @@ fn main() -> Result<()> {
     // term. "Long assistant turn" = text longer than 2000 chars. We mint an
     // unasserted belief: a reifier node that rdf:reifies the (turn, detected,
     // "verbose") proposition, carrying detector metadata + confidence. ---
-    let detected = format!("{WEAVE_NS}detected");
-    let verbose = format!("{WEAVE_NS}Verbose");
-    let p_text = format!("{WEAVE_NS}text");
-    let p_detector = format!("{WEAVE_NS}detector");
-    let p_confidence = format!("{WEAVE_NS}confidence");
+    let detected = format!("{RAVEL_NS}detected");
+    let verbose = format!("{RAVEL_NS}Verbose");
+    let p_text = format!("{RAVEL_NS}text");
+    let p_detector = format!("{RAVEL_NS}detector");
+    let p_confidence = format!("{RAVEL_NS}confidence");
     let xsd_decimal = "http://www.w3.org/2001/XMLSchema#decimal";
 
     // RDF 1.2 triple term in CONSTRUCT: the reifier is a blank node that
-    // rdf:reifies the (unasserted) proposition `?turn weave:detected weave:Verbose`.
+    // rdf:reifies the (unasserted) proposition `?turn ravel:detected ravel:Verbose`.
     let construct = format!(
         r#"
-        PREFIX weave: <{WEAVE_NS}>
+        PREFIX ravel: <{RAVEL_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         CONSTRUCT {{
             _:r rdf:reifies <<( ?turn <{detected}> <{verbose}> )>> ;
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
     // triple term, and pull out the subject + detector + confidence.
     let select = format!(
         r#"
-        PREFIX weave: <{WEAVE_NS}>
+        PREFIX ravel: <{RAVEL_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         SELECT ?turn ?detector ?conf WHERE {{
             ?r rdf:reifies <<( ?turn <{detected}> <{verbose}> )>> ;

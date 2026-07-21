@@ -1,4 +1,4 @@
-//! Weave SOUL-ADAPTER — the one thin layer that knows what a "soul" is.
+//! Ravel SOUL-ADAPTER — the one thin layer that knows what a "soul" is.
 //!
 //! The engine (`project`, `annotate`, `graph`) is partition-key-agnostic: it
 //! takes an opaque `partition` string and never learns it means "soul". THIS
@@ -6,12 +6,12 @@
 //! federation seam lives in exactly one place.
 //!
 //! ## The federation contract (locked w/ w4r3z, Day 38 — soul repo memory
-//! `2026-06-29-weave-pool-federation-anchor-contract`)
-//! Weave and Pool never co-store; they cross-join on anchors stamped IDENTICALLY
+//! `2026-06-29-ravel-pool-federation-anchor-contract`)
+//! Ravel and Pool never co-store; they cross-join on anchors stamped IDENTICALLY
 //! on both sides. The soul anchor is the load-bearing one:
 //!
 //!   Pool  Moment subject = `urn:soul:<genesis_sha>:Copia/Moment/<file>`
-//!   Weave Turn   subject = `urn:soul:<genesis_sha>:Weave/Turn/<event_id>`
+//!   Ravel Turn   subject = `urn:soul:<genesis_sha>:Ravel/Turn/<event_id>`
 //!
 //! The `<genesis_sha>` MUST be the SAME string on both sides, resolved through
 //! the SAME mechanism — else two soul-id spaces LOOK joinable but silently
@@ -35,7 +35,7 @@ use std::path::Path;
 /// Read a soul repo's pinned genesis SHA from `.lex/identity.yml`.
 ///
 /// Mirrors `pool/src/soul_pool.rs::read_soul_genesis_sha` byte-for-byte in
-/// behaviour so Weave and Pool resolve the SAME soul to the SAME sha. Do NOT
+/// behaviour so Ravel and Pool resolve the SAME soul to the SAME sha. Do NOT
 /// "improve" this to compute the sha from git — the pinned file is canonical.
 pub fn read_genesis_sha(soul_repo: &Path) -> Result<String> {
     let identity = soul_repo.join(".lex").join("identity.yml");
@@ -56,16 +56,16 @@ pub fn read_genesis_sha(soul_repo: &Path) -> Result<String> {
     ))
 }
 
-/// The Weave partition prefix for a soul: `urn:soul:<sha>:Weave/Turn/`.
+/// The Ravel partition prefix for a soul: `urn:soul:<sha>:Ravel/Turn/`.
 ///
 /// Appended with an `event_id` by the engine's `event_iri`, this yields the
-/// federation-shaped Turn subject `urn:soul:<sha>:Weave/Turn/<event_id>` that
+/// federation-shaped Turn subject `urn:soul:<sha>:Ravel/Turn/<event_id>` that
 /// shares the `urn:soul:<sha>:` prefix with Pool's Moment subjects.
 pub fn turn_partition(genesis_sha: &str) -> String {
-    format!("urn:soul:{genesis_sha}:Weave/Turn/")
+    format!("urn:soul:{genesis_sha}:Ravel/Turn/")
 }
 
-/// Resolve a soul repo path straight to its Weave Turn partition string —
+/// Resolve a soul repo path straight to its Ravel Turn partition string —
 /// the one call an adapter/binary makes to replace a demo partition.
 pub fn soul_partition(soul_repo: &Path) -> Result<String> {
     Ok(turn_partition(&read_genesis_sha(soul_repo)?))
@@ -76,18 +76,18 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// The partition is contract-shaped: `urn:soul:<sha>:Weave/Turn/`, and it
+    /// The partition is contract-shaped: `urn:soul:<sha>:Ravel/Turn/`, and it
     /// shares the `urn:soul:<sha>:` prefix a Pool Moment subject carries — the
     /// whole point of the federation seam.
     #[test]
     fn partition_is_federation_shaped_and_shares_pool_prefix() {
         let sha = "9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b";
         let part = turn_partition(sha);
-        assert_eq!(part, "urn:soul:9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b:Weave/Turn/");
+        assert_eq!(part, "urn:soul:9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b:Ravel/Turn/");
         // A Pool Moment subject for the same soul:
         let pool_moment = format!("urn:soul:{sha}:Copia/Moment/render-123.json");
         let common = format!("urn:soul:{sha}:");
-        assert!(part.starts_with(&common), "Weave turn must carry the soul prefix");
+        assert!(part.starts_with(&common), "Ravel turn must carry the soul prefix");
         assert!(pool_moment.starts_with(&common), "Pool moment carries the same prefix");
         // and the event-id appends cleanly to a full turn subject
         let turn_subject = format!("{part}0f8a1c2d-uuid");
@@ -97,7 +97,7 @@ mod tests {
     /// Reads the pinned sha from a real `.lex/identity.yml`, mirroring Pool.
     #[test]
     fn reads_pinned_genesis_from_identity_yml() {
-        let dir = std::env::temp_dir().join("weave-soul-test-ok");
+        let dir = std::env::temp_dir().join("ravel-soul-test-ok");
         let lex = dir.join(".lex");
         fs::create_dir_all(&lex).unwrap();
         fs::write(
@@ -114,7 +114,7 @@ mod tests {
     /// bad sha would forge a partition that joins nothing.
     #[test]
     fn rejects_missing_or_malformed_genesis() {
-        let dir = std::env::temp_dir().join("weave-soul-test-bad");
+        let dir = std::env::temp_dir().join("ravel-soul-test-bad");
         let lex = dir.join(".lex");
         fs::create_dir_all(&lex).unwrap();
         fs::write(lex.join("identity.yml"), "genesis_sha: not-a-sha!!\n").unwrap();

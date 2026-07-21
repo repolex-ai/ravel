@@ -10,19 +10,19 @@
 //!    doesn't leave a ghost. Verified by the idempotent-reingest test.
 //!
 //! 2. **Named-graph read-wrapping.** Each transcript's annotations live in their
-//!    OWN named graph `weave:graph/<transcript_id>` (a per-session provenance
+//!    OWN named graph `ravel:graph/<transcript_id>` (a per-session provenance
 //!    unit — droppable, re-ingestable atomically). A naked default-graph query
 //!    will NOT see them; every query here wraps in `GRAPH ?g { … }`. (Pool learned
 //!    this the hard way — chevron.rs:707.)
 //!
 //! 3. **Same registry / partition.** The partition string (`urn:soul:<sha>:…`)
-//!    is the adapter's, threaded through unchanged, so a Weave⋈Pool join lines up
+//!    is the adapter's, threaded through unchanged, so a Ravel⋈Pool join lines up
 //!    on the same soul URN. The engine never invents it.
 
 use crate::annotate::annotation_nt;
 use crate::project::project_nt;
 use crate::reader::Annotation;
-use crate::{Event, WEAVE_NS};
+use crate::{Event, RAVEL_NS};
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphNameRef, NamedNode};
@@ -32,7 +32,7 @@ use std::path::Path;
 
 /// The named graph for one transcript's annotations.
 pub fn transcript_graph_iri(transcript_id: &str) -> String {
-    format!("{WEAVE_NS}graph/{}", safe(transcript_id))
+    format!("{RAVEL_NS}graph/{}", safe(transcript_id))
 }
 
 /// Open (or create) the persistent store at `path`. Read-WRITE — takes the
@@ -53,8 +53,8 @@ pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
 /// idempotently.
 ///
 /// Both halves go into the same graph on purpose: the annotations carry
-/// soul-prefixed `weave:atEvent` / `prov:used` references to Turn IRIs, and the
-/// Turn NODES carry the federation TIME anchor (`weave:timestamp` xsd:dateTime).
+/// soul-prefixed `ravel:atEvent` / `prov:used` references to Turn IRIs, and the
+/// Turn NODES carry the federation TIME anchor (`ravel:timestamp` xsd:dateTime).
 /// Ingesting annotations alone would leave those references dangling and the
 /// soul+time cross-store join would have soul but not time — verified the hard
 /// way (a fed-probe found 32 soul-prefixed anchors but 0 actual Turn nodes).
@@ -164,18 +164,18 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
     // ?g is the transcript graph; strip the graph-IRI prefix to a readable id.
     let q = format!(
         r#"
-        PREFIX weave: <{WEAVE_NS}>
+        PREFIX ravel: <{RAVEL_NS}>
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         PREFIX oa: <http://www.w3.org/ns/oa#>
         PREFIX prov: <http://www.w3.org/ns/prov#>
         SELECT ?g ?sk ?me ?content ?you ?ts WHERE {{
             GRAPH ?g {{
-                ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+                ?claim rdf:reifies <<( ?event ravel:exhibits "emojikey/harvest" )>> ;
                        prov:wasDerivedFrom ?ann .
                 ?ann oa:hasBody ?body .
-                OPTIONAL {{ ?ann weave:sourceKind ?sk }}
+                OPTIONAL {{ ?ann ravel:sourceKind ?sk }}
                 OPTIONAL {{ ?ann prov:generatedAtTime ?ts }}
-                ?body weave:sig_me ?me ; weave:sig_content ?content ; weave:sig_you ?you .
+                ?body ravel:sig_me ?me ; ravel:sig_content ?content ; ravel:sig_you ?you .
                 {filter}
             }}
         }}
@@ -186,7 +186,7 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
     let QueryResults::Solutions(solutions) = results else {
         anyhow::bail!("expected SELECT solutions");
     };
-    let prefix = format!("{WEAVE_NS}graph/");
+    let prefix = format!("{RAVEL_NS}graph/");
     let mut hits = Vec::new();
     for sol in solutions {
         let sol = sol?;
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn triple_term_survives_named_graph_and_reingest_is_idempotent() {
         let store = Store::new().unwrap(); // in-memory is the same API as on-disk
-        let part = "urn:soul:test-sha:Weave/Turn/";
+        let part = "urn:soul:test-sha:Ravel/Turn/";
         let evs = vec![ev("e1", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored)];
         let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1);
@@ -257,9 +257,9 @@ mod tests {
         // the soul+time federation join has soul but not time (the dangling-Turn
         // bug this ingest fixes).
         let turn_q = format!(
-            r#"PREFIX weave: <{WEAVE_NS}>
+            r#"PREFIX ravel: <{RAVEL_NS}>
                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-               ASK {{ GRAPH ?g {{ ?t rdf:type weave:Turn ; weave:timestamp ?ts .
+               ASK {{ GRAPH ?g {{ ?t rdf:type ravel:Turn ; ravel:timestamp ?ts .
                       FILTER(STRSTARTS(STR(?t), "urn:soul:test-sha:")) }} }}"#
         );
         let ask = SparqlEvaluator::new().parse_query(&turn_q).unwrap().on_store(&store).execute().unwrap();
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn two_sessions_accumulate_and_are_separable() {
         let store = Store::new().unwrap();
-        let part = "urn:soul:test-sha:Weave/Turn/";
+        let part = "urn:soul:test-sha:Ravel/Turn/";
         let eva = vec![ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)];
         let evb = vec![ev("e2", "[ME|x]~[CONTENT|y]~[YOU|z]", SourceKind::ToolResult)];
         let a = emojikey_read(&eva);
@@ -305,7 +305,7 @@ mod tests {
         // three turns carry no emojikey — annotation-scoped ingest would drop
         // them; full-spine keeps all three.
         let store = Store::new().unwrap();
-        let part = "urn:soul:test-sha:Weave/Turn/";
+        let part = "urn:soul:test-sha:Ravel/Turn/";
         let evs = vec![
             ev("e1", "just some prose, no key here", SourceKind::Authored),
             ev("e2", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored),
@@ -318,8 +318,8 @@ mod tests {
 
         // ALL THREE turns are present as spine nodes (not just the annotated one).
         let count_q = format!(
-            r#"PREFIX weave: <{WEAVE_NS}>
-               SELECT (COUNT(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a weave:Turn }} }}"#
+            r#"PREFIX ravel: <{RAVEL_NS}>
+               SELECT (COUNT(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a ravel:Turn }} }}"#
         );
         let res = SparqlEvaluator::new().parse_query(&count_q).unwrap().on_store(&store).execute().unwrap();
         if let QueryResults::Solutions(mut s) = res {

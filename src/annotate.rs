@@ -8,12 +8,12 @@
 //!         oa:hasTarget [ oa:hasSource <transcript> ;
 //!                        oa:hasSelector [ a oa:TextPositionSelector ;
 //!                                         oa:start ; oa:end ] ;
-//!                        weave:eventId … ] ;
-//!         oa:hasBody [ weave:sig_* … ] ;
+//!                        ravel:eventId … ] ;
+//!         oa:hasBody [ ravel:sig_* … ] ;
 //!         prov:used <evidence> .
-//!   claim rdf:reifies <<( event weave:exhibits "event_type" )>> ;  # UNASSERTED
+//!   claim rdf:reifies <<( event ravel:exhibits "event_type" )>> ;  # UNASSERTED
 //!         prov:wasDerivedFrom ann ;                                #   belief form
-//!         weave:detector ; weave:detectionType .
+//!         ravel:detector ; ravel:detectionType .
 //!
 //! The reified proposition is the WORLD-claim — "this event exhibits X" — and it
 //! is never asserted: a detection is an unasserted CLAIM carrying detector
@@ -21,7 +21,7 @@
 //! The subject must be the EVENT, not the annotation: reifying a statement about
 //! the annotation would just restate metadata the annotation already asserts,
 //! leaving the actual detection asserted-by-implication. (The original spike had
-//! this right — `<<( turn weave:detected ... )>>` — the emojikey promotion
+//! this right — `<<( turn ravel:detected ... )>>` — the emojikey promotion
 //! drifted.) claim → ann via prov:wasDerivedFrom joins belief to evidence.
 //! RDF 1.2 triple term = `<<( s p o )>>` (PARENS, object-position) +
 //! `rdf:reifies` — squad standard, NOT RDF-star `<< >>`.
@@ -31,7 +31,7 @@
 //! w4r3z idempotency discipline, carried into the annotation IRIs.
 
 use crate::reader::Annotation;
-use crate::WEAVE_NS;
+use crate::RAVEL_NS;
 use anyhow::Result;
 use oxigraph::store::Store;
 use sha2::{Digest, Sha256};
@@ -74,7 +74,7 @@ fn ann_hash(transcript_id: &str, a: &Annotation) -> String {
 /// Project annotations for one transcript into a fresh in-memory store.
 ///
 /// `partition` is the engine-opaque prefix the adapter chose (for the soul
-/// adapter, `urn:soul:<sha>:Weave/Turn/`). Event-anchor IRIs are
+/// adapter, `urn:soul:<sha>:Ravel/Turn/`). Event-anchor IRIs are
 /// `<partition><event_id>` so the annotation's target resolves back to the same
 /// turn node the projector emits.
 pub fn project_annotations(
@@ -110,10 +110,10 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
             )
         })?;
         let h = ann_hash(transcript_id, ann);
-        let ann_iri = format!("{WEAVE_NS}ann/{h}");
-        let claim_iri = format!("{WEAVE_NS}claim/{h}");
-        let detector_iri = format!("{WEAVE_NS}detector/{}", safe(&ann.reader));
-        let transcript_iri = format!("{WEAVE_NS}transcript/{}", safe(transcript_id));
+        let ann_iri = format!("{RAVEL_NS}ann/{h}");
+        let claim_iri = format!("{RAVEL_NS}claim/{h}");
+        let detector_iri = format!("{RAVEL_NS}detector/{}", safe(&ann.reader));
+        let transcript_iri = format!("{RAVEL_NS}transcript/{}", safe(transcript_id));
         let target_iri = format!("{ann_iri}/target");
         let selector_iri = format!("{ann_iri}/selector");
         let body_iri = format!("{ann_iri}/body");
@@ -122,12 +122,12 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
 
         // --- detector as a prov:SoftwareAgent ---
         triple(&mut nt, iri(&detector_iri), iri(&a_type), iri(&format!("{PROV}SoftwareAgent")));
-        triple(&mut nt, iri(&detector_iri), iri(&format!("{WEAVE_NS}readerName")), str_lit(&ann.reader));
+        triple(&mut nt, iri(&detector_iri), iri(&format!("{RAVEL_NS}readerName")), str_lit(&ann.reader));
 
         // --- the annotation (oa:) ---
         triple(&mut nt, iri(&ann_iri), iri(&a_type), iri(&format!("{OA}Annotation")));
         triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}wasAttributedTo")), iri(&detector_iri));
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{WEAVE_NS}eventType")), str_lit(&ann.event_type));
+        triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}eventType")), str_lit(&ann.event_type));
         if let Some(ts) = &ann.ts {
             triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}generatedAtTime")), typed_lit(ts, &format!("{XSD}dateTime")));
         }
@@ -135,7 +135,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // TOOL_RESULT (quoted/pasted)? Carried on the annotation so a query can
         // filter to live keys — the lossless-emit decision (don't drop at read).
         if let Some(sk) = ann.source_kind {
-            triple(&mut nt, iri(&ann_iri), iri(&format!("{WEAVE_NS}sourceKind")), str_lit(sk.tag()));
+            triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}sourceKind")), str_lit(sk.tag()));
         }
 
         // --- target: a span of the source. Matches the proven Python shape:
@@ -151,8 +151,8 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         triple(&mut nt, iri(&selector_iri), iri(&format!("{OA}end")), typed_lit(&ann.end.to_string(), &format!("{XSD}integer")));
         // durable per-turn join key — the event node the projector emits, so the
         // annotation joins straight back to its exact turn (not just the doc).
-        triple(&mut nt, iri(&target_iri), iri(&format!("{WEAVE_NS}eventId")), str_lit(&ann.event_id));
-        triple(&mut nt, iri(&target_iri), iri(&format!("{WEAVE_NS}atEvent")), iri(&event_iri));
+        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}eventId")), str_lit(&ann.event_id));
+        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}atEvent")), iri(&event_iri));
 
         // --- evidence (prov:used): what the detector looked at = the event ---
         triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}used")), iri(&event_iri));
@@ -166,25 +166,25 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
                 Some(dt) => typed_lit(&v.lexical(), dt),
                 None => str_lit(&v.lexical()),
             };
-            triple(&mut nt, iri(&body_iri), iri(&format!("{WEAVE_NS}sig_{}", safe(k))), obj);
+            triple(&mut nt, iri(&body_iri), iri(&format!("{RAVEL_NS}sig_{}", safe(k))), obj);
         }
 
         // --- the CLAIM: an RDF 1.2 triple term, UNASSERTED, carrying meta ---
-        // <<( event weave:exhibits "event_type" )>> — the world-claim ("this
+        // <<( event ravel:exhibits "event_type" )>> — the world-claim ("this
         // turn exhibits X"), never asserted. Subject is the EVENT: reifying a
         // statement about the annotation would restate already-asserted
         // metadata and the belief semantics would protect nothing.
         let proposition = format!(
             "<<( {} {} {} )>>",
             iri(&event_iri),
-            iri(&format!("{WEAVE_NS}exhibits")),
+            iri(&format!("{RAVEL_NS}exhibits")),
             str_lit(&ann.event_type),
         );
         triple(&mut nt, iri(&claim_iri), iri(&format!("{RDF}reifies")), proposition);
         // belief → evidence: the claim is derived from the annotation wrapper
         triple(&mut nt, iri(&claim_iri), iri(&format!("{PROV}wasDerivedFrom")), iri(&ann_iri));
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detector")), str_lit(&ann.reader));
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{WEAVE_NS}detectionType")), str_lit(&ann.event_type));
+        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detector")), str_lit(&ann.reader));
+        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detectionType")), str_lit(&ann.event_type));
     }
 
     Ok(nt)
@@ -254,7 +254,7 @@ mod tests {
         // prefix. Healthy annotations continue to project fine.
         let mut anns = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         anns[0].event_id = "  ".into();
-        let Err(e) = project_annotations(&anns, "t", "urn:soul:x:Weave/Turn/") else {
+        let Err(e) = project_annotations(&anns, "t", "urn:soul:x:Ravel/Turn/") else {
             panic!("empty event_id must refuse to project");
         };
         assert!(e.to_string().contains("empty event_id"));
@@ -263,7 +263,7 @@ mod tests {
         // collide two distinct ids into one IRI)
         let mut bad = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         bad[0].event_id = "e 1<".into();
-        let Err(e2) = project_annotations(&bad, "t", "urn:soul:x:Weave/Turn/") else {
+        let Err(e2) = project_annotations(&bad, "t", "urn:soul:x:Ravel/Turn/") else {
             panic!("malformed event_id must refuse to project");
         };
         assert!(e2.to_string().contains("malformed event_id"));
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn projects_and_reads_back_through_triple_term() {
-        let part = "urn:soul:test-sha:Weave/Turn/";
+        let part = "urn:soul:test-sha:Ravel/Turn/";
         let anns = emojikey_read(&[ev("e1", "key [ME|🧠]~[CONTENT|💻]~[YOU|🎓] here")]);
         assert_eq!(anns.len(), 1);
         let store = project_annotations(&anns, "trans-1", part).unwrap();
@@ -294,16 +294,16 @@ mod tests {
 
         let q = format!(
             r#"
-            PREFIX weave: <{WEAVE_NS}>
+            PREFIX ravel: <{RAVEL_NS}>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             PREFIX oa: <{OA}>
             PREFIX prov: <{PROV}>
             SELECT ?event ?det ?me WHERE {{
-                ?claim rdf:reifies <<( ?event weave:exhibits "emojikey/harvest" )>> ;
+                ?claim rdf:reifies <<( ?event ravel:exhibits "emojikey/harvest" )>> ;
                        prov:wasDerivedFrom ?ann ;
-                       weave:detector ?det .
+                       ravel:detector ?det .
                 ?ann oa:hasBody ?body .
-                ?body weave:sig_me ?me .
+                ?body ravel:sig_me ?me .
             }}
             "#
         );
@@ -342,15 +342,15 @@ mod tests {
             }
         };
         let anns = vec![mk(3), mk(8)];
-        let store = project_annotations(&anns, "trans-num", "urn:soul:x:Weave/Turn/").unwrap();
+        let store = project_annotations(&anns, "trans-num", "urn:soul:x:Ravel/Turn/").unwrap();
 
         // NUMERIC filter: legs projected as plain strings would compare
         // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a
         // typed xsd:integer makes `> 5` a real number comparison.
         let q = format!(
-            r#"PREFIX weave: <{WEAVE_NS}>
+            r#"PREFIX ravel: <{RAVEL_NS}>
                SELECT (COUNT(*) AS ?big) WHERE {{
-                 ?body weave:sig_magnitude ?m . FILTER(?m > 5) }}"#
+                 ?body ravel:sig_magnitude ?m . FILTER(?m > 5) }}"#
         );
         let res = SparqlEvaluator::new().parse_query(&q).unwrap().on_store(&store).execute().unwrap();
         let QueryResults::Solutions(sols) = res else { panic!("expected solutions") };

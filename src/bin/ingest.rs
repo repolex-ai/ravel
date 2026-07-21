@@ -1,4 +1,4 @@
-//! Weave — ingest many sessions into ONE persistent graph, then see it.
+//! Ravel — ingest many sessions into ONE persistent graph, then see it.
 //!
 //! Walks a directory of Claude Code `.jsonl` session logs, runs the emojikey
 //! reader over each, and ingests every session's annotations into its own named
@@ -6,10 +6,10 @@
 //! query and prints what it found — the "see graphs of sessions" payoff.
 //!
 //! Run:
-//!   cargo run --bin weave-ingest -- <store-dir> <sessions-dir> <soul-repo> [--authored-only]
+//!   cargo run --bin ravel-ingest -- <store-dir> <sessions-dir> <soul-repo> [--authored-only]
 //!
 //! e.g.
-//!   cargo run --bin weave-ingest -- /tmp/weave-store \
+//!   cargo run --bin ravel-ingest -- /tmp/ravel-store \
 //!       ~/.claude/projects/-Users-dev-repos-SQUAD-spaceGOAT \
 //!       ~/repos/SQUAD/spaceGOAT
 //!
@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use weave::{adapter, graph, reader, soul};
+use ravel::{adapter, graph, reader, soul};
 
 fn main() -> Result<()> {
     let mut positional = Vec::new();
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     let mut positional = positional.into_iter();
     let store_dir = positional
         .next()
-        .context("usage: weave-ingest <store-dir> <sessions-dir> <soul-repo> [--authored-only]")?;
+        .context("usage: ravel-ingest <store-dir> <sessions-dir> <soul-repo> [--authored-only]")?;
     let sessions_dir = positional.next().context("missing <sessions-dir>")?;
     let soul_repo = positional
         .next()
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
 
     let store = graph::open(&store_dir)?;
     // The soul-adapter mints the REAL partition from the soul repo's pinned
-    // genesis sha (`.lex/identity.yml`), the SAME mechanism Pool uses — so Weave
+    // genesis sha (`.lex/identity.yml`), the SAME mechanism Pool uses — so Ravel
     // Turn subjects share the `urn:soul:<sha>:` prefix with Pool Moments and the
     // cross-store join is trivial. No more demo string.
     let partition = soul::soul_partition(Path::new(&soul_repo))

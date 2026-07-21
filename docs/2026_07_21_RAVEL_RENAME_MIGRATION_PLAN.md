@@ -50,18 +50,25 @@ famous, same-space projects).
 
 ### The federation anchor segment (the coordinated part)
 - `urn:soul:<sha>:Weave/Turn/<event_id>` → `urn:soul:<sha>:Ravel/Turn/<event_id>`.
-- **ONE live mint site** (`src/soul.rs:65`, `weave_partition_prefix()`) — verified
-  Day 44; every other hit is doc-comment/test-fixture/read-side FILTER (`stats.rs`).
+- **ONE live site constructs this prefix** (`src/soul.rs:65`, now
+  `ravel_partition_prefix()`) — verified Day 44; every other hit is
+  doc-comment/test-fixture/read-side FILTER (`stats.rs`).
+- **OPEN QUESTION FOR ROB (raised by trip.lex 2026-07-21, pre-federation window):**
+  the `urn:` scheme itself. git-lex was swept this month from opaque identifiers to
+  resolvable https IRIs; the Day-38 anchor contract predates that ruling. If Rob
+  re-rules the anchor as an https IRI, that's the SAME one-line change + re-ingest —
+  but it should be decided BEFORE the store cut (step 3) so the store is re-derived
+  exactly once. If `urn:soul:` stands as deliberate design, nothing changes here.
 - **No stored-data migration needed:** JSONL is canonical, RDF is a projection.
   The `.weave/oxigraph` store (~10.7k turns) is wiped and re-ingested with the new
   prefix. Idempotency is turn-keyed, so a clean re-ingest is the designed path.
 - **Pool side:** ZERO code coupling — one doc-comment (`pool/src/layout.rs:6`).
   The Day-38 contract federates at query time; Pool never stores our prefix.
-- **trip.lex federation vocab: NOT YET MINTED** (verified — no `urn:soul`/`Weave/Turn`
-  in TR1P.L3X ttl/md). **This is the window.** Rename lands first → vocab mints
+- **trip.lex federation vocab: NOT YET AUTHORED** (verified — no `urn:soul`/`Weave/Turn`
+  in TR1P.L3X ttl/md). **This is the window.** Rename lands first → vocab is authored with
   `Ravel/Turn/` on day one → nobody renames twice. This composes with the Day-44
-  graph-track sequence (enforce → mint → swap → federate): the segment rename rides
-  the same one-line swap weave already owes (hand-mirror → minted anchor).
+  graph-track sequence (enforce → derive → swap → federate): the segment rename rides
+  the same one-line swap weave already owes (hand-mirror → derived anchor).
 
 ### Per-soul dirs + neighbors
 - **`.weave/` → `.ravel/`** in each soul repo (spaceGOAT: 27M store — re-ingest, don't
@@ -74,7 +81,7 @@ famous, same-space projects).
 
 ## 3. Sequencing (so we rename exactly once)
 
-1. **Heads-up to trip.lex** (sent 2026-07-21): federation vocab, when it mints, uses
+1. **Heads-up to trip.lex** (sent 2026-07-21): federation vocab, when it is authored, uses
    `Ravel/Turn/` + `ontology/ravel#`. He's on HOLD for the git2 cluster anyway — zero
    rework, pure pre-emption.
 2. **The repo cut (one session, mostly one commit):** Cargo.toml + NS constant +
@@ -84,8 +91,8 @@ famous, same-space projects).
    JSONL into `.ravel/` with `Ravel/Turn/` prefix → `.gitignore` updated → verify
    turn-count parity with old store (the frozen-file idempotency check, reused).
 4. **The federation swap stays sequenced as agreed Day 44:** enforce (w4r3z SHACL
-   link-guard) → mint (trip.lex vocab, now Ravel-native) → ravel swaps hand-mirror
-   for minted anchor (still one line) → distributor federates.
+   link-guard) → derive (trip.lex vocab, now Ravel-native) → ravel swaps hand-mirror
+   for derived anchor (still one line) → distributor federates.
 5. **Coordination notes:** w4r3z's one-graph/temporal-model build and Pan/Syrinx may
    reference weave by name in fresh docs — nug3 pulse requested; anything in flight
    gets the new name at write time, not a retro-sweep.

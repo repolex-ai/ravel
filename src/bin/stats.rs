@@ -1,8 +1,8 @@
-//! `weave-stats` — a read-only inspector for a persistent weave store. A dev
+//! `ravel-stats` — a read-only inspector for a persistent ravel store. A dev
 //! lens, not part of the shipped read surface (that's the HTTP server, later).
 //!
-//!   weave-stats <store-dir>            # summary: quads, graphs, predicates, anchors
-//!   weave-stats <store-dir> "SELECT …" # run an ad-hoc SPARQL query, dump rows
+//!   ravel-stats <store-dir>            # summary: quads, graphs, predicates, anchors
+//!   ravel-stats <store-dir> "SELECT …" # run an ad-hoc SPARQL query, dump rows
 //!
 //! Summary mode reports total quads, named-graph count, top predicates, and
 //! whether the federation anchors are present (soul-prefixed Turn subjects +
@@ -26,10 +26,10 @@ fn scalar(store: &Store, q: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args().nth(1).expect("usage: weave-stats <store-dir> [SPARQL]");
+    let dir = std::env::args().nth(1).expect("usage: ravel-stats <store-dir> [SPARQL]");
     let store = Store::open(&dir)?;
 
-    // Ad-hoc mode: `weave-stats <dir> "SELECT ..."` runs the query and dumps rows.
+    // Ad-hoc mode: `ravel-stats <dir> "SELECT ..."` runs the query and dumps rows.
     if let Some(q) = std::env::args().nth(2) {
         println!("=== ad-hoc query on {dir} ===\n{q}\n");
         match store.query(&q)? {

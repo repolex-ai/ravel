@@ -4,7 +4,7 @@
 //! supplies `partition` (for the soul adapter, `urn:soul:<sha>:`). The engine
 //! treats `partition` as an opaque prefix — it does not know it means "soul".
 
-use crate::{Event, WEAVE_NS};
+use crate::{Event, RAVEL_NS};
 use anyhow::Result;
 use oxigraph::store::Store;
 
@@ -51,24 +51,24 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
 /// text). Exposed alongside `annotate::annotation_nt` so the persistent-graph
 /// ingest can load the Turn NODES into the same named graph as the annotations
 /// that reference them — without this, an annotation's soul-prefixed
-/// `weave:atEvent` / `prov:used` anchor points at a Turn that was never minted,
-/// and the federation TIME anchor (`weave:timestamp` xsd:dateTime) is absent, so
+/// `ravel:atEvent` / `prov:used` anchor points at a Turn that was never minted,
+/// and the federation TIME anchor (`ravel:timestamp` xsd:dateTime) is absent, so
 /// a soul+time cross-store join has soul but not time. The Turn node is what
 /// carries the time half of the anchor contract.
 pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
     let mut nt = String::new();
 
-    let turn_class = format!("{WEAVE_NS}Turn");
-    let p_parent = format!("{WEAVE_NS}parentEvent");
-    let p_ts = format!("{WEAVE_NS}timestamp");
-    let p_text = format!("{WEAVE_NS}text");
-    let p_role = format!("{WEAVE_NS}role");
+    let turn_class = format!("{RAVEL_NS}Turn");
+    let p_parent = format!("{RAVEL_NS}parentEvent");
+    let p_ts = format!("{RAVEL_NS}timestamp");
+    let p_text = format!("{RAVEL_NS}text");
+    let p_role = format!("{RAVEL_NS}role");
     let xsd_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
 
     for e in events {
         validate_event_id(&e.event_id)?;
         let s = event_iri(partition, &e.event_id);
-        // rdf:type weave:Turn
+        // rdf:type ravel:Turn
         nt.push_str(&format!(
             "<{s}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{turn_class}> .\n"
         ));
