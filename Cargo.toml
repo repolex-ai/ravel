@@ -38,3 +38,7 @@ chrono = "0.4"
 anyhow = "1"
 # Deterministic annotation IRIs (idempotent reimport — the w4r3z discipline).
 sha2 = "0.10"
+
+[[bin]]
+name = "ravel-sync"
+path = "src/bin/sync.rs"
