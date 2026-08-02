@@ -56,7 +56,7 @@ pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
 /// idempotently.
 ///
 /// Both halves go into the same graph on purpose: the annotations carry
-/// soul-prefixed `ravel:atEvent` / `prov:used` references to Turn IRIs, and the
+/// soul-prefixed `ravel:atTurn` / `prov:used` references to Turn IRIs, and the
 /// Turn NODES carry the federation TIME anchor (`ravel:timestamp` xsd:dateTime).
 /// Ingesting annotations alone would leave those references dangling and the
 /// soul+time cross-store join would have soul but not time — verified the hard
@@ -176,7 +176,7 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
                 ?claim rdf:reifies <<( ?event ravel:exhibits "emojikey/harvest" )>> ;
                        prov:wasDerivedFrom ?ann .
                 ?ann oa:hasBody ?body .
-                OPTIONAL {{ ?ann ravel:sourceKind ?sk }}
+                OPTIONAL {{ ?ann ravel:textOrigin ?sk }}
                 OPTIONAL {{ ?ann prov:generatedAtTime ?ts }}
                 ?body ravel:sig_me ?me ; ravel:sig_content ?content ; ravel:sig_you ?you .
                 {filter}

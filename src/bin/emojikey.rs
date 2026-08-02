@@ -75,7 +75,7 @@ fn main() -> Result<()> {
                    ravel:detector ?det .
             ?ann oa:hasBody ?body ;
                  oa:hasTarget ?t .
-            OPTIONAL {{ ?ann ravel:sourceKind ?sk }}
+            OPTIONAL {{ ?ann ravel:textOrigin ?sk }}
             ?body ravel:sig_me ?me ; ravel:sig_content ?content ; ravel:sig_you ?you .
             ?t oa:hasSelector ?sel .
             ?sel oa:start ?start ; oa:end ?end .

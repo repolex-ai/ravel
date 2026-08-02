@@ -51,7 +51,7 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    /// Stable lowercase tag for RDF projection (`ravel:sourceKind "authored"`).
+    /// Stable lowercase tag for RDF projection (`ravel:textOrigin "authored"`).
     pub fn tag(self) -> &'static str {
         match self {
             SourceKind::Authored => "authored",
@@ -82,7 +82,7 @@ impl Event {
 
 /// The engine namespace for the ravel ontology — VOCABULARY only (classes,
 /// properties). Instance data never lives under this prefix.
-pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel#";
+pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel/";
 
 /// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path,
 /// mirroring git-lex's `…/git-lex/SpoEvent/<id>` / `…/git-lex/NamedGraph/<name>`

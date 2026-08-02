@@ -18,7 +18,7 @@
 //!
 //! following git-lex's machinery shape (`…/git-lex/SpoEvent/<id>`,
 //! `…/git-lex/NamedGraph/<name>`): instance data under the product path,
-//! vocabulary under `…/ontology/ravel#` — never mixed.
+//! vocabulary under `…/ontology/ravel/` — never mixed.
 //!
 //! ## The federation join (contract w/ Pool, re-based on this ruling)
 //! Ravel and Pool never co-store; the cross-store join no longer rides a

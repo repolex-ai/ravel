@@ -31,7 +31,7 @@
 //! w4r3z idempotency discipline, carried into the annotation IRIs.
 
 use crate::reader::Annotation;
-use crate::RAVEL_NS;
+use crate::{RAVEL_BASE, RAVEL_NS};
 use anyhow::Result;
 use oxigraph::store::Store;
 use sha2::{Digest, Sha256};
@@ -99,7 +99,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // Fail loud on an empty or malformed event_id: empty would silently
         // derive the bare partition prefix as the event IRI and reify a claim
         // about a non-thing; malformed would embed IRI-breaking bytes. Five
-        // triples depend on this id (eventId, atEvent, prov:used, and the
+        // triples depend on this id (eventId, atTurn, prov:used, and the
         // reified claim's subject) — the run stops here, not in a downstream
         // query returning wrong-but-plausible joins. (w3bl0rd flinch-audit,
         // Day 41: empty caught by SG, malformed layer caught by the audit.)
@@ -110,10 +110,10 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
             )
         })?;
         let h = ann_hash(transcript_id, ann);
-        let ann_iri = format!("{RAVEL_NS}ann/{h}");
-        let claim_iri = format!("{RAVEL_NS}claim/{h}");
-        let detector_iri = format!("{RAVEL_NS}detector/{}", safe(&ann.reader));
-        let transcript_iri = format!("{RAVEL_NS}transcript/{}", safe(transcript_id));
+        let ann_iri = format!("{RAVEL_BASE}Annotation/{h}");
+        let claim_iri = format!("{RAVEL_BASE}Claim/{h}");
+        let detector_iri = format!("{RAVEL_BASE}Detector/{}", safe(&ann.reader));
+        let transcript_iri = format!("{RAVEL_BASE}Transcript/{}", safe(transcript_id));
         let target_iri = format!("{ann_iri}/target");
         let selector_iri = format!("{ann_iri}/selector");
         let body_iri = format!("{ann_iri}/body");
@@ -127,7 +127,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // --- the annotation (oa:) ---
         triple(&mut nt, iri(&ann_iri), iri(&a_type), iri(&format!("{OA}Annotation")));
         triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}wasAttributedTo")), iri(&detector_iri));
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}eventType")), str_lit(&ann.event_type));
+        triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}detectionType")), str_lit(&ann.event_type));
         if let Some(ts) = &ann.ts {
             triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}generatedAtTime")), typed_lit(ts, &format!("{XSD}dateTime")));
         }
@@ -135,7 +135,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // TOOL_RESULT (quoted/pasted)? Carried on the annotation so a query can
         // filter to live keys — the lossless-emit decision (don't drop at read).
         if let Some(sk) = ann.source_kind {
-            triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}sourceKind")), str_lit(sk.tag()));
+            triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}textOrigin")), str_lit(sk.tag()));
         }
 
         // --- target: a span of the source. Matches the proven Python shape:
@@ -149,10 +149,9 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         triple(&mut nt, iri(&selector_iri), iri(&a_type), iri(&format!("{OA}TextPositionSelector")));
         triple(&mut nt, iri(&selector_iri), iri(&format!("{OA}start")), typed_lit(&ann.start.to_string(), &format!("{XSD}integer")));
         triple(&mut nt, iri(&selector_iri), iri(&format!("{OA}end")), typed_lit(&ann.end.to_string(), &format!("{XSD}integer")));
-        // durable per-turn join key — the event node the projector emits, so the
-        // annotation joins straight back to its exact turn (not just the doc).
-        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}eventId")), str_lit(&ann.event_id));
-        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}atEvent")), iri(&event_iri));
+        // durable per-turn join: the target anchors to the exact Turn NODE
+        // (address-by-identity; turn IRIs are stable+derived, no literal key).
+        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}atTurn")), iri(&event_iri));
 
         // --- evidence (prov:used): what the detector looked at = the event ---
         triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}used")), iri(&event_iri));
@@ -183,7 +182,7 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         triple(&mut nt, iri(&claim_iri), iri(&format!("{RDF}reifies")), proposition);
         // belief → evidence: the claim is derived from the annotation wrapper
         triple(&mut nt, iri(&claim_iri), iri(&format!("{PROV}wasDerivedFrom")), iri(&ann_iri));
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detector")), str_lit(&ann.reader));
+        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detectorName")), str_lit(&ann.reader));
         triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detectionType")), str_lit(&ann.event_type));
     }
 
@@ -301,7 +300,7 @@ mod tests {
             SELECT ?event ?det ?me WHERE {{
                 ?claim rdf:reifies <<( ?event ravel:exhibits "emojikey/harvest" )>> ;
                        prov:wasDerivedFrom ?ann ;
-                       ravel:detector ?det .
+                       ravel:detectorName ?det .
                 ?ann oa:hasBody ?body .
                 ?body ravel:sig_me ?me .
             }}

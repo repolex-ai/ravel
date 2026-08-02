@@ -52,7 +52,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
 /// text). Exposed alongside `annotate::annotation_nt` so the persistent-graph
 /// ingest can load the Turn NODES into the same named graph as the annotations
 /// that reference them — without this, an annotation's soul-prefixed
-/// `ravel:atEvent` / `prov:used` anchor points at a Turn that was never derived,
+/// `ravel:atTurn` / `prov:used` anchor points at a Turn that was never derived,
 /// and the federation TIME anchor (`ravel:timestamp` xsd:dateTime) is absent, so
 /// a soul+time cross-store join has soul but not time. The Turn node is what
 /// carries the time half of the anchor contract.
@@ -60,7 +60,8 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
     let mut nt = String::new();
 
     let turn_class = format!("{RAVEL_NS}Turn");
-    let p_parent = format!("{RAVEL_NS}parentEvent");
+    let p_turn_id = format!("{RAVEL_NS}turnId");
+    let p_parent = format!("{RAVEL_NS}parentTurn");
     let p_ts = format!("{RAVEL_NS}timestamp");
     let p_text = format!("{RAVEL_NS}text");
     let p_role = format!("{RAVEL_NS}role");
@@ -73,6 +74,8 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
         nt.push_str(&format!(
             "<{s}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{turn_class}> .\n"
         ));
+        // per-class id (kit-ontology law: every class declares <class>Id)
+        nt.push_str(&format!("<{s}> <{p_turn_id}> {} .\n", lit(&e.event_id)));
         // role (plain literal)
         nt.push_str(&format!("<{s}> <{p_role}> {} .\n", lit(&e.role)));
         // spine
