@@ -27,7 +27,16 @@ fn scalar(store: &Store, q: &str) -> Result<String> {
 
 fn main() -> Result<()> {
     let dir = std::env::args().nth(1).expect("usage: ravel-stats <store-dir> [SPARQL]");
-    let store = Store::open(&dir)?;
+    // A stats call must NEVER create a store: a mis-aimed path should refuse,
+    // not litter an empty RocksDB dir and report a trustworthy-looking 0.
+    // (th34's first field report, 2026-08-04.) Read-only open requires the
+    // path to exist and never writes.
+    if !std::path::Path::new(&dir).join("CURRENT").exists() {
+        anyhow::bail!(
+            "{dir} is not an oxigraph store (no RocksDB CURRENT file) — refusing to create one; check the path (expected e.g. <soul-repo>/.ravel/oxigraph)"
+        );
+    }
+    let store = Store::open_read_only(&dir)?;
 
     // Ad-hoc mode: `ravel-stats <dir> "SELECT ..."` runs the query and dumps rows.
     if let Some(q) = std::env::args().nth(2) {
