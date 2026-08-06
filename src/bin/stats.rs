@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     // path to exist and never writes.
     if !std::path::Path::new(&dir).join("CURRENT").exists() {
         anyhow::bail!(
-            "{dir} is not an oxigraph store (no RocksDB CURRENT file) — refusing to create one; check the path (expected e.g. <soul-repo>/.ravel/oxigraph)"
+            "{dir} is not an oxigraph store (no RocksDB CURRENT file) — refusing to create one; check the path (expected e.g. <soul-repo>/.ravel/_ignore/oxigraph)"
         );
     }
     let store = Store::open_read_only(&dir)?;

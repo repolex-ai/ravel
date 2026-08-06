@@ -7,16 +7,22 @@
 //!    session dir into the soul repo's transcript mirror. The mirror is
 //!    dialect-scoped so other harnesses can land as siblings later:
 //!
-//!      `<repo>/.ravel/transcripts/claude-code/<session>.jsonl`
+//!      `<repo>/.ravel/_ignore/transcripts/claude-code/<session>.jsonl`
 //!
 //!    Bytes live WITH the soul (Rob's one-folder-per-agent rule: copying the
 //!    soul folder copies the conversations), and the mirror — not the live
 //!    harness dir — is what gets ingested, so the graph and the bytes it was
 //!    derived from can never drift apart.
 //!
-//! 2. **Ingest** — project the mirror into `<repo>/.ravel/oxigraph`. Turn-keyed
-//!    IRIs + per-transcript named-graph replace make re-runs cheap and safe
-//!    (only new turns add triples).
+//! 2. **Ingest** — project the mirror into `<repo>/.ravel/_ignore/oxigraph`.
+//!    Turn-keyed IRIs + per-transcript named-graph replace make re-runs cheap
+//!    and safe (only new turns add triples).
+//!
+//! Layout follows the stack-wide `_ignore/` pocket law (Rob, 2026-08-05:
+//! subtexture docs/stack/2026_08_05_DOTDIR_IGNORE_POCKET.md): inside `.ravel/`,
+//! `_ignore/` holds all machine-local rebuildable-or-relocatable state and is
+//! gitignored; everything else in `.ravel/` is committable. Pre-pocket installs
+//! are migrated automatically by [`migrate_legacy_layout`] on every sync.
 //!
 //! This module owns the `.ravel/` layout; nothing else may hardcode it.
 
@@ -26,10 +32,49 @@ use std::path::{Path, PathBuf};
 
 /// The dialect-scoped transcript mirror, relative to the soul repo root.
 /// Other harnesses land as siblings of `claude-code/`.
-pub const TRANSCRIPTS_SUBDIR: &str = ".ravel/transcripts/claude-code";
+pub const TRANSCRIPTS_SUBDIR: &str = ".ravel/_ignore/transcripts/claude-code";
 
 /// The graph store, relative to the soul repo root.
-pub const STORE_SUBDIR: &str = ".ravel/oxigraph";
+pub const STORE_SUBDIR: &str = ".ravel/_ignore/oxigraph";
+
+/// Pre-pocket (≤2026-08-05) locations of the two machine-local trees. This is
+/// also git-lex's per-engine legacy list: its managed-gitignore emitter keeps
+/// the whole-dir `.ravel/` entry until neither of these exists, then narrows
+/// to `.ravel/_ignore/`. Transitional — dies with the fleet conversion.
+const LEGACY_DIRS: [(&str, &str); 2] = [
+    (".ravel/oxigraph", ".ravel/_ignore/oxigraph"),
+    (".ravel/transcripts", ".ravel/_ignore/transcripts"),
+];
+
+/// Move pre-pocket trees into `.ravel/_ignore/`. Returns how many moved.
+/// Fails loud when BOTH layouts hold the same tree — that's an ambiguity a
+/// rename must not silently resolve (which copy is authoritative?).
+pub fn migrate_legacy_layout(repo: &Path) -> Result<usize> {
+    let mut moved = 0usize;
+    for (old_rel, new_rel) in LEGACY_DIRS {
+        let (old, new) = (repo.join(old_rel), repo.join(new_rel));
+        if !old.exists() {
+            continue;
+        }
+        if new.exists() {
+            anyhow::bail!(
+                "both {} and {} exist — refusing to migrate over live data; \
+                 merge or remove one by hand, then re-run",
+                old.display(),
+                new.display()
+            );
+        }
+        if let Some(parent) = new.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create pocket dir {}", parent.display()))?;
+        }
+        std::fs::rename(&old, &new)
+            .with_context(|| format!("move {} → {}", old.display(), new.display()))?;
+        eprintln!("[ravel-sync] migrated {} → {}", old.display(), new.display());
+        moved += 1;
+    }
+    Ok(moved)
+}
 
 #[derive(Debug, Default)]
 pub struct SyncStats {
@@ -81,6 +126,7 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
 /// Bring one soul's ravel fully up to date: mirror then ingest-the-mirror.
 /// `sessions_src` defaults to the Claude Code dir for this repo.
 pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> {
+    migrate_legacy_layout(repo)?;
     let src = match sessions_src {
         Some(p) => p.to_path_buf(),
         None => claude_sessions_dir_for(repo)?,
@@ -157,6 +203,41 @@ mod tests {
         assert_eq!(fs::read_to_string(dst.join("a.jsonl")).unwrap(), "line1\nline2\n");
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    /// Legacy trees move into the pocket once; a second run is a no-op; a
+    /// pocket-born repo is untouched.
+    #[test]
+    fn legacy_layout_migrates_once_then_noop() {
+        let repo = std::env::temp_dir().join("ravel-sync-test-migrate");
+        fs::remove_dir_all(&repo).ok();
+        fs::create_dir_all(repo.join(".ravel/oxigraph")).unwrap();
+        fs::create_dir_all(repo.join(".ravel/transcripts/claude-code")).unwrap();
+        fs::write(repo.join(".ravel/oxigraph/CURRENT"), "x").unwrap();
+        fs::write(repo.join(".ravel/transcripts/claude-code/a.jsonl"), "l\n").unwrap();
+
+        assert_eq!(migrate_legacy_layout(&repo).unwrap(), 2, "both trees move");
+        assert!(repo.join(".ravel/_ignore/oxigraph/CURRENT").exists());
+        assert!(repo.join(TRANSCRIPTS_SUBDIR).join("a.jsonl").exists());
+        assert!(!repo.join(".ravel/oxigraph").exists(), "legacy path is gone");
+        assert!(!repo.join(".ravel/transcripts").exists(), "legacy path is gone");
+
+        assert_eq!(migrate_legacy_layout(&repo).unwrap(), 0, "second run is a no-op");
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Both layouts holding the same tree is ambiguous — refuse, loudly.
+    #[test]
+    fn migration_refuses_ambiguous_dual_layout() {
+        let repo = std::env::temp_dir().join("ravel-sync-test-migrate-dual");
+        fs::remove_dir_all(&repo).ok();
+        fs::create_dir_all(repo.join(".ravel/oxigraph")).unwrap();
+        fs::create_dir_all(repo.join(".ravel/_ignore/oxigraph")).unwrap();
+
+        let err = migrate_legacy_layout(&repo).unwrap_err().to_string();
+        assert!(err.contains("refusing to migrate"), "got: {err}");
+        assert!(repo.join(".ravel/oxigraph").exists(), "nothing was touched");
+        fs::remove_dir_all(&repo).ok();
     }
 
     /// The slug is the absolute repo path with slashes flattened to dashes.
