@@ -76,6 +76,36 @@ pub fn migrate_legacy_layout(repo: &Path) -> Result<usize> {
     Ok(moved)
 }
 
+/// How one mirrored session file relates to its source. `Growing` is the
+/// by-design case (a live session's source outruns the mirror until
+/// SessionEnd fires); `Stale` is the silent failure the diagnostic exists to
+/// catch (source changed long ago and no hook caught up).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MirrorState {
+    Current,
+    Growing,
+    Stale,
+    Missing,
+}
+
+/// A source file that still changed within this window is treated as a live
+/// session (`Growing`); older divergence is `Stale`.
+pub const LIVE_SESSION_WINDOW_SECS: u64 = 30 * 60;
+
+pub fn classify_mirror_file(
+    src_len: u64,
+    mirror_len: Option<u64>,
+    src_age_secs: u64,
+) -> MirrorState {
+    match mirror_len {
+        Some(m) if m == src_len => MirrorState::Current,
+        None if src_age_secs <= LIVE_SESSION_WINDOW_SECS => MirrorState::Growing,
+        None => MirrorState::Missing,
+        Some(_) if src_age_secs <= LIVE_SESSION_WINDOW_SECS => MirrorState::Growing,
+        Some(_) => MirrorState::Stale,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SyncStats {
     pub mirrored: usize,
@@ -174,6 +204,158 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     Ok(stats)
 }
 
+/// One diagnostic finding: severity tag + human line. "attention" findings
+/// make the diagnostic exit non-zero; "ok"/"expected" never do.
+#[derive(Debug)]
+pub struct DiagFinding {
+    pub attention: bool,
+    pub line: String,
+}
+
+/// `ravel-sync --diagnostic` — the ONE diagnostic switch (Rob's rule: every
+/// tool gets exactly one, spelled `--diagnostic`). STRICTLY READ-ONLY: it
+/// reports a legacy layout, it never migrates one; it opens the store
+/// read-only; it creates nothing. Healthy output is short and ends in a
+/// one-line verdict; every problem is named with its fix.
+pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFinding>> {
+    let mut out: Vec<DiagFinding> = Vec::new();
+    let mut push = |attention: bool, line: String| out.push(DiagFinding { attention, line });
+
+    // Layout — pocket law (2026-08-05).
+    let legacy: Vec<&str> = LEGACY_DIRS
+        .iter()
+        .filter(|(old, _)| repo.join(old).exists())
+        .map(|(old, _)| *old)
+        .collect();
+    if legacy.is_empty() {
+        push(false, "layout: pocket (.ravel/_ignore/) — OK".into());
+    } else {
+        push(
+            true,
+            format!(
+                "layout: PRE-POCKET paths present ({}) — run `ravel-sync {}` to migrate",
+                legacy.join(", "),
+                repo.display()
+            ),
+        );
+    }
+
+    // Kit + hook — is the backup wired to fire at all?
+    let kit_reg = std::fs::read_to_string(repo.join(".lex/repo.yml"))
+        .map(|s| s.contains("git-lex-kit-ravel"))
+        .unwrap_or(false);
+    let hook = repo.join(".claude/hooks/SessionEnd-ravel-ravelsync.sh").is_file();
+    match (kit_reg, hook) {
+        (true, true) => push(false, "kit: registered; hook: installed — OK".into()),
+        (_, false) => push(
+            true,
+            "hook: SessionEnd-ravel-ravelsync.sh MISSING — backups will not run on session end \
+             (install: `git lex kit-add repolex-ai/git-lex-kit-ravel`, then kit-update)"
+                .into(),
+        ),
+        (false, true) => push(
+            false,
+            "kit: not in .lex/repo.yml optional_kits (hook present — manual install?)".into(),
+        ),
+    }
+
+    // Mirror vs source.
+    let src = match sessions_src {
+        Some(p) => p.to_path_buf(),
+        None => claude_sessions_dir_for(repo)?,
+    };
+    let mirror = repo.join(TRANSCRIPTS_SUBDIR);
+    let now = std::time::SystemTime::now();
+    let (mut current, mut growing, mut stale, mut missing, mut src_n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    if src.is_dir() {
+        for entry in std::fs::read_dir(&src)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            src_n += 1;
+            let meta = std::fs::metadata(&path)?;
+            let age = now
+                .duration_since(meta.modified()?)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mirror_len = path
+                .file_name()
+                .map(|n| mirror.join(n))
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len());
+            match classify_mirror_file(meta.len(), mirror_len, age) {
+                MirrorState::Current => current += 1,
+                MirrorState::Growing => growing += 1,
+                MirrorState::Stale => stale += 1,
+                MirrorState::Missing => missing += 1,
+            }
+        }
+        let summary = format!(
+            "mirror: {src_n} source session(s) → {current} current, {growing} growing (live, catches up at session end), {stale} stale, {missing} missing"
+        );
+        if stale > 0 || missing > 0 {
+            push(true, format!("{summary} — stale/missing with no live session means the hook did not fire; run `ravel-sync {}` and check the hook", repo.display()));
+        } else {
+            push(false, summary);
+        }
+    } else if mirror.is_dir() {
+        push(
+            false,
+            format!("mirror: source dir {} absent; mirror exists (archived soul?) — verify the slug if this soul is active", src.display()),
+        );
+    } else {
+        push(
+            true,
+            format!("mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here", src.display()),
+        );
+    }
+
+    // Store — read-only look, never create.
+    let store_dir = repo.join(STORE_SUBDIR);
+    if !store_dir.join("CURRENT").exists() {
+        push(
+            true,
+            format!(
+                "store: {} is not an oxigraph store (no CURRENT) — mirror exists but nothing is ingested; run `ravel-sync {}`",
+                store_dir.display(),
+                repo.display()
+            ),
+        );
+    } else {
+        let store = graph::open_read_only(&store_dir)?;
+        let count = |q: &str| -> Result<String> {
+            use oxigraph::model::Term;
+            use oxigraph::sparql::QueryResults;
+            if let QueryResults::Solutions(mut sols) = store.query(q)? {
+                if let Some(s) = sols.next() {
+                    if let Some((_, t)) = s?.iter().next() {
+                        // lexical form only — "11994", not "11994"^^xsd:integer
+                        return Ok(match t {
+                            Term::Literal(l) => l.value().to_string(),
+                            other => other.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok("0".into())
+        };
+        let turns = count(
+            "SELECT (COUNT(?s) AS ?n) WHERE { GRAPH ?g { ?s <https://repolex.ai/ontology/ravel/turnId> ?id } }",
+        )?;
+        let graphs = count("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }")?;
+        let latest = count(
+            "SELECT ?t WHERE { GRAPH ?g { ?s <https://repolex.ai/ontology/ravel/timestamp> ?t } } ORDER BY DESC(?t) LIMIT 1",
+        )?;
+        push(
+            false,
+            format!("store: {graphs} transcript graph(s), {turns} turns, latest turn {latest}"),
+        );
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +385,20 @@ mod tests {
         assert_eq!(fs::read_to_string(dst.join("a.jsonl")).unwrap(), "line1\nline2\n");
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    /// The mirror-state classifier: same-size is current regardless of age;
+    /// divergence within the live window is a growing session (healthy);
+    /// old divergence or absence is the hook having failed to fire.
+    #[test]
+    fn mirror_state_classification() {
+        let w = LIVE_SESSION_WINDOW_SECS;
+        assert_eq!(classify_mirror_file(100, Some(100), w * 10), MirrorState::Current);
+        assert_eq!(classify_mirror_file(100, Some(100), 0), MirrorState::Current);
+        assert_eq!(classify_mirror_file(200, Some(100), w / 2), MirrorState::Growing);
+        assert_eq!(classify_mirror_file(200, None, w / 2), MirrorState::Growing);
+        assert_eq!(classify_mirror_file(200, Some(100), w + 1), MirrorState::Stale);
+        assert_eq!(classify_mirror_file(200, None, w + 1), MirrorState::Missing);
     }
 
     /// Legacy trees move into the pocket once; a second run is a no-op; a
