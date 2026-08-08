@@ -113,6 +113,9 @@ pub struct SyncStats {
     pub sessions: usize,
     pub turns: usize,
     pub keys: usize,
+    /// Mirror files skipped at ingest because the manifest shows them
+    /// unchanged since their last successful ingest.
+    pub skipped: usize,
 }
 
 /// Where Claude Code keeps this soul repo's session logs:
@@ -127,8 +130,11 @@ pub fn claude_sessions_dir_for(repo: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude").join("projects").join(slug))
 }
 
-/// Copy every top-level `*.jsonl` in `src` into `dst` when missing or changed
-/// (size differs — a session JSONL only ever grows). Returns (copied, unchanged).
+/// Copy every top-level `*.jsonl` in `src` into `dst` when missing or grown.
+/// A session JSONL only ever grows, so a SMALLER source is a stale snapshot
+/// (e.g. a frozen Raw/ archive of a session the mirror holds in fuller form)
+/// — never let it regress the mirror; warn and keep the fuller copy.
+/// Returns (copied, unchanged).
 fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("create mirror dir {}", dst.display()))?;
@@ -141,16 +147,51 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
         let Some(name) = path.file_name() else { continue };
         let to = dst.join(name);
         let src_len = std::fs::metadata(&path)?.len();
-        let same = std::fs::metadata(&to).map(|m| m.len() == src_len).unwrap_or(false);
-        if same {
-            unchanged += 1;
-        } else {
-            std::fs::copy(&path, &to)
-                .with_context(|| format!("copy {} → {}", path.display(), to.display()))?;
-            copied += 1;
+        match std::fs::metadata(&to).map(|m| m.len()) {
+            Ok(dst_len) if dst_len == src_len => unchanged += 1,
+            Ok(dst_len) if dst_len > src_len => {
+                eprintln!(
+                    "[ravel-sync] REFUSING to shrink mirror of {} ({dst_len} → {src_len} bytes): source looks like a stale snapshot; mirror keeps the fuller copy",
+                    name.to_string_lossy()
+                );
+                unchanged += 1;
+            }
+            _ => {
+                std::fs::copy(&path, &to)
+                    .with_context(|| format!("copy {} → {}", path.display(), to.display()))?;
+                copied += 1;
+            }
         }
     }
     Ok((copied, unchanged))
+}
+
+/// Per-transcript ingest bookkeeping: `<filename>\t<bytes>` per line, living
+/// in the pocket beside the store. Sync state, not graph data — the store
+/// stays a pure projection of the bytes, and no ontology term is spent on
+/// operational bookkeeping.
+const INGEST_MANIFEST: &str = ".ravel/_ignore/ingest-manifest.tsv";
+
+fn read_manifest(repo: &Path) -> std::collections::HashMap<String, u64> {
+    std::fs::read_to_string(repo.join(INGEST_MANIFEST))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (name, len) = l.split_once('\t')?;
+                    Some((name.to_string(), len.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_manifest(repo: &Path, m: &std::collections::HashMap<String, u64>) -> Result<()> {
+    let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
+    lines.sort();
+    let tmp = repo.join(INGEST_MANIFEST).with_extension("tsv.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, repo.join(INGEST_MANIFEST))?;
+    Ok(())
 }
 
 /// Bring one soul's ravel fully up to date: mirror then ingest-the-mirror.
@@ -176,6 +217,7 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     }
 
     let store = graph::open(repo.join(STORE_SUBDIR))?;
+    let mut manifest = read_manifest(repo);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&mirror)
         .with_context(|| format!("read mirror {}", mirror.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -183,6 +225,15 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         .collect();
     paths.sort();
     for path in &paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // Unchanged since its last successful ingest → the graph already
+        // holds this projection; skip the parse. Makes a large backfilled
+        // mirror cost nothing at session end.
+        if manifest.get(&name) == Some(&len) {
+            stats.skipped += 1;
+            continue;
+        }
         let jsonl = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -192,15 +243,18 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         };
         let events = adapter::parse_transcript(&jsonl)?;
         if events.is_empty() {
+            manifest.insert(name, len);
             continue;
         }
         let anns = reader::emojikey_read(&events);
         let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
         graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
+        manifest.insert(name, len);
         stats.sessions += 1;
         stats.turns += events.len();
         stats.keys += anns.len();
     }
+    write_manifest(repo, &manifest)?;
     Ok(stats)
 }
 
@@ -385,6 +439,42 @@ mod tests {
         assert_eq!(fs::read_to_string(dst.join("a.jsonl")).unwrap(), "line1\nline2\n");
 
         fs::remove_dir_all(&base).ok();
+    }
+
+    /// A smaller source (stale snapshot) must never regress a fuller mirror
+    /// copy; a larger one still re-mirrors.
+    #[test]
+    fn mirror_never_shrinks() {
+        let base = std::env::temp_dir().join("ravel-sync-test-noshrink");
+        let (src, dst) = (base.join("src"), base.join("dst"));
+        fs::remove_dir_all(&base).ok();
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("a.jsonl"), "old-snapshot\n").unwrap();
+        fs::write(dst.join("a.jsonl"), "the fuller, newer mirror copy\n").unwrap();
+
+        let (copied, unchanged) = mirror_jsonl(&src, &dst).unwrap();
+        assert_eq!((copied, unchanged), (0, 1), "stale snapshot must not copy");
+        assert_eq!(
+            fs::read_to_string(dst.join("a.jsonl")).unwrap(),
+            "the fuller, newer mirror copy\n"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// Manifest round-trip: what write_manifest stores, read_manifest returns.
+    #[test]
+    fn ingest_manifest_round_trips() {
+        let repo = std::env::temp_dir().join("ravel-sync-test-manifest");
+        fs::remove_dir_all(&repo).ok();
+        fs::create_dir_all(repo.join(".ravel/_ignore")).unwrap();
+        let mut m = std::collections::HashMap::new();
+        m.insert("a.jsonl".to_string(), 42u64);
+        m.insert("b.jsonl".to_string(), 991_000_000u64);
+        write_manifest(&repo, &m).unwrap();
+        assert_eq!(read_manifest(&repo), m);
+        assert_eq!(read_manifest(&std::env::temp_dir().join("no-such-repo")).len(), 0);
+        fs::remove_dir_all(&repo).ok();
     }
 
     /// The mirror-state classifier: same-size is current regardless of age;

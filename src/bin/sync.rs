@@ -49,10 +49,11 @@ fn main() -> Result<()> {
 
     let stats = sync::sync_soul(&repo, src.as_deref())?;
     println!(
-        "[ravel-sync] mirrored {} (unchanged {}) → {} session(s), {} turns, {} emojikeys in {}",
+        "[ravel-sync] mirrored {} (unchanged {}) → ingested {} session(s) ({} skipped unchanged), {} turns, {} emojikeys in {}",
         stats.mirrored,
         stats.unchanged,
         stats.sessions,
+        stats.skipped,
         stats.turns,
         stats.keys,
         repo.join(sync::STORE_SUBDIR).display(),
