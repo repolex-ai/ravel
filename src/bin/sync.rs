@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     let stats = sync::sync_soul(&repo, src.as_deref())?;
     println!(
-        "[ravel-sync] mirrored {} (unchanged {}) → ingested {} session(s) ({} skipped unchanged), {} turns, {} emojikeys in {}",
+        "[ravel-sync] claude-code: mirrored {} (unchanged {}) → ingested {} session(s) ({} skipped unchanged), {} turns, {} emojikeys in {}",
         stats.mirrored,
         stats.unchanged,
         stats.sessions,
@@ -58,5 +58,29 @@ fn main() -> Result<()> {
         stats.keys,
         repo.join(sync::STORE_SUBDIR).display(),
     );
+    // The agy line prints ONLY when there is something to say. A soul with no
+    // Antigravity conversations should not read a row of zeros as a result;
+    // but a soul with unattributed conversations must never NOT read about it.
+    let a = &stats.agy;
+    if a.mirrored + a.unchanged + a.sessions + a.skipped > 0 {
+        println!(
+            "[ravel-sync] agy:         mirrored {} (unchanged {}) → ingested {} conversation(s) ({} skipped unchanged), {} turns, {} spine gap(s)",
+            a.mirrored, a.unchanged, a.sessions, a.skipped, a.turns, a.gaps,
+        );
+    }
+    if !a.lossy.is_empty() {
+        println!(
+            "[ravel-sync] agy:         {} conversation(s) ingested from a TRUNCATED source: {}",
+            a.lossy.len(),
+            a.lossy.join(", "),
+        );
+    }
+    if !a.unattributed.is_empty() {
+        println!(
+            "[ravel-sync] agy:         {} conversation(s) NOT backed up — no workspace attribution: {}",
+            a.unattributed.len(),
+            a.unattributed.join(", "),
+        );
+    }
     Ok(())
 }

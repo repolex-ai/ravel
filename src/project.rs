@@ -17,16 +17,22 @@ pub fn event_iri(partition: &str, event_id: &str) -> String {
 /// Validate an event_id before it's embedded in an IRI. VALIDATE, don't mangle:
 /// a `safe()`-style character mangle on an IDENTITY key can collide two
 /// distinct ids ("a b" and "a_b" → same IRI) — identity-loss hidden as
-/// robustness. Today's adapter sources event_id from JSONL uuids (hex +
-/// hyphens, always valid); the first non-UUID dialect adapter hits this gate
-/// instead of silently deriving a broken or colliding IRI.
+/// robustness. The claude-code adapter sources event_id from JSONL uuids (hex +
+/// hyphens); the agy adapter synthesizes `<conversation-uuid>:<step_index>`.
+///
+/// `:` was added to the allowlist on 2026-08-26 when the agy adapter — the
+/// first non-UUID dialect, which this gate was written to catch — hit it. It is
+/// a deliberate WIDENING, not a mangle: `:` is a legal `pchar` in an IRI path
+/// segment (RFC 3987), and since neither a UUID nor a decimal index can contain
+/// one, no two distinct agy ids can collide through it and no agy id can
+/// collide with a claude uuid.
 pub fn validate_event_id(event_id: &str) -> Result<()> {
     if event_id.trim().is_empty() {
         anyhow::bail!("empty event_id — refusing to derive an IRI for a non-event");
     }
     if !event_id
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':')
     {
         anyhow::bail!(
             "malformed event_id {event_id:?} — contains characters unsafe to embed in an IRI; fix the adapter, don't mangle the id"

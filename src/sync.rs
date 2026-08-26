@@ -26,13 +26,19 @@
 //!
 //! This module owns the `.ravel/` layout; nothing else may hardcode it.
 
-use crate::{adapter, graph, reader, soul};
+use crate::{adapter, agy, graph, reader, soul};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The dialect-scoped transcript mirror, relative to the soul repo root.
 /// Other harnesses land as siblings of `claude-code/`.
 pub const TRANSCRIPTS_SUBDIR: &str = ".ravel/_ignore/transcripts/claude-code";
+
+/// The Gemini/Antigravity transcript mirror — sibling of `claude-code/`, named
+/// for the substrate's kind as herdr reports it (Rob, 2026-08-26). The
+/// per-dialect shelf has existed since before a second dialect did; this is its
+/// first use.
+pub const AGY_TRANSCRIPTS_SUBDIR: &str = ".ravel/_ignore/transcripts/agy";
 
 /// The graph store, relative to the soul repo root.
 pub const STORE_SUBDIR: &str = ".ravel/_ignore/oxigraph";
@@ -116,6 +122,32 @@ pub struct SyncStats {
     /// Mirror files skipped at ingest because the manifest shows them
     /// unchanged since their last successful ingest.
     pub skipped: usize,
+    /// The Gemini/Antigravity half, counted separately so a green claude-side
+    /// number can never stand in for an agy-side one.
+    pub agy: AgyStats,
+}
+
+/// What the agy pass did. `unattributed` is the load-bearing field: a
+/// conversation on disk that no map ties to a repo is NOT backed up, and a
+/// summary that omits it would be another instrument printing OK over missing
+/// data.
+#[derive(Debug, Default)]
+pub struct AgyStats {
+    pub mirrored: usize,
+    pub unchanged: usize,
+    pub sessions: usize,
+    pub turns: usize,
+    pub skipped: usize,
+    /// Conversations whose transcripts exist but whose owning workspace could
+    /// not be determined; reported by id, never silently skipped.
+    pub unattributed: Vec<String>,
+    /// Conversations ingested from a `transcript.jsonl` that declares
+    /// truncation with no `transcript_full.jsonl` beside it — the only copy is
+    /// lossy and ravel says so.
+    pub lossy: Vec<String>,
+    /// Total `step_index` holes recorded across this soul's conversations.
+    /// Expected to be roughly one per conversation; a spike means something else.
+    pub gaps: usize,
 }
 
 /// Where Claude Code keeps this soul repo's session logs:
@@ -194,6 +226,304 @@ fn write_manifest(repo: &Path, m: &std::collections::HashMap<String, u64>) -> Re
     Ok(())
 }
 
+// ─────────────────────────── Gemini / Antigravity ───────────────────────────
+//
+// The agy half of sync. Structurally the same two stages as the claude-code
+// half — mirror the bytes into the soul, then project the mirror — but three
+// things differ, each for a measured reason:
+//
+//   1. **Attribution is a lookup, not a path slug.** Claude Code files sessions
+//      in a directory named after the repo path. Antigravity files them by
+//      conversation UUID under one flat store, so which soul a conversation
+//      belongs to must be read from `history.jsonl`.
+//   2. **Change detection is by CONTENT HASH, not size.** The client rewrites a
+//      step's line in place (`RUNNING` → `DONE`) rather than appending a
+//      correction, so bytes change without the file growing. Size comparison —
+//      correct for an append-only claude log — is unsound here.
+//   3. **No anti-shrink guard.** That guard exists because a frozen archive can
+//      be smaller than a live mirror. An in-place rewrite may legitimately
+//      shrink the file, and the agy source is always the live store rather than
+//      an archive, so the guard would block correct updates and catch nothing.
+
+/// The Antigravity CLI store root.
+pub fn agy_store_root() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".gemini").join("antigravity-cli"))
+}
+
+/// One conversation's transcript, resolved to the file ravel will actually read.
+#[derive(Debug, Clone)]
+pub struct AgyConversation {
+    pub id: String,
+    /// `transcript_full.jsonl` when it exists, else `transcript.jsonl`.
+    pub source: PathBuf,
+    /// True when the chosen source is a `transcript.jsonl` with no full
+    /// counterpart. Whether that is actually lossy is only known after parsing
+    /// (it depends on `truncated_fields` markers), so this only flags the
+    /// *possibility* — [`sync_agy`] resolves it against the parse.
+    pub short_only: bool,
+}
+
+/// Resolve the transcript file for one conversation, preferring the untruncated
+/// copy. Returns `None` when the conversation folder holds neither.
+pub fn agy_transcript_for(brain: &Path, conversation_id: &str) -> Option<AgyConversation> {
+    let logs = brain
+        .join(conversation_id)
+        .join(".system_generated")
+        .join("logs");
+    let full = logs.join("transcript_full.jsonl");
+    if full.is_file() {
+        return Some(AgyConversation {
+            id: conversation_id.to_string(),
+            source: full,
+            short_only: false,
+        });
+    }
+    let short = logs.join("transcript.jsonl");
+    short.is_file().then(|| AgyConversation {
+        id: conversation_id.to_string(),
+        source: short,
+        short_only: true,
+    })
+}
+
+/// Which conversations belong to which workspace, read from the CLI's
+/// `history.jsonl` — one JSON object per user prompt carrying `workspace` and
+/// `conversationId`. This is the agy analogue of Claude Code's path slug, and
+/// unlike `conversation_summaries.db` (which stopped being written around
+/// 2026-06-18) it is current.
+///
+/// Returns `workspace path → conversation ids`, in first-seen order.
+pub fn agy_workspace_map(store_root: &Path) -> Result<Vec<(String, Vec<String>)>> {
+    let path = store_root.join("history.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(o) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let (Some(ws), Some(cid)) = (
+            o.get("workspace").and_then(|v| v.as_str()),
+            o.get("conversationId").and_then(|v| v.as_str()),
+        ) else {
+            continue; // a prompt logged before a conversation existed
+        };
+        let entry = map.entry(ws.to_string()).or_insert_with(|| {
+            order.push(ws.to_string());
+            Vec::new()
+        });
+        if !entry.iter().any(|c| c == cid) {
+            entry.push(cid.to_string());
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|ws| {
+            let ids = map.remove(&ws).unwrap_or_default();
+            (ws, ids)
+        })
+        .collect())
+}
+
+/// The conversations belonging to `repo`, plus the ones on disk that no map
+/// could place.
+///
+/// The unattributed list is deliberately part of the return value rather than a
+/// silent filter. `history.jsonl` only records conversations that logged a user
+/// prompt through it; at least one conversation on this machine (June-era)
+/// predates that and appears nowhere in it. Such a conversation is NOT backed
+/// up, and the whole point of today's work is that an instrument must not print
+/// a clean number over data it never counted.
+///
+/// KNOWN GAP, stated rather than papered over: `conversation_summaries.db` does
+/// carry `workspace_uris` for exactly the conversations `history.jsonl` misses.
+/// Reading it needs a SQLite dependency in a binary that is installed once and
+/// shared by every soul on the machine, so that is a deliberate follow-up
+/// decision, not an oversight. Until then the ids are reported and the fix is
+/// one command, named in the message.
+pub fn agy_conversations_for(repo: &Path) -> Result<(Vec<AgyConversation>, Vec<String>)> {
+    let root = agy_store_root()?;
+    let brain = root.join("brain");
+    if !brain.is_dir() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let abs = repo
+        .canonicalize()
+        .with_context(|| format!("canonicalize soul repo {}", repo.display()))?;
+
+    let map = agy_workspace_map(&root)?;
+    let mut mine: Vec<AgyConversation> = Vec::new();
+    let mut placed: std::collections::HashSet<String> = Default::default();
+    for (ws, ids) in &map {
+        let same = Path::new(ws)
+            .canonicalize()
+            .map(|p| p == abs)
+            .unwrap_or(false);
+        for id in ids {
+            placed.insert(id.clone());
+            if same {
+                if let Some(c) = agy_transcript_for(&brain, id) {
+                    mine.push(c);
+                }
+            }
+        }
+    }
+
+    let mut unattributed: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&brain).with_context(|| format!("read {}", brain.display()))? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !placed.contains(id) && agy_transcript_for(&brain, id).is_some() {
+            unattributed.push(id.to_string());
+        }
+    }
+    mine.sort_by(|a, b| a.id.cmp(&b.id));
+    unattributed.sort();
+    Ok((mine, unattributed))
+}
+
+/// Hex sha256 of a file's bytes — the agy shelf's change detector.
+fn file_sha256(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Per-conversation ingest bookkeeping for the agy shelf: `<id>\t<sha256>`.
+/// A SEPARATE file from the claude-code manifest on purpose — that one stores a
+/// byte length, this one a content hash, and one file holding two silently
+/// different meanings in the same column is exactly the kind of ambiguity that
+/// reads fine until it doesn't.
+const AGY_MANIFEST: &str = ".ravel/_ignore/ingest-manifest-agy.tsv";
+
+fn read_agy_manifest(repo: &Path) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(repo.join(AGY_MANIFEST))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (name, hash) = l.split_once('\t')?;
+                    Some((name.to_string(), hash.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_agy_manifest(repo: &Path, m: &std::collections::HashMap<String, String>) -> Result<()> {
+    let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
+    lines.sort();
+    let tmp = repo.join(AGY_MANIFEST).with_extension("tsv.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, repo.join(AGY_MANIFEST))?;
+    Ok(())
+}
+
+/// Mirror and ingest this soul's Gemini/Antigravity conversations.
+///
+/// A clean no-op when the CLI is not installed or no conversation belongs to
+/// this repo — most souls on this machine are claude-only and must not pay for
+/// this pass.
+pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
+    let mut st = AgyStats::default();
+    let (convs, unattributed) = agy_conversations_for(repo)?;
+    st.unattributed = unattributed;
+    if !st.unattributed.is_empty() {
+        eprintln!(
+            "[ravel-sync] {} agy conversation(s) on disk are attributed to NO workspace and are therefore NOT backed up: {}\n\
+             [ravel-sync]   history.jsonl does not name them (it predates them, or they logged no prompt through it).\n\
+             [ravel-sync]   check the owner by hand: sqlite3 \"file:$HOME/.gemini/antigravity-cli/conversation_summaries.db?mode=ro\" \\\n\
+             [ravel-sync]     \"SELECT conversation_id, workspace_uris FROM conversation_summaries;\"",
+            st.unattributed.len(),
+            st.unattributed.join(", ")
+        );
+    }
+    if convs.is_empty() {
+        return Ok(st);
+    }
+
+    let mirror = repo.join(AGY_TRANSCRIPTS_SUBDIR);
+    std::fs::create_dir_all(&mirror)
+        .with_context(|| format!("create agy mirror dir {}", mirror.display()))?;
+
+    let store = graph::open(repo.join(STORE_SUBDIR))?;
+    let mut manifest = read_agy_manifest(repo);
+
+    for c in &convs {
+        // MIRROR — by content hash. The source is rewritten in place while a
+        // session is live, so equal size proves nothing.
+        let to = mirror.join(format!("{}.jsonl", c.id));
+        let src_hash = file_sha256(&c.source)?;
+        let dst_hash = to.is_file().then(|| file_sha256(&to)).transpose()?;
+        if dst_hash.as_deref() == Some(src_hash.as_str()) {
+            st.unchanged += 1;
+        } else {
+            std::fs::copy(&c.source, &to)
+                .with_context(|| format!("copy {} → {}", c.source.display(), to.display()))?;
+            st.mirrored += 1;
+        }
+
+        // INGEST — skip when this exact content is already projected.
+        if manifest.get(&c.id) == Some(&src_hash) {
+            st.skipped += 1;
+            continue;
+        }
+        let jsonl = std::fs::read_to_string(&to)
+            .with_context(|| format!("read agy mirror {}", to.display()))?;
+        let parsed = agy::parse_transcript(&jsonl, &c.id)?;
+        st.gaps += parsed.gaps.len();
+        if !parsed.gaps.is_empty() {
+            eprintln!(
+                "[ravel-sync] agy {}: step_index gap(s) at {:?} — the spine is left DISCONNECTED there rather than bridged (expected: the client burns an index on an interrupted step)",
+                &c.id[..8.min(c.id.len())],
+                parsed.gaps
+            );
+        }
+        if c.short_only && parsed.truncated_rows > 0 {
+            st.lossy.push(c.id.clone());
+            eprintln!(
+                "[ravel-sync] agy {}: LOSSY SOURCE — {} row(s) declare truncated_fields and there is no transcript_full.jsonl beside them; ingesting the short copy, which is NOT the whole conversation",
+                &c.id[..8.min(c.id.len())],
+                parsed.truncated_rows
+            );
+        }
+        if parsed.malformed_lines > 0 {
+            eprintln!(
+                "[ravel-sync] agy {}: {} unparseable line(s) skipped",
+                &c.id[..8.min(c.id.len())],
+                parsed.malformed_lines
+            );
+        }
+        if parsed.events.is_empty() {
+            manifest.insert(c.id.clone(), src_hash);
+            continue;
+        }
+        let anns = reader::emojikey_read(&parsed.events);
+        // Dialect-prefixed graph name: the named graph is the provenance unit,
+        // and which substrate a conversation came from is provenance.
+        let transcript_id = format!("agy-{}", c.id);
+        graph::ingest_transcript(
+            &store,
+            &parsed.events,
+            &anns,
+            &transcript_id,
+            soul::TURN_PARTITION,
+        )?;
+        manifest.insert(c.id.clone(), src_hash);
+        st.sessions += 1;
+        st.turns += parsed.events.len();
+    }
+    write_agy_manifest(repo, &manifest)?;
+    Ok(st)
+}
+
 /// Bring one soul's ravel fully up to date: mirror then ingest-the-mirror.
 /// `sessions_src` defaults to the Claude Code dir for this repo.
 pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> {
@@ -255,6 +585,11 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         stats.keys += anns.len();
     }
     write_manifest(repo, &manifest)?;
+    // The agy half. Independent of the claude half on purpose: a soul with no
+    // Antigravity conversations pays nothing, and a failure on one side must
+    // not be able to silently swallow the other's numbers.
+    drop(store);
+    stats.agy = sync_agy(repo)?;
     Ok(stats)
 }
 
@@ -524,6 +859,102 @@ mod tests {
         assert!(err.contains("refusing to migrate"), "got: {err}");
         assert!(repo.join(".ravel/oxigraph").exists(), "nothing was touched");
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Prefer the untruncated transcript; fall back to the short one and SAY
+    /// that it is the short one.
+    #[test]
+    fn agy_prefers_full_transcript_and_flags_short_only() {
+        let brain = std::env::temp_dir().join("ravel-agy-test-brain");
+        fs::remove_dir_all(&brain).ok();
+        let logs = |id: &str| brain.join(id).join(".system_generated").join("logs");
+        fs::create_dir_all(logs("both")).unwrap();
+        fs::create_dir_all(logs("short")).unwrap();
+        fs::create_dir_all(logs("neither")).unwrap();
+        fs::write(logs("both").join("transcript.jsonl"), "{}").unwrap();
+        fs::write(logs("both").join("transcript_full.jsonl"), "{}").unwrap();
+        fs::write(logs("short").join("transcript.jsonl"), "{}").unwrap();
+
+        let both = agy_transcript_for(&brain, "both").unwrap();
+        assert!(both.source.ends_with("transcript_full.jsonl"));
+        assert!(!both.short_only);
+
+        let short = agy_transcript_for(&brain, "short").unwrap();
+        assert!(short.source.ends_with("transcript.jsonl"));
+        assert!(short.short_only, "a short-only source must be flagged, not assumed whole");
+
+        assert!(agy_transcript_for(&brain, "neither").is_none());
+        fs::remove_dir_all(&brain).ok();
+    }
+
+    /// `history.jsonl` is the agy analogue of the claude path slug: rows carry
+    /// `workspace` + `conversationId`, a conversation repeats across many rows,
+    /// and the earliest rows have no conversation yet.
+    #[test]
+    fn agy_workspace_map_groups_and_dedupes() {
+        let root = std::env::temp_dir().join("ravel-agy-test-history");
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("history.jsonl"),
+            [
+                r#"{"display":"hi","timestamp":1,"workspace":"/w/one"}"#,
+                r#"{"display":"a","timestamp":2,"workspace":"/w/one","conversationId":"c1"}"#,
+                r#"{"display":"b","timestamp":3,"workspace":"/w/one","conversationId":"c1"}"#,
+                r#"{"display":"c","timestamp":4,"workspace":"/w/one","conversationId":"c2"}"#,
+                r#"{"display":"d","timestamp":5,"workspace":"/w/two","conversationId":"c3"}"#,
+                r#"garbage"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let map = agy_workspace_map(&root).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[0].0, "/w/one");
+        assert_eq!(map[0].1, vec!["c1", "c2"], "repeated ids collapse, order preserved");
+        assert_eq!(map[1].1, vec!["c3"]);
+
+        // A missing history file is empty, not an error — most machines have no
+        // Antigravity CLI at all.
+        assert!(agy_workspace_map(&std::env::temp_dir().join("nope")).unwrap().is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The agy manifest stores a CONTENT HASH where the claude one stores a
+    /// byte length — separate files, because the same column meaning two
+    /// different things is how a stale entry passes for a fresh one.
+    #[test]
+    fn agy_manifest_round_trips_hashes() {
+        let repo = std::env::temp_dir().join("ravel-agy-test-manifest");
+        fs::remove_dir_all(&repo).ok();
+        fs::create_dir_all(repo.join(".ravel/_ignore")).unwrap();
+        let mut m = std::collections::HashMap::new();
+        m.insert("d6bf9dc3-c6e6-49ef-9e9b-fc70c7186501".to_string(), "a".repeat(64));
+        write_agy_manifest(&repo, &m).unwrap();
+        assert_eq!(read_agy_manifest(&repo), m);
+        assert!(!repo.join(INGEST_MANIFEST).exists(), "must not collide with the claude manifest");
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// An in-place rewrite that keeps the file the SAME SIZE must still be seen.
+    /// This is the whole reason the agy shelf hashes instead of measuring: the
+    /// client rewrites a step's line from RUNNING to DONE without appending.
+    #[test]
+    fn agy_change_detection_catches_a_same_size_rewrite() {
+        let dir = std::env::temp_dir().join("ravel-agy-test-hash");
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        fs::write(&f, r#"{"status":"RUNNING"}"#).unwrap();
+        let before = file_sha256(&f).unwrap();
+        let before_len = fs::metadata(&f).unwrap().len();
+
+        fs::write(&f, r#"{"status":"DONE___"}"#).unwrap();
+        let after = file_sha256(&f).unwrap();
+        assert_eq!(before_len, fs::metadata(&f).unwrap().len(), "same size by construction");
+        assert_ne!(before, after, "size says unchanged; the hash says otherwise");
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The slug is the absolute repo path with slashes flattened to dashes.

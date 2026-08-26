@@ -254,6 +254,7 @@ mod tests {
             timestamp: Some("2026-06-30T00:00:00Z".into()),
             text: Some(text.into()),
             text_provenance: vec![span],
+            thinking: None,
         }
     }
 

@@ -12,6 +12,7 @@
 //! soul identity — see `soul.rs`). The engine is invariant under it.
 
 pub mod adapter;
+pub mod agy;
 pub mod annotate;
 pub mod graph;
 pub mod project;
@@ -37,6 +38,21 @@ pub struct Event {
     /// looks up its `SourceKind` here, so downstream can tell an AUTHORED
     /// emission from one merely QUOTED inside a tool result. Empty when unknown.
     pub text_provenance: Vec<TextSpan>,
+    /// Model reasoning scratchpad, kept OUT of `text` so chat prose stays clean.
+    ///
+    /// Cross-dialect, measured not assumed: Claude Code files it as a
+    /// `thinking` content block (750 of them across spaceGOAT's own 18
+    /// mirrored sessions, 2026-08-26) and Gemini/Antigravity as a `thinking`
+    /// sibling of `content` on `PLANNER_RESPONSE` (55 in one live
+    /// conversation). Both adapters extract it.
+    ///
+    /// DEFERRED — nothing projects this yet. Whether it becomes a
+    /// `ravel:thinking` property on Turn or a third `textOrigin` value is a
+    /// modeling ruling that serves both dialects, standing before tr1p
+    /// (see the extractor spec §2, 2026-08-26). It is carried here so the
+    /// adapters are already lossless and the ruling costs one line in
+    /// `project.rs` when it lands — absence as roadmap, not as ignorance.
+    pub thinking: Option<String>,
 }
 
 /// Where a slice of an event's concatenated `text` came from.

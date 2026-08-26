@@ -50,6 +50,7 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
             timestamp,
             text,
             text_provenance,
+            thinking: extract_thinking(o.get("message")),
         });
     }
     Ok(events)
@@ -63,9 +64,16 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
 /// emission from one merely quoted inside a tool result:
 ///   - `text`         → Authored   (human text, or the assistant's prose)
 ///   - `tool_result`  → ToolResult (tool output pasted back — quoted material)
+///
 /// Blocks are joined by `\n`; the provenance spans track each block's byte range
 /// in the joined string so an offset maps back to its origin. (`tool_use` inputs
 /// are machine JSON, not prose — skipped; readers anchor to prose.)
+///
+/// `thinking` blocks are NOT joined into `text` — reasoning is not spoken prose
+/// and must not pollute what a reader scans. They go to `Event::thinking` via
+/// [`extract_thinking`]; before 2026-08-26 they were silently discarded by the
+/// catch-all arm below, which was a lossless-ingest violation with 750 blocks
+/// behind it in spaceGOAT's own mirror alone.
 fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
     let Some(content) = message.and_then(|m| m.get("content")) else {
         return (None, Vec::new());
@@ -108,6 +116,24 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
         (None, Vec::new())
     } else {
         (Some(out), spans)
+    }
+}
+
+/// Pull `thinking` blocks out of a `message`, joined by a blank line when a
+/// record carries several. Separate from [`extract_text`] on purpose: these
+/// share a record with spoken prose but are not part of it.
+fn extract_thinking(message: Option<&Value>) -> Option<String> {
+    let blocks = message.and_then(|m| m.get("content")).and_then(Value::as_array)?;
+    let parts: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|b| b.get("thinking").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
     }
 }
 
