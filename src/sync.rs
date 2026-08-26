@@ -90,6 +90,11 @@ pub fn migrate_legacy_layout(repo: &Path) -> Result<usize> {
 pub enum MirrorState {
     Current,
     Growing,
+    /// A live session whose mirror has been behind for longer than
+    /// [`GROWING_DIVERGENCE_LIMIT_SECS`]. Still "growing" in mechanism, but no
+    /// longer healthy: see the doc comment on that constant for the incident
+    /// that put this variant here.
+    GrowingLong,
     Stale,
     Missing,
 }
@@ -98,18 +103,56 @@ pub enum MirrorState {
 /// session (`Growing`); older divergence is `Stale`.
 pub const LIVE_SESSION_WINDOW_SECS: u64 = 30 * 60;
 
+/// How long a live session's mirror may lag before `Growing` stops counting as
+/// healthy.
+///
+/// **Why this exists.** `Growing` used to have no duration. It asked "is the
+/// source still being written?" and never "for how long has the mirror been
+/// behind?", so a 20-minute-old live session and a session left open for three
+/// weeks produced identical green output. On 2026-08-26 that printed OK across
+/// four souls while 101.4 MB of conversation existed in exactly one place on
+/// disk. Every component did what it was built to do; the check forgot to ask
+/// one question.
+///
+/// Three days is chosen to sit well clear of a long working session (souls here
+/// run day-long ones routinely) while catching the real failure — a session
+/// nobody has ended, whose SessionEnd hook therefore has not fired since it
+/// opened. The backup is not broken; it is deferred indefinitely, which for a
+/// custody engine is the same thing said politely.
+pub const GROWING_DIVERGENCE_LIMIT_SECS: u64 = 3 * 24 * 60 * 60;
+
+/// Classify one source file against its mirror.
+///
+/// `divergence_age_secs` answers "how long has the mirror been out of date?" —
+/// the question the original classifier never asked. It is the mirror file's
+/// own age when a mirror exists (it was last correct when it was written), and
+/// the source's age since creation when no mirror exists (it has never been
+/// correct). `None` when the filesystem could not supply it, which downgrades
+/// to the old duration-blind behaviour rather than inventing a number.
 pub fn classify_mirror_file(
     src_len: u64,
     mirror_len: Option<u64>,
     src_age_secs: u64,
+    divergence_age_secs: Option<u64>,
 ) -> MirrorState {
+    let live = src_age_secs <= LIVE_SESSION_WINDOW_SECS;
+    let lagging_long = divergence_age_secs
+        .map(|d| d > GROWING_DIVERGENCE_LIMIT_SECS)
+        .unwrap_or(false);
     match mirror_len {
         Some(m) if m == src_len => MirrorState::Current,
-        None if src_age_secs <= LIVE_SESSION_WINDOW_SECS => MirrorState::Growing,
+        None if live && lagging_long => MirrorState::GrowingLong,
+        None if live => MirrorState::Growing,
         None => MirrorState::Missing,
-        Some(_) if src_age_secs <= LIVE_SESSION_WINDOW_SECS => MirrorState::Growing,
+        Some(_) if live && lagging_long => MirrorState::GrowingLong,
+        Some(_) if live => MirrorState::Growing,
         Some(_) => MirrorState::Stale,
     }
+}
+
+/// Seconds since a `SystemTime`, saturating at zero for clock skew.
+fn secs_since(t: std::time::SystemTime, now: std::time::SystemTime) -> u64 {
+    now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -593,6 +636,129 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     Ok(stats)
 }
 
+/// A slug reduced to its comparable core: lowercase, punctuation dropped.
+///
+/// Claude Code names a session directory after the repo's absolute path with
+/// `/` → `-`, so ANY change to the path spells a different directory. In
+/// practice the change that actually happens is cosmetic — `spaceG.O.A.T.`
+/// became `spaceGOAT`, `M4RQ` became `m4rq` — and the old directory keeps its
+/// sessions forever (Claude's `cleanupPeriodDays` here is 99999, so nothing
+/// expires). Normalizing to letters and digits makes those renames comparable
+/// without matching two genuinely different repos that merely share a word.
+fn slug_core(slug: &str) -> String {
+    slug.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// A session directory OTHER than this repo's current one that appears to hold
+/// this repo's history.
+#[derive(Debug)]
+pub struct SiblingSlug {
+    pub slug: String,
+    pub sessions: usize,
+    /// Sessions in that directory with no counterpart in this repo's mirror.
+    pub unmirrored: usize,
+    pub unmirrored_bytes: u64,
+    /// True when at least one of its session files is ALREADY in this mirror —
+    /// proof the directory served this repo, not a guess from its name.
+    pub proven: bool,
+}
+
+/// Find session directories that belong to this repo under a name it no longer
+/// uses.
+///
+/// **The blind spot this closes.** The mirror check counts source sessions in
+/// ONE directory — the slug for the repo's current path. Rename the repo and
+/// the old directory keeps every session it ever held, outside the counted set:
+/// not stale, not missing, simply never looked at. The verdict stays a clean
+/// `0 missing` while history sits unbacked-up. That cost spaceGOAT 42.8 MB of
+/// April–May conversations, which a full backfill of the current slug swept
+/// past without a word.
+///
+/// Two classes, kept apart on purpose:
+///   - **proven** — the directory holds at least one session file this repo's
+///     mirror already has. Session ids are unique, so that is evidence, not
+///     resemblance.
+///   - **suspected** — the directory's slug normalizes to the same core as this
+///     repo's ([`slug_core`]). Reported so a human can look, never asserted.
+pub fn sibling_slugs_for(repo: &Path) -> Result<Vec<SiblingSlug>> {
+    let current = claude_sessions_dir_for(repo)?;
+    let Some(projects) = current.parent().map(Path::to_path_buf) else {
+        return Ok(Vec::new());
+    };
+    if !projects.is_dir() {
+        return Ok(Vec::new());
+    }
+    let current_name = current
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let core = slug_core(&current_name);
+    let mirror = repo.join(TRANSCRIPTS_SUBDIR);
+    let mirrored: std::collections::HashSet<String> = std::fs::read_dir(&mirror)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&projects)? {
+        let dir = entry?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else { continue };
+        if name == current_name {
+            continue;
+        }
+        let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        // A mirrored file may carry a date prefix from a hand backfill, so
+        // match on the session id appearing anywhere in a mirror filename.
+        let is_home = |n: &String| mirrored.iter().any(|m| m == n || m.ends_with(n.as_str()));
+        let proven = names.iter().any(is_home);
+        if !proven && slug_core(name) != core {
+            continue;
+        }
+        let unmirrored: Vec<&PathBuf> = files
+            .iter()
+            .zip(&names)
+            .filter(|(_, n)| !is_home(n))
+            .map(|(p, _)| p)
+            .collect();
+        out.push(SiblingSlug {
+            slug: name.to_string(),
+            sessions: files.len(),
+            unmirrored: unmirrored.len(),
+            unmirrored_bytes: unmirrored
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .sum(),
+            proven,
+        });
+    }
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(out)
+}
+
 /// One diagnostic finding: severity tag + human line. "attention" findings
 /// make the diagnostic exit non-zero; "ok"/"expected" never do.
 #[derive(Debug)]
@@ -656,6 +822,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
     let mirror = repo.join(TRANSCRIPTS_SUBDIR);
     let now = std::time::SystemTime::now();
     let (mut current, mut growing, mut stale, mut missing, mut src_n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut long_lag: Vec<(String, u64, u64)> = Vec::new(); // (name, days behind, unmirrored bytes)
     if src.is_dir() {
         for entry in std::fs::read_dir(&src)? {
             let path = entry?.path();
@@ -664,18 +831,27 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             }
             src_n += 1;
             let meta = std::fs::metadata(&path)?;
-            let age = now
-                .duration_since(meta.modified()?)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let mirror_len = path
-                .file_name()
-                .map(|n| mirror.join(n))
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len());
-            match classify_mirror_file(meta.len(), mirror_len, age) {
+            let age = secs_since(meta.modified()?, now);
+            let mirror_path = path.file_name().map(|n| mirror.join(n));
+            let mirror_meta = mirror_path.as_ref().and_then(|p| std::fs::metadata(p).ok());
+            let mirror_len = mirror_meta.as_ref().map(|m| m.len());
+            // How long the mirror has been out of date: the mirror's own age
+            // when one exists, else how long the source has existed unmirrored.
+            let divergence = match &mirror_meta {
+                Some(m) => m.modified().ok().map(|t| secs_since(t, now)),
+                None => meta.created().ok().map(|t| secs_since(t, now)),
+            };
+            match classify_mirror_file(meta.len(), mirror_len, age, divergence) {
                 MirrorState::Current => current += 1,
                 MirrorState::Growing => growing += 1,
+                MirrorState::GrowingLong => {
+                    growing += 1;
+                    long_lag.push((
+                        path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                        divergence.unwrap_or(0) / 86_400,
+                        meta.len().saturating_sub(mirror_len.unwrap_or(0)),
+                    ));
+                }
                 MirrorState::Stale => stale += 1,
                 MirrorState::Missing => missing += 1,
             }
@@ -688,6 +864,29 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         } else {
             push(false, summary);
         }
+        // The age question `growing` used to skip. A live session is healthy;
+        // a live session whose mirror has been behind for weeks is a backup
+        // deferred indefinitely, and it used to print exactly as green as the
+        // healthy one.
+        if !long_lag.is_empty() {
+            let unmirrored: u64 = long_lag.iter().map(|(_, _, b)| *b).sum();
+            let worst = long_lag.iter().map(|(_, d, _)| *d).max().unwrap_or(0);
+            push(
+                true,
+                format!(
+                    "mirror age: {} live session(s) have been ahead of the mirror for over {} day(s) (worst: {worst}) — {:.1} MB currently exists in ONE place only. A session open this long has not fired SessionEnd since it opened; close it, or run `ravel-sync {}` now. Sessions: {}",
+                    long_lag.len(),
+                    GROWING_DIVERGENCE_LIMIT_SECS / 86_400,
+                    unmirrored as f64 / 1_048_576.0,
+                    repo.display(),
+                    long_lag
+                        .iter()
+                        .map(|(n, d, _)| format!("{n} ({d}d)"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            );
+        }
     } else if mirror.is_dir() {
         push(
             false,
@@ -698,6 +897,75 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             true,
             format!("mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here", src.display()),
         );
+    }
+
+    // Other session directories that hold this repo's history under a name it
+    // no longer uses. `0 missing` above only ever covered the current slug.
+    match sibling_slugs_for(repo) {
+        Ok(sibs) if sibs.is_empty() => {
+            push(false, "other slugs: none — no renamed session directory holds this repo's history".into())
+        }
+        Ok(sibs) => {
+            for sib in sibs {
+                let how = if sib.proven { "PROVEN (shares session ids with this mirror)" } else { "suspected (name matches after normalizing)" };
+                if sib.unmirrored > 0 {
+                    push(true, format!(
+                        "other slugs: {} — {how}, {} of {} session(s) are NOT in this mirror ({:.1} MB unbacked-up). Bring them home: `ravel-sync {} {}`",
+                        sib.slug, sib.unmirrored, sib.sessions,
+                        sib.unmirrored_bytes as f64 / 1_048_576.0,
+                        repo.display(),
+                        std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                            .join(".claude").join("projects").join(&sib.slug).display(),
+                    ));
+                } else {
+                    push(false, format!(
+                        "other slugs: {} — {how}, all {} session(s) already mirrored (history from a previous path is home)",
+                        sib.slug, sib.sessions,
+                    ));
+                }
+            }
+        }
+        Err(e) => push(true, format!("other slugs: could not scan for renamed session directories — {e}")),
+    }
+
+    // The agy shelf. Reported only when the substrate is present, so a
+    // claude-only soul does not read a row of zeros as a finding — but an
+    // unattributed conversation is always said out loud.
+    match agy_conversations_for(repo) {
+        Ok((convs, unattributed)) => {
+            if !convs.is_empty() {
+                let agy_mirror = repo.join(AGY_TRANSCRIPTS_SUBDIR);
+                let home = convs
+                    .iter()
+                    .filter(|c| agy_mirror.join(format!("{}.jsonl", c.id)).is_file())
+                    .count();
+                let line = format!(
+                    "agy: {} conversation(s) for this soul → {home} mirrored, {} never backed up",
+                    convs.len(),
+                    convs.len() - home
+                );
+                if home < convs.len() {
+                    push(true, format!("{line} — run `ravel-sync {}`", repo.display()));
+                } else {
+                    push(false, line);
+                }
+            }
+            // Deliberately NOT an attention finding, and deliberately printed
+            // even on souls with no agy conversations of their own. An
+            // unattributed conversation is a fact about the MACHINE, not about
+            // this soul — raising the verdict here would flip every soul on the
+            // box to ATTENTION for one orphan belonging to none of them, which
+            // is how a real warning gets trained into background noise. It
+            // stays visible everywhere so it cannot be missed, and owning it
+            // belongs to the fleet-wide health pass that walks every soul.
+            if !unattributed.is_empty() {
+                push(false, format!(
+                    "agy (machine-wide, not this soul): {} conversation(s) on disk belong to no workspace and are backed up nowhere: {} — find the owner with `sqlite3 \"file:$HOME/.gemini/antigravity-cli/conversation_summaries.db?mode=ro\" \"SELECT conversation_id, workspace_uris FROM conversation_summaries;\"`",
+                    unattributed.len(), unattributed.join(", "),
+                ));
+            }
+        }
+        Err(e) => push(true, format!("agy: could not resolve Antigravity conversations — {e}")),
     }
 
     // Store — read-only look, never create.
@@ -818,12 +1086,74 @@ mod tests {
     #[test]
     fn mirror_state_classification() {
         let w = LIVE_SESSION_WINDOW_SECS;
-        assert_eq!(classify_mirror_file(100, Some(100), w * 10), MirrorState::Current);
-        assert_eq!(classify_mirror_file(100, Some(100), 0), MirrorState::Current);
-        assert_eq!(classify_mirror_file(200, Some(100), w / 2), MirrorState::Growing);
-        assert_eq!(classify_mirror_file(200, None, w / 2), MirrorState::Growing);
-        assert_eq!(classify_mirror_file(200, Some(100), w + 1), MirrorState::Stale);
-        assert_eq!(classify_mirror_file(200, None, w + 1), MirrorState::Missing);
+        let fresh = Some(60u64);
+        assert_eq!(classify_mirror_file(100, Some(100), w * 10, fresh), MirrorState::Current);
+        assert_eq!(classify_mirror_file(100, Some(100), 0, fresh), MirrorState::Current);
+        assert_eq!(classify_mirror_file(200, Some(100), w / 2, fresh), MirrorState::Growing);
+        assert_eq!(classify_mirror_file(200, None, w / 2, fresh), MirrorState::Growing);
+        assert_eq!(classify_mirror_file(200, Some(100), w + 1, fresh), MirrorState::Stale);
+        assert_eq!(classify_mirror_file(200, None, w + 1, fresh), MirrorState::Missing);
+    }
+
+    /// THE 2026-08-26 INCIDENT, pinned as a test.
+    ///
+    /// A live session whose mirror has been behind for weeks used to be
+    /// indistinguishable from one that started twenty minutes ago: both
+    /// `Growing`, both green. Four souls printed OK over 101.4 MB that existed
+    /// in one place. The classifier now asks how long, and the two cases part.
+    #[test]
+    fn a_live_session_lagging_for_weeks_is_no_longer_green() {
+        let w = LIVE_SESSION_WINDOW_SECS;
+        let day = 86_400u64;
+        let twenty_days = Some(20 * day);
+        let twenty_minutes = Some(20 * 60);
+
+        // Same source, same mirror, same live source age — only the DURATION
+        // of the divergence differs, and that is now decisive.
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w / 2, twenty_minutes),
+            MirrorState::Growing,
+            "a session that has been running twenty minutes is healthy"
+        );
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w / 2, twenty_days),
+            MirrorState::GrowingLong,
+            "the same shape after twenty days is a backup deferred indefinitely"
+        );
+
+        // A never-mirrored live session, judged by how long it has existed.
+        assert_eq!(classify_mirror_file(200, None, w / 2, twenty_days), MirrorState::GrowingLong);
+
+        // The threshold is a boundary, not a vibe.
+        let lim = GROWING_DIVERGENCE_LIMIT_SECS;
+        assert_eq!(classify_mirror_file(200, Some(100), 0, Some(lim)), MirrorState::Growing);
+        assert_eq!(classify_mirror_file(200, Some(100), 0, Some(lim + 1)), MirrorState::GrowingLong);
+
+        // Unknown duration must NOT be invented — it falls back to the old
+        // duration-blind answer rather than guessing a bad one.
+        assert_eq!(classify_mirror_file(200, Some(100), w / 2, None), MirrorState::Growing);
+        // …and a stale or missing verdict never depended on duration anyway.
+        assert_eq!(classify_mirror_file(200, Some(100), w + 1, twenty_days), MirrorState::Stale);
+    }
+
+    /// `spaceG.O.A.T.` → `spaceGOAT` and `M4RQ` → `m4rq` are the renames that
+    /// actually happened on this machine; two different repos that merely share
+    /// a word are not.
+    #[test]
+    fn slug_core_matches_renames_not_neighbours() {
+        assert_eq!(
+            slug_core("-Users-dev-repos-SQUAD-spaceG-O-A-T-"),
+            slug_core("-Users-dev-repos-SQUAD-spaceGOAT"),
+        );
+        assert_eq!(
+            slug_core("-Users-dev-repos-SQUAD--M4RQ"),
+            slug_core("-Users-dev-repos-SQUAD-m4rq"),
+        );
+        assert_ne!(
+            slug_core("-Users-dev-repos-SQUAD-lUX"),
+            slug_core("-Users-dev-repos-SQUAD-lUX-making"),
+            "a neighbouring repo is not a rename"
+        );
     }
 
     /// Legacy trees move into the pocket once; a second run is a no-op; a
