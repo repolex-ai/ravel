@@ -581,57 +581,53 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         let (copied, unchanged) = mirror_jsonl(&src, &mirror)?;
         stats.mirrored = copied;
         stats.unchanged = unchanged;
-    } else if !mirror.is_dir() {
-        anyhow::bail!(
-            "no sessions to sync: {} missing and no existing mirror at {}",
-            src.display(),
-            mirror.display()
-        );
     }
 
-    let store = graph::open(repo.join(STORE_SUBDIR))?;
-    let mut manifest = read_manifest(repo);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&mirror)
-        .with_context(|| format!("read mirror {}", mirror.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .collect();
-    paths.sort();
-    for path in &paths {
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        // Unchanged since its last successful ingest → the graph already
-        // holds this projection; skip the parse. Makes a large backfilled
-        // mirror cost nothing at session end.
-        if manifest.get(&name) == Some(&len) {
-            stats.skipped += 1;
-            continue;
-        }
-        let jsonl = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("skip {}: {e}", path.display());
+    if mirror.is_dir() {
+        let store = graph::open(repo.join(STORE_SUBDIR))?;
+        let mut manifest = read_manifest(repo);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&mirror)
+            .with_context(|| format!("read mirror {}", mirror.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .collect();
+        paths.sort();
+        for path in &paths {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            // Unchanged since its last successful ingest → the graph already
+            // holds this projection; skip the parse. Makes a large backfilled
+            // mirror cost nothing at session end.
+            if manifest.get(&name) == Some(&len) {
+                stats.skipped += 1;
                 continue;
             }
-        };
-        let events = adapter::parse_transcript(&jsonl)?;
-        if events.is_empty() {
+            let jsonl = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("skip {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let events = adapter::parse_transcript(&jsonl)?;
+            if events.is_empty() {
+                manifest.insert(name, len);
+                continue;
+            }
+            let anns = reader::emojikey_read(&events);
+            let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
+            graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
             manifest.insert(name, len);
-            continue;
+            stats.sessions += 1;
+            stats.turns += events.len();
+            stats.keys += anns.len();
         }
-        let anns = reader::emojikey_read(&events);
-        let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
-        graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
-        manifest.insert(name, len);
-        stats.sessions += 1;
-        stats.turns += events.len();
-        stats.keys += anns.len();
+        write_manifest(repo, &manifest)?;
     }
-    write_manifest(repo, &manifest)?;
+
     // The agy half. Independent of the claude half on purpose: a soul with no
     // Antigravity conversations pays nothing, and a failure on one side must
     // not be able to silently swallow the other's numbers.
-    drop(store);
     stats.agy = sync_agy(repo)?;
     Ok(stats)
 }
