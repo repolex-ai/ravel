@@ -48,8 +48,12 @@ pub fn open(path: impl AsRef<Path>) -> Result<Store> {
 /// Open the store read-only (shared lock — many readers, or a reader beside a
 /// writer). The path must already exist.
 pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
-    Store::open_read_only(path.as_ref())
-        .with_context(|| format!("open read-only oxigraph store at {}", path.as_ref().display()))
+    Store::open_read_only(path.as_ref()).with_context(|| {
+        format!(
+            "open read-only oxigraph store at {}",
+            path.as_ref().display()
+        )
+    })
 }
 
 /// Ingest one transcript's Turn nodes AND its annotations into its named graph,
@@ -97,7 +101,12 @@ pub fn ingest_annotations(
 
     // count what's in this graph now
     Ok(store
-        .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(graph.as_ref())))
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(graph.as_ref())),
+        )
         .count())
 }
 
@@ -137,7 +146,12 @@ pub fn ingest_transcript(
     store.flush()?;
 
     Ok(store
-        .quads_for_pattern(None, None, None, Some(GraphNameRef::NamedNode(graph.as_ref())))
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(graph.as_ref())),
+        )
         .count())
 }
 
@@ -185,7 +199,10 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
         ORDER BY ?g ?ts
         "#
     );
-    let results = SparqlEvaluator::new().parse_query(&q)?.on_store(store).execute()?;
+    let results = SparqlEvaluator::new()
+        .parse_query(&q)?
+        .on_store(store)
+        .execute()?;
     let QueryResults::Solutions(solutions) = results else {
         anyhow::bail!("expected SELECT solutions");
     };
@@ -220,7 +237,13 @@ fn term_value(t: &oxigraph::model::Term) -> String {
 
 fn safe(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -231,7 +254,11 @@ mod tests {
     use crate::{Event, SourceKind, TextSpan};
 
     fn ev(id: &str, text: &str, kind: SourceKind) -> Event {
-        let span = TextSpan { start: 0, end: text.len(), kind };
+        let span = TextSpan {
+            start: 0,
+            end: text.len(),
+            kind,
+        };
         Event {
             event_id: id.into(),
             parent_id: None,
@@ -247,7 +274,11 @@ mod tests {
     fn triple_term_survives_named_graph_and_reingest_is_idempotent() {
         let store = Store::new().unwrap(); // in-memory is the same API as on-disk
         let part = "https://repolex.ai/ravel/Turn/";
-        let evs = vec![ev("e1", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored)];
+        let evs = vec![ev(
+            "e1",
+            "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]",
+            SourceKind::Authored,
+        )];
         let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1);
 
@@ -266,20 +297,34 @@ mod tests {
                ASK {{ GRAPH ?g {{ ?t rdf:type ravel:Turn ; ravel:timestamp ?ts .
                       FILTER(STRSTARTS(STR(?t), "https://repolex.ai/ravel/Turn/")) }} }}"#
         );
-        let ask = SparqlEvaluator::new().parse_query(&turn_q).unwrap().on_store(&store).execute().unwrap();
-        assert!(matches!(ask, QueryResults::Boolean(true)),
-            "the Turn node with its timestamp must be in the graph");
+        let ask = SparqlEvaluator::new()
+            .parse_query(&turn_q)
+            .unwrap()
+            .on_store(&store)
+            .execute()
+            .unwrap();
+        assert!(
+            matches!(ask, QueryResults::Boolean(true)),
+            "the Turn node with its timestamp must be in the graph"
+        );
 
         // GOTCHA #2: the triple term must be readable THROUGH the named graph.
         let hits = query_emojikeys(&store, None).unwrap();
-        assert_eq!(hits.len(), 1, "one emojikey, read back through GRAPH + triple term");
+        assert_eq!(
+            hits.len(),
+            1,
+            "one emojikey, read back through GRAPH + triple term"
+        );
         assert_eq!(hits[0].transcript, "sess-A");
         assert_eq!(hits[0].source_kind, "authored");
         assert_eq!(hits[0].me, "🧠");
 
         // provenance filter: authored-only keeps it; tool_result-only drops it.
         assert_eq!(query_emojikeys(&store, Some("authored")).unwrap().len(), 1);
-        assert_eq!(query_emojikeys(&store, Some("tool_result")).unwrap().len(), 0);
+        assert_eq!(
+            query_emojikeys(&store, Some("tool_result")).unwrap().len(),
+            0
+        );
     }
 
     #[test]
@@ -287,7 +332,11 @@ mod tests {
         let store = Store::new().unwrap();
         let part = "https://repolex.ai/ravel/Turn/";
         let eva = vec![ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)];
-        let evb = vec![ev("e2", "[ME|x]~[CONTENT|y]~[YOU|z]", SourceKind::ToolResult)];
+        let evb = vec![ev(
+            "e2",
+            "[ME|x]~[CONTENT|y]~[YOU|z]",
+            SourceKind::ToolResult,
+        )];
         let a = emojikey_read(&eva);
         let b = emojikey_read(&evb);
         ingest_annotations(&store, &eva, &a, "sess-A", part).unwrap();
@@ -325,7 +374,12 @@ mod tests {
             r#"PREFIX ravel: <{RAVEL_NS}>
                SELECT (COUNT(?t) AS ?n) WHERE {{ GRAPH ?g {{ ?t a ravel:Turn }} }}"#
         );
-        let res = SparqlEvaluator::new().parse_query(&count_q).unwrap().on_store(&store).execute().unwrap();
+        let res = SparqlEvaluator::new()
+            .parse_query(&count_q)
+            .unwrap()
+            .on_store(&store)
+            .execute()
+            .unwrap();
         if let QueryResults::Solutions(mut s) = res {
             let row = s.next().unwrap().unwrap();
             let n = row.get("n").unwrap().to_string();

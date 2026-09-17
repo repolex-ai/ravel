@@ -106,7 +106,10 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         crate::project::validate_event_id(&ann.event_id).map_err(|e| {
             anyhow::anyhow!(
                 "annotation from reader '{}' (type '{}', span {}..{}): {e}",
-                ann.reader, ann.event_type, ann.start, ann.end
+                ann.reader,
+                ann.event_type,
+                ann.start,
+                ann.end
             )
         })?;
         let h = ann_hash(transcript_id, ann);
@@ -121,21 +124,56 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         let event_iri = crate::project::event_iri(partition, &ann.event_id);
 
         // --- detector as a prov:SoftwareAgent ---
-        triple(&mut nt, iri(&detector_iri), iri(&a_type), iri(&format!("{PROV}SoftwareAgent")));
-        triple(&mut nt, iri(&detector_iri), iri(&format!("{RAVEL_NS}readerName")), str_lit(&ann.reader));
+        triple(
+            &mut nt,
+            iri(&detector_iri),
+            iri(&a_type),
+            iri(&format!("{PROV}SoftwareAgent")),
+        );
+        triple(
+            &mut nt,
+            iri(&detector_iri),
+            iri(&format!("{RAVEL_NS}readerName")),
+            str_lit(&ann.reader),
+        );
 
         // --- the annotation (oa:) ---
-        triple(&mut nt, iri(&ann_iri), iri(&a_type), iri(&format!("{OA}Annotation")));
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}wasAttributedTo")), iri(&detector_iri));
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}detectionType")), str_lit(&ann.event_type));
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&a_type),
+            iri(&format!("{OA}Annotation")),
+        );
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&format!("{PROV}wasAttributedTo")),
+            iri(&detector_iri),
+        );
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&format!("{RAVEL_NS}detectionType")),
+            str_lit(&ann.event_type),
+        );
         if let Some(ts) = &ann.ts {
-            triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}generatedAtTime")), typed_lit(ts, &format!("{XSD}dateTime")));
+            triple(
+                &mut nt,
+                iri(&ann_iri),
+                iri(&format!("{PROV}generatedAtTime")),
+                typed_lit(ts, &format!("{XSD}dateTime")),
+            );
         }
         // provenance: was the signal AUTHORED (live emission) or found inside a
         // TOOL_RESULT (quoted/pasted)? Carried on the annotation so a query can
         // filter to live keys — the lossless-emit decision (don't drop at read).
         if let Some(sk) = ann.source_kind {
-            triple(&mut nt, iri(&ann_iri), iri(&format!("{RAVEL_NS}textOrigin")), str_lit(sk.tag()));
+            triple(
+                &mut nt,
+                iri(&ann_iri),
+                iri(&format!("{RAVEL_NS}textOrigin")),
+                str_lit(sk.tag()),
+            );
         }
 
         // --- target: a span of the source. Matches the proven Python shape:
@@ -143,29 +181,79 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
         // character span; and the durable per-turn join key (the event node) is
         // carried explicitly so the annotation resolves to BOTH the document and
         // the exact turn (address-by-identity, not just offsets). ---
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{OA}hasTarget")), iri(&target_iri));
-        triple(&mut nt, iri(&target_iri), iri(&format!("{OA}hasSource")), iri(&transcript_iri));
-        triple(&mut nt, iri(&target_iri), iri(&format!("{OA}hasSelector")), iri(&selector_iri));
-        triple(&mut nt, iri(&selector_iri), iri(&a_type), iri(&format!("{OA}TextPositionSelector")));
-        triple(&mut nt, iri(&selector_iri), iri(&format!("{OA}start")), typed_lit(&ann.start.to_string(), &format!("{XSD}integer")));
-        triple(&mut nt, iri(&selector_iri), iri(&format!("{OA}end")), typed_lit(&ann.end.to_string(), &format!("{XSD}integer")));
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&format!("{OA}hasTarget")),
+            iri(&target_iri),
+        );
+        triple(
+            &mut nt,
+            iri(&target_iri),
+            iri(&format!("{OA}hasSource")),
+            iri(&transcript_iri),
+        );
+        triple(
+            &mut nt,
+            iri(&target_iri),
+            iri(&format!("{OA}hasSelector")),
+            iri(&selector_iri),
+        );
+        triple(
+            &mut nt,
+            iri(&selector_iri),
+            iri(&a_type),
+            iri(&format!("{OA}TextPositionSelector")),
+        );
+        triple(
+            &mut nt,
+            iri(&selector_iri),
+            iri(&format!("{OA}start")),
+            typed_lit(&ann.start.to_string(), &format!("{XSD}integer")),
+        );
+        triple(
+            &mut nt,
+            iri(&selector_iri),
+            iri(&format!("{OA}end")),
+            typed_lit(&ann.end.to_string(), &format!("{XSD}integer")),
+        );
         // durable per-turn join: the target anchors to the exact Turn NODE
         // (address-by-identity; turn IRIs are stable+derived, no literal key).
-        triple(&mut nt, iri(&target_iri), iri(&format!("{RAVEL_NS}atTurn")), iri(&event_iri));
+        triple(
+            &mut nt,
+            iri(&target_iri),
+            iri(&format!("{RAVEL_NS}atTurn")),
+            iri(&event_iri),
+        );
 
         // --- evidence (prov:used): what the detector looked at = the event ---
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{PROV}used")), iri(&event_iri));
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&format!("{PROV}used")),
+            iri(&event_iri),
+        );
 
         // --- body: the signal payload, flattened onto a body node. A leg the
         // reader declared numeric projects as its xsd typed literal, so
         // FILTER-by-magnitude compares as a NUMBER; text legs stay plain. ---
-        triple(&mut nt, iri(&ann_iri), iri(&format!("{OA}hasBody")), iri(&body_iri));
+        triple(
+            &mut nt,
+            iri(&ann_iri),
+            iri(&format!("{OA}hasBody")),
+            iri(&body_iri),
+        );
         for (k, v) in &ann.signal {
             let obj = match v.xsd_datatype() {
                 Some(dt) => typed_lit(&v.lexical(), dt),
                 None => str_lit(&v.lexical()),
             };
-            triple(&mut nt, iri(&body_iri), iri(&format!("{RAVEL_NS}sig_{}", safe(k))), obj);
+            triple(
+                &mut nt,
+                iri(&body_iri),
+                iri(&format!("{RAVEL_NS}sig_{}", safe(k))),
+                obj,
+            );
         }
 
         // --- the CLAIM: an RDF 1.2 triple term, UNASSERTED, carrying meta ---
@@ -179,11 +267,31 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
             iri(&format!("{RAVEL_NS}exhibits")),
             str_lit(&ann.event_type),
         );
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{RDF}reifies")), proposition);
+        triple(
+            &mut nt,
+            iri(&claim_iri),
+            iri(&format!("{RDF}reifies")),
+            proposition,
+        );
         // belief → evidence: the claim is derived from the annotation wrapper
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{PROV}wasDerivedFrom")), iri(&ann_iri));
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detectorName")), str_lit(&ann.reader));
-        triple(&mut nt, iri(&claim_iri), iri(&format!("{RAVEL_NS}detectionType")), str_lit(&ann.event_type));
+        triple(
+            &mut nt,
+            iri(&claim_iri),
+            iri(&format!("{PROV}wasDerivedFrom")),
+            iri(&ann_iri),
+        );
+        triple(
+            &mut nt,
+            iri(&claim_iri),
+            iri(&format!("{RAVEL_NS}detectorName")),
+            str_lit(&ann.reader),
+        );
+        triple(
+            &mut nt,
+            iri(&claim_iri),
+            iri(&format!("{RAVEL_NS}detectionType")),
+            str_lit(&ann.event_type),
+        );
     }
 
     Ok(nt)
@@ -222,7 +330,13 @@ fn escape(s: &str) -> String {
 
 fn safe(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -235,7 +349,11 @@ mod tests {
     use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 
     fn ev(id: &str, text: &str) -> Event {
-        let span = crate::TextSpan { start: 0, end: text.len(), kind: crate::SourceKind::Authored };
+        let span = crate::TextSpan {
+            start: 0,
+            end: text.len(),
+            kind: crate::SourceKind::Authored,
+        };
         Event {
             event_id: id.into(),
             parent_id: None,
@@ -286,7 +404,10 @@ mod tests {
         // round-trip through a fresh store, reading back THROUGH the triple term
         let store2 = Store::new().unwrap();
         let dump = store
-            .dump_to_writer(oxigraph::io::RdfSerializer::from_format(oxigraph::io::RdfFormat::NQuads), Vec::new())
+            .dump_to_writer(
+                oxigraph::io::RdfSerializer::from_format(oxigraph::io::RdfFormat::NQuads),
+                Vec::new(),
+            )
             .unwrap();
         store2
             .load_from_reader(oxigraph::io::RdfFormat::NQuads, dump.as_slice())
@@ -307,8 +428,15 @@ mod tests {
             }}
             "#
         );
-        let res = SparqlEvaluator::new().parse_query(&q).unwrap().on_store(&store2).execute().unwrap();
-        let QueryResults::Solutions(sols) = res else { panic!("expected solutions") };
+        let res = SparqlEvaluator::new()
+            .parse_query(&q)
+            .unwrap()
+            .on_store(&store2)
+            .execute()
+            .unwrap();
+        let QueryResults::Solutions(sols) = res else {
+            panic!("expected solutions")
+        };
         let mut n = 0;
         for s in sols {
             let s = s.unwrap();
@@ -342,7 +470,8 @@ mod tests {
             }
         };
         let anns = vec![mk(3), mk(8)];
-        let store = project_annotations(&anns, "trans-num", "https://repolex.ai/ravel/Turn/").unwrap();
+        let store =
+            project_annotations(&anns, "trans-num", "https://repolex.ai/ravel/Turn/").unwrap();
 
         // NUMERIC filter: legs projected as plain strings would compare
         // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a
@@ -352,8 +481,15 @@ mod tests {
                SELECT (COUNT(*) AS ?big) WHERE {{
                  ?body ravel:sig_magnitude ?m . FILTER(?m > 5) }}"#
         );
-        let res = SparqlEvaluator::new().parse_query(&q).unwrap().on_store(&store).execute().unwrap();
-        let QueryResults::Solutions(sols) = res else { panic!("expected solutions") };
+        let res = SparqlEvaluator::new()
+            .parse_query(&q)
+            .unwrap()
+            .on_store(&store)
+            .execute()
+            .unwrap();
+        let QueryResults::Solutions(sols) = res else {
+            panic!("expected solutions")
+        };
         let got: i64 = sols
             .map(|s| s.unwrap().get("big").unwrap().to_string())
             .next()
@@ -365,7 +501,10 @@ mod tests {
             .trim_matches('"')
             .parse()
             .unwrap();
-        assert_eq!(got, 1, "only magnitude 8 is > 5 (numeric compare, not string)");
+        assert_eq!(
+            got, 1,
+            "only magnitude 8 is > 5 (numeric compare, not string)"
+        );
 
         // and the datatype is genuinely xsd:integer on the wire
         let dump = String::from_utf8(

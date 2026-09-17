@@ -22,8 +22,7 @@ fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
         .context("usage: ravel-spike <transcript.jsonl>")?;
-    let jsonl = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {path}"))?;
+    let jsonl = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
 
     // --- adapter: dialect → generic events ---
     let events = adapter::parse_transcript(&jsonl)?;
@@ -96,7 +95,10 @@ fn main() -> Result<()> {
         // a Store is a quad store — drop the triple into the default graph
         store2.insert(t.clone().in_graph(GraphName::DefaultGraph).as_ref())?;
     }
-    println!("[round-trip] re-loaded into fresh store: {} triples", store2.len()?);
+    println!(
+        "[round-trip] re-loaded into fresh store: {} triples",
+        store2.len()?
+    );
 
     // Read the derived detections back: find reifiers, follow rdf:reifies to the
     // triple term, and pull out the subject + detector + confidence.
@@ -121,7 +123,10 @@ fn main() -> Result<()> {
             let sol = sol?;
             n += 1;
             let turn = sol.get("turn").map(|t| t.to_string()).unwrap_or_default();
-            let det = sol.get("detector").map(|t| t.to_string()).unwrap_or_default();
+            let det = sol
+                .get("detector")
+                .map(|t| t.to_string())
+                .unwrap_or_default();
             let conf = sol.get("conf").map(|t| t.to_string()).unwrap_or_default();
             println!("  ✓ detection {n}: turn={turn}  detector={det}  conf={conf}");
         }

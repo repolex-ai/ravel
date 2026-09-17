@@ -83,7 +83,11 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
         if s.is_empty() {
             return (None, Vec::new());
         }
-        let span = TextSpan { start: 0, end: s.len(), kind: SourceKind::Authored };
+        let span = TextSpan {
+            start: 0,
+            end: s.len(),
+            kind: SourceKind::Authored,
+        };
         return (Some(s.to_string()), vec![span]);
     }
     let Some(blocks) = content.as_array() else {
@@ -110,7 +114,11 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
         }
         let start = out.len();
         out.push_str(&piece);
-        spans.push(TextSpan { start, end: out.len(), kind });
+        spans.push(TextSpan {
+            start,
+            end: out.len(),
+            kind,
+        });
     }
     if out.is_empty() {
         (None, Vec::new())
@@ -123,7 +131,9 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
 /// record carries several. Separate from [`extract_text`] on purpose: these
 /// share a record with spoken prose but are not part of it.
 fn extract_thinking(message: Option<&Value>) -> Option<String> {
-    let blocks = message.and_then(|m| m.get("content")).and_then(Value::as_array)?;
+    let blocks = message
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)?;
     let parts: Vec<&str> = blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))

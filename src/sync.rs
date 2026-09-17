@@ -76,7 +76,11 @@ pub fn migrate_legacy_layout(repo: &Path) -> Result<usize> {
         }
         std::fs::rename(&old, &new)
             .with_context(|| format!("move {} → {}", old.display(), new.display()))?;
-        eprintln!("[ravel-sync] migrated {} → {}", old.display(), new.display());
+        eprintln!(
+            "[ravel-sync] migrated {} → {}",
+            old.display(),
+            new.display()
+        );
         moved += 1;
     }
     Ok(moved)
@@ -202,7 +206,10 @@ pub fn claude_sessions_dir_for(repo: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize soul repo {}", repo.display()))?;
     let slug = abs.to_string_lossy().replace('/', "-");
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".claude").join("projects").join(slug))
+    Ok(PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(slug))
 }
 
 /// Copy every top-level `*.jsonl` in `src` into `dst` when missing or grown.
@@ -211,15 +218,16 @@ pub fn claude_sessions_dir_for(repo: &Path) -> Result<PathBuf> {
 /// — never let it regress the mirror; warn and keep the fuller copy.
 /// Returns (copied, unchanged).
 fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("create mirror dir {}", dst.display()))?;
+    std::fs::create_dir_all(dst).with_context(|| format!("create mirror dir {}", dst.display()))?;
     let (mut copied, mut unchanged) = (0usize, 0usize);
     for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
         let path = entry?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(name) = path.file_name() else { continue };
+        let Some(name) = path.file_name() else {
+            continue;
+        };
         let to = dst.join(name);
         let src_len = std::fs::metadata(&path)?.len();
         match std::fs::metadata(&to).map(|m| m.len()) {
@@ -349,7 +357,9 @@ pub fn agy_workspace_map(store_root: &Path) -> Result<Vec<(String, Vec<String>)>
         if line.is_empty() {
             continue;
         }
-        let Ok(o) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(o) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let (Some(ws), Some(cid)) = (
             o.get("workspace").and_then(|v| v.as_str()),
             o.get("conversationId").and_then(|v| v.as_str()),
@@ -423,7 +433,9 @@ pub fn agy_conversations_for(repo: &Path) -> Result<(Vec<AgyConversation>, Vec<S
         if !path.is_dir() {
             continue;
         }
-        let Some(id) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if !placed.contains(id) && agy_transcript_for(&brain, id).is_some() {
             unattributed.push(id.to_string());
         }
@@ -593,7 +605,11 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
             .collect();
         paths.sort();
         for path in &paths {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             // Unchanged since its last successful ingest → the graph already
             // holds this projection; skip the parse. Makes a large backfilled
@@ -615,7 +631,10 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 continue;
             }
             let anns = reader::emojikey_read(&events);
-            let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
+            let transcript_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("transcript");
             graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
             manifest.insert(name, len);
             stats.sessions += 1;
@@ -707,7 +726,9 @@ pub fn sibling_slugs_for(repo: &Path) -> Result<Vec<SiblingSlug>> {
         if !dir.is_dir() {
             continue;
         }
-        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if name == current_name {
             continue;
         }
@@ -795,7 +816,9 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
     let kit_reg = std::fs::read_to_string(repo.join(".lex/repo.yml"))
         .map(|s| s.contains("git-lex-kit-ravel"))
         .unwrap_or(false);
-    let hook = repo.join(".claude/hooks/SessionEnd-ravel-ravelsync.sh").is_file();
+    let hook = repo
+        .join(".claude/hooks/SessionEnd-ravel-ravelsync.sh")
+        .is_file();
     match (kit_reg, hook) {
         (true, true) => push(false, "kit: registered; hook: installed — OK".into()),
         (_, false) => push(
@@ -817,7 +840,8 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
     };
     let mirror = repo.join(TRANSCRIPTS_SUBDIR);
     let now = std::time::SystemTime::now();
-    let (mut current, mut growing, mut stale, mut missing, mut src_n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut current, mut growing, mut stale, mut missing, mut src_n) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut long_lag: Vec<(String, u64, u64)> = Vec::new(); // (name, days behind, unmirrored bytes)
     if src.is_dir() {
         for entry in std::fs::read_dir(&src)? {
@@ -843,7 +867,10 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 MirrorState::GrowingLong => {
                     growing += 1;
                     long_lag.push((
-                        path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
                         divergence.unwrap_or(0) / 86_400,
                         meta.len().saturating_sub(mirror_len.unwrap_or(0)),
                     ));
@@ -891,19 +918,27 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
     } else {
         push(
             true,
-            format!("mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here", src.display()),
+            format!(
+                "mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here",
+                src.display()
+            ),
         );
     }
 
     // Other session directories that hold this repo's history under a name it
     // no longer uses. `0 missing` above only ever covered the current slug.
     match sibling_slugs_for(repo) {
-        Ok(sibs) if sibs.is_empty() => {
-            push(false, "other slugs: none — no renamed session directory holds this repo's history".into())
-        }
+        Ok(sibs) if sibs.is_empty() => push(
+            false,
+            "other slugs: none — no renamed session directory holds this repo's history".into(),
+        ),
         Ok(sibs) => {
             for sib in sibs {
-                let how = if sib.proven { "PROVEN (shares session ids with this mirror)" } else { "suspected (name matches after normalizing)" };
+                let how = if sib.proven {
+                    "PROVEN (shares session ids with this mirror)"
+                } else {
+                    "suspected (name matches after normalizing)"
+                };
                 if sib.unmirrored > 0 {
                     push(true, format!(
                         "other slugs: {} — {how}, {} of {} session(s) are NOT in this mirror ({:.1} MB unbacked-up). Bring them home: `ravel-sync {} {}`",
@@ -921,7 +956,10 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 }
             }
         }
-        Err(e) => push(true, format!("other slugs: could not scan for renamed session directories — {e}")),
+        Err(e) => push(
+            true,
+            format!("other slugs: could not scan for renamed session directories — {e}"),
+        ),
     }
 
     // The agy shelf. Reported only when the substrate is present, so a
@@ -941,7 +979,10 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                     convs.len() - home
                 );
                 if home < convs.len() {
-                    push(true, format!("{line} — run `ravel-sync {}`", repo.display()));
+                    push(
+                        true,
+                        format!("{line} — run `ravel-sync {}`", repo.display()),
+                    );
                 } else {
                     push(false, line);
                 }
@@ -961,7 +1002,10 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 ));
             }
         }
-        Err(e) => push(true, format!("agy: could not resolve Antigravity conversations — {e}")),
+        Err(e) => push(
+            true,
+            format!("agy: could not resolve Antigravity conversations — {e}"),
+        ),
     }
 
     // Store — read-only look, never create.
@@ -1025,7 +1069,11 @@ mod tests {
         fs::write(src.join("noise.txt"), "ignored").unwrap();
 
         let (copied, unchanged) = mirror_jsonl(&src, &dst).unwrap();
-        assert_eq!((copied, unchanged), (1, 0), "first pass copies the jsonl only");
+        assert_eq!(
+            (copied, unchanged),
+            (1, 0),
+            "first pass copies the jsonl only"
+        );
         assert!(dst.join("a.jsonl").exists());
         assert!(!dst.join("noise.txt").exists(), "non-jsonl never mirrors");
 
@@ -1035,7 +1083,10 @@ mod tests {
         fs::write(src.join("a.jsonl"), "line1\nline2\n").unwrap();
         let (copied, _) = mirror_jsonl(&src, &dst).unwrap();
         assert_eq!(copied, 1, "a grown session re-mirrors");
-        assert_eq!(fs::read_to_string(dst.join("a.jsonl")).unwrap(), "line1\nline2\n");
+        assert_eq!(
+            fs::read_to_string(dst.join("a.jsonl")).unwrap(),
+            "line1\nline2\n"
+        );
 
         fs::remove_dir_all(&base).ok();
     }
@@ -1072,7 +1123,10 @@ mod tests {
         m.insert("b.jsonl".to_string(), 991_000_000u64);
         write_manifest(&repo, &m).unwrap();
         assert_eq!(read_manifest(&repo), m);
-        assert_eq!(read_manifest(&std::env::temp_dir().join("no-such-repo")).len(), 0);
+        assert_eq!(
+            read_manifest(&std::env::temp_dir().join("no-such-repo")).len(),
+            0
+        );
         fs::remove_dir_all(&repo).ok();
     }
 
@@ -1083,12 +1137,30 @@ mod tests {
     fn mirror_state_classification() {
         let w = LIVE_SESSION_WINDOW_SECS;
         let fresh = Some(60u64);
-        assert_eq!(classify_mirror_file(100, Some(100), w * 10, fresh), MirrorState::Current);
-        assert_eq!(classify_mirror_file(100, Some(100), 0, fresh), MirrorState::Current);
-        assert_eq!(classify_mirror_file(200, Some(100), w / 2, fresh), MirrorState::Growing);
-        assert_eq!(classify_mirror_file(200, None, w / 2, fresh), MirrorState::Growing);
-        assert_eq!(classify_mirror_file(200, Some(100), w + 1, fresh), MirrorState::Stale);
-        assert_eq!(classify_mirror_file(200, None, w + 1, fresh), MirrorState::Missing);
+        assert_eq!(
+            classify_mirror_file(100, Some(100), w * 10, fresh),
+            MirrorState::Current
+        );
+        assert_eq!(
+            classify_mirror_file(100, Some(100), 0, fresh),
+            MirrorState::Current
+        );
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w / 2, fresh),
+            MirrorState::Growing
+        );
+        assert_eq!(
+            classify_mirror_file(200, None, w / 2, fresh),
+            MirrorState::Growing
+        );
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w + 1, fresh),
+            MirrorState::Stale
+        );
+        assert_eq!(
+            classify_mirror_file(200, None, w + 1, fresh),
+            MirrorState::Missing
+        );
     }
 
     /// THE 2026-08-26 INCIDENT, pinned as a test.
@@ -1118,18 +1190,33 @@ mod tests {
         );
 
         // A never-mirrored live session, judged by how long it has existed.
-        assert_eq!(classify_mirror_file(200, None, w / 2, twenty_days), MirrorState::GrowingLong);
+        assert_eq!(
+            classify_mirror_file(200, None, w / 2, twenty_days),
+            MirrorState::GrowingLong
+        );
 
         // The threshold is a boundary, not a vibe.
         let lim = GROWING_DIVERGENCE_LIMIT_SECS;
-        assert_eq!(classify_mirror_file(200, Some(100), 0, Some(lim)), MirrorState::Growing);
-        assert_eq!(classify_mirror_file(200, Some(100), 0, Some(lim + 1)), MirrorState::GrowingLong);
+        assert_eq!(
+            classify_mirror_file(200, Some(100), 0, Some(lim)),
+            MirrorState::Growing
+        );
+        assert_eq!(
+            classify_mirror_file(200, Some(100), 0, Some(lim + 1)),
+            MirrorState::GrowingLong
+        );
 
         // Unknown duration must NOT be invented — it falls back to the old
         // duration-blind answer rather than guessing a bad one.
-        assert_eq!(classify_mirror_file(200, Some(100), w / 2, None), MirrorState::Growing);
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w / 2, None),
+            MirrorState::Growing
+        );
         // …and a stale or missing verdict never depended on duration anyway.
-        assert_eq!(classify_mirror_file(200, Some(100), w + 1, twenty_days), MirrorState::Stale);
+        assert_eq!(
+            classify_mirror_file(200, Some(100), w + 1, twenty_days),
+            MirrorState::Stale
+        );
     }
 
     /// `spaceG.O.A.T.` → `spaceGOAT` and `M4RQ` → `m4rq` are the renames that
@@ -1166,10 +1253,20 @@ mod tests {
         assert_eq!(migrate_legacy_layout(&repo).unwrap(), 2, "both trees move");
         assert!(repo.join(".ravel/_ignore/oxigraph/CURRENT").exists());
         assert!(repo.join(TRANSCRIPTS_SUBDIR).join("a.jsonl").exists());
-        assert!(!repo.join(".ravel/oxigraph").exists(), "legacy path is gone");
-        assert!(!repo.join(".ravel/transcripts").exists(), "legacy path is gone");
+        assert!(
+            !repo.join(".ravel/oxigraph").exists(),
+            "legacy path is gone"
+        );
+        assert!(
+            !repo.join(".ravel/transcripts").exists(),
+            "legacy path is gone"
+        );
 
-        assert_eq!(migrate_legacy_layout(&repo).unwrap(), 0, "second run is a no-op");
+        assert_eq!(
+            migrate_legacy_layout(&repo).unwrap(),
+            0,
+            "second run is a no-op"
+        );
         fs::remove_dir_all(&repo).ok();
     }
 
@@ -1207,7 +1304,10 @@ mod tests {
 
         let short = agy_transcript_for(&brain, "short").unwrap();
         assert!(short.source.ends_with("transcript.jsonl"));
-        assert!(short.short_only, "a short-only source must be flagged, not assumed whole");
+        assert!(
+            short.short_only,
+            "a short-only source must be flagged, not assumed whole"
+        );
 
         assert!(agy_transcript_for(&brain, "neither").is_none());
         fs::remove_dir_all(&brain).ok();
@@ -1238,12 +1338,18 @@ mod tests {
         let map = agy_workspace_map(&root).unwrap();
         assert_eq!(map.len(), 2);
         assert_eq!(map[0].0, "/w/one");
-        assert_eq!(map[0].1, vec!["c1", "c2"], "repeated ids collapse, order preserved");
+        assert_eq!(
+            map[0].1,
+            vec!["c1", "c2"],
+            "repeated ids collapse, order preserved"
+        );
         assert_eq!(map[1].1, vec!["c3"]);
 
         // A missing history file is empty, not an error — most machines have no
         // Antigravity CLI at all.
-        assert!(agy_workspace_map(&std::env::temp_dir().join("nope")).unwrap().is_empty());
+        assert!(agy_workspace_map(&std::env::temp_dir().join("nope"))
+            .unwrap()
+            .is_empty());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1256,10 +1362,16 @@ mod tests {
         fs::remove_dir_all(&repo).ok();
         fs::create_dir_all(repo.join(".ravel/_ignore")).unwrap();
         let mut m = std::collections::HashMap::new();
-        m.insert("d6bf9dc3-c6e6-49ef-9e9b-fc70c7186501".to_string(), "a".repeat(64));
+        m.insert(
+            "d6bf9dc3-c6e6-49ef-9e9b-fc70c7186501".to_string(),
+            "a".repeat(64),
+        );
         write_agy_manifest(&repo, &m).unwrap();
         assert_eq!(read_agy_manifest(&repo), m);
-        assert!(!repo.join(INGEST_MANIFEST).exists(), "must not collide with the claude manifest");
+        assert!(
+            !repo.join(INGEST_MANIFEST).exists(),
+            "must not collide with the claude manifest"
+        );
         fs::remove_dir_all(&repo).ok();
     }
 
@@ -1278,8 +1390,15 @@ mod tests {
 
         fs::write(&f, r#"{"status":"DONE___"}"#).unwrap();
         let after = file_sha256(&f).unwrap();
-        assert_eq!(before_len, fs::metadata(&f).unwrap().len(), "same size by construction");
-        assert_ne!(before, after, "size says unchanged; the hash says otherwise");
+        assert_eq!(
+            before_len,
+            fs::metadata(&f).unwrap().len(),
+            "same size by construction"
+        );
+        assert_ne!(
+            before, after,
+            "size says unchanged; the hash says otherwise"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1290,7 +1409,10 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let dir = claude_sessions_dir_for(&repo).unwrap();
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with('-'), "abs path starts with / → slug starts with -");
+        assert!(
+            name.starts_with('-'),
+            "abs path starts with / → slug starts with -"
+        );
         assert!(name.contains("ravel-sync-test-slug"));
         assert!(!name.contains('/'));
         fs::remove_dir_all(&repo).ok();

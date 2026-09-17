@@ -246,7 +246,11 @@ mod tests {
 
     fn ev(text: &str) -> Event {
         // whole-text authored provenance, so source_kind resolves in tests
-        let span = crate::TextSpan { start: 0, end: text.len(), kind: SourceKind::Authored };
+        let span = crate::TextSpan {
+            start: 0,
+            end: text.len(),
+            kind: SourceKind::Authored,
+        };
         Event {
             event_id: "e1".into(),
             parent_id: None,
@@ -260,7 +264,9 @@ mod tests {
 
     #[test]
     fn matches_canonical_shape() {
-        let anns = emojikey_read(&[ev("wrap up 🐐 [ME|🧠🎨8∠45]~[CONTENT|💻🧩9∠15]~[YOU|🎓🌱8∠35] done")]);
+        let anns = emojikey_read(&[ev(
+            "wrap up 🐐 [ME|🧠🎨8∠45]~[CONTENT|💻🧩9∠15]~[YOU|🎓🌱8∠35] done",
+        )]);
         assert_eq!(anns.len(), 1);
         let a = &anns[0];
         assert_eq!(a.signal["me"].lexical(), "🧠🎨8∠45");

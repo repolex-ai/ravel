@@ -26,7 +26,9 @@ fn scalar(store: &Store, q: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args().nth(1).expect("usage: ravel-stats <store-dir> [SPARQL]");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: ravel-stats <store-dir> [SPARQL]");
     // A stats call must NEVER create a store: a mis-aimed path should refuse,
     // not litter an empty RocksDB dir and report a trustworthy-looking 0.
     // (th34's first field report, 2026-08-04.) Read-only open requires the
@@ -46,7 +48,10 @@ fn main() -> Result<()> {
                 let mut n = 0;
                 for s in sols {
                     let s = s?;
-                    let row: Vec<String> = s.iter().map(|(v, t)| format!("{}={}", v.as_str(), t)).collect();
+                    let row: Vec<String> = s
+                        .iter()
+                        .map(|(v, t)| format!("{}={}", v.as_str(), t))
+                        .collect();
                     println!("  {}", row.join("   "));
                     n += 1;
                 }
@@ -60,9 +65,27 @@ fn main() -> Result<()> {
 
     println!("=== STORE: {dir} ===\n");
 
-    println!("total quads:      {}", scalar(&store, "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }")?);
-    println!("named graphs:     {}", scalar(&store, "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }")?);
-    println!("distinct subjects:{}", scalar(&store, "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }")?);
+    println!(
+        "total quads:      {}",
+        scalar(
+            &store,
+            "SELECT (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"
+        )?
+    );
+    println!(
+        "named graphs:     {}",
+        scalar(
+            &store,
+            "SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"
+        )?
+    );
+    println!(
+        "distinct subjects:{}",
+        scalar(
+            &store,
+            "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"
+        )?
+    );
 
     println!("\n--- top predicates ---");
     if let QueryResults::Solutions(sols) = store.query(

@@ -72,7 +72,10 @@ fn main() -> Result<()> {
         if events.is_empty() {
             continue;
         }
-        let transcript_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("transcript");
+        let transcript_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("transcript");
         let n = graph::ingest_transcript(&store, &events, &anns, transcript_id, partition)?;
         sessions += 1;
         total_turns += events.len();
@@ -90,11 +93,19 @@ fn main() -> Result<()> {
     );
 
     // --- the payoff: query the graph of sessions ---
-    let filter = if authored_only { Some("authored") } else { None };
+    let filter = if authored_only {
+        Some("authored")
+    } else {
+        None
+    };
     let hits = graph::query_emojikeys(&store, filter)?;
     println!(
         "\n=== emojikeys across sessions{} ===",
-        if authored_only { " (authored only)" } else { "" }
+        if authored_only {
+            " (authored only)"
+        } else {
+            ""
+        }
     );
     let mut last = String::new();
     for h in &hits {
@@ -107,14 +118,22 @@ fn main() -> Result<()> {
             h.source_kind, h.me, h.content, h.you, h.ts
         );
     }
-    println!("\n[SEE GRAPH] {} emojikey annotation(s) queried across {} session graph(s).",
+    println!(
+        "\n[SEE GRAPH] {} emojikey annotation(s) queried across {} session graph(s).",
         hits.len(),
-        hits.iter().map(|h| &h.transcript).collect::<std::collections::BTreeSet<_>>().len(),
+        hits.iter()
+            .map(|h| &h.transcript)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
     );
     Ok(())
 }
 
 /// Shorten a uuid-ish transcript id for display.
 fn short(id: &str) -> String {
-    if id.len() > 12 { format!("{}…", &id[..12]) } else { id.to_string() }
+    if id.len() > 12 {
+        format!("{}…", &id[..12])
+    } else {
+        id.to_string()
+    }
 }

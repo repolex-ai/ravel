@@ -156,7 +156,11 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
             SourceKind::Authored
         };
         let text_provenance = match &text {
-            Some(t) => vec![TextSpan { start: 0, end: t.len(), kind }],
+            Some(t) => vec![TextSpan {
+                start: 0,
+                end: t.len(),
+                kind,
+            }],
             None => Vec::new(),
         };
 
@@ -230,8 +234,12 @@ pub fn derive_tool_calls(jsonl: &str) -> Result<Vec<ToolCall>> {
         if line.is_empty() {
             continue;
         }
-        let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
-        let Some(i) = o.get("step_index").and_then(Value::as_u64) else { continue };
+        let Ok(o) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(i) = o.get("step_index").and_then(Value::as_u64) else {
+            continue;
+        };
         rows.push((i, o));
     }
     rows.sort_by_key(|(i, _)| *i);
@@ -240,7 +248,9 @@ pub fn derive_tool_calls(jsonl: &str) -> Result<Vec<ToolCall>> {
 
     let mut calls = Vec::new();
     for (idx, o) in &rows {
-        let Some(tcs) = o.get("tool_calls").and_then(Value::as_array) else { continue };
+        let Some(tcs) = o.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
         let unambiguous = tcs.len() == 1
             && by_idx
                 .get(&(idx + 1))
@@ -250,7 +260,11 @@ pub fn derive_tool_calls(jsonl: &str) -> Result<Vec<ToolCall>> {
                 .unwrap_or(false);
         for tc in tcs {
             calls.push(ToolCall {
-                name: tc.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                name: tc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 at_step: *idx,
                 result_step: if unambiguous { Some(idx + 1) } else { None },
             });
@@ -300,30 +314,55 @@ mod tests {
         assert_eq!(parent(0), None, "the first step is a root");
         assert_eq!(parent(1), Some(format!("{CONV}:0")), "adjacent → linked");
         assert_eq!(parent(2), None, "step 3 follows the hole at 2 → NO parent");
-        assert_eq!(parent(3), Some(format!("{CONV}:3")), "adjacent again → linked");
+        assert_eq!(
+            parent(3),
+            Some(format!("{CONV}:3")),
+            "adjacent again → linked"
+        );
         assert_eq!(p.gaps, vec![2], "the hole is recorded, not swallowed");
     }
 
     #[test]
     fn roles_and_timestamps_pass_through_verbatim() {
         let p = parse_transcript(&sample(), CONV).unwrap();
-        assert_eq!(p.events[0].role, "USER_EXPLICIT", "no lossy remap onto Claude's vocabulary");
+        assert_eq!(
+            p.events[0].role, "USER_EXPLICIT",
+            "no lossy remap onto Claude's vocabulary"
+        );
         assert_eq!(p.events[3].role, "MODEL");
-        assert_eq!(p.events[0].timestamp.as_deref(), Some("2026-08-25T15:54:21Z"));
+        assert_eq!(
+            p.events[0].timestamp.as_deref(),
+            Some("2026-08-25T15:54:21Z")
+        );
     }
 
     #[test]
     fn tool_output_is_quoted_prose_is_authored() {
         let p = parse_transcript(&sample(), CONV).unwrap();
-        assert_eq!(p.events[0].source_kind_at(0), Some(SourceKind::Authored), "USER_INPUT");
-        assert_eq!(p.events[2].source_kind_at(0), Some(SourceKind::ToolResult), "RUN_COMMAND");
-        assert_eq!(p.events[3].source_kind_at(0), Some(SourceKind::Authored), "PLANNER_RESPONSE");
+        assert_eq!(
+            p.events[0].source_kind_at(0),
+            Some(SourceKind::Authored),
+            "USER_INPUT"
+        );
+        assert_eq!(
+            p.events[2].source_kind_at(0),
+            Some(SourceKind::ToolResult),
+            "RUN_COMMAND"
+        );
+        assert_eq!(
+            p.events[3].source_kind_at(0),
+            Some(SourceKind::Authored),
+            "PLANNER_RESPONSE"
+        );
     }
 
     #[test]
     fn thinking_is_extracted_and_kept_out_of_text() {
         let p = parse_transcript(&sample(), CONV).unwrap();
-        assert_eq!(p.events[3].thinking.as_deref(), Some("**Weighing options**"));
+        assert_eq!(
+            p.events[3].thinking.as_deref(),
+            Some("**Weighing options**")
+        );
         assert_eq!(p.events[3].text.as_deref(), Some("I will do the thing."));
         assert!(p.events[..3].iter().all(|e| e.thinking.is_none()));
     }
@@ -379,8 +418,18 @@ mod tests {
         .join("\n");
         let calls = derive_tool_calls(&j).unwrap();
         assert_eq!(calls.len(), 4);
-        assert_eq!(calls[0], ToolCall { name: "run_command".into(), at_step: 0, result_step: Some(1) });
-        assert_eq!(calls[1].result_step, None, "two calls → which output is whose?");
+        assert_eq!(
+            calls[0],
+            ToolCall {
+                name: "run_command".into(),
+                at_step: 0,
+                result_step: Some(1)
+            }
+        );
+        assert_eq!(
+            calls[1].result_step, None,
+            "two calls → which output is whose?"
+        );
         assert_eq!(calls[2].result_step, None);
         assert_eq!(calls[3].result_step, None, "next step is not tool output");
     }

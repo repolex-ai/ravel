@@ -34,12 +34,20 @@ fn main() -> Result<()> {
         println!("[ravel-diagnostic] {}", repo.display());
         let mut attention = false;
         for f in &findings {
-            println!("  {}{}", if f.attention { "ATTENTION — " } else { "" }, f.line);
+            println!(
+                "  {}{}",
+                if f.attention { "ATTENTION — " } else { "" },
+                f.line
+            );
             attention |= f.attention;
         }
         println!(
             "  verdict: {}",
-            if attention { "ATTENTION (see above)" } else { "OK" }
+            if attention {
+                "ATTENTION (see above)"
+            } else {
+                "OK"
+            }
         );
         if attention {
             std::process::exit(1);

@@ -31,8 +31,14 @@ fn main() -> Result<()> {
 
     // --- reader: a REAL, proven reader. Harvest inline emojikeys. ---
     let anns = reader::emojikey_read(&events);
-    let authored = anns.iter().filter(|a| a.source_kind == Some(ravel::SourceKind::Authored)).count();
-    let quoted = anns.iter().filter(|a| a.source_kind == Some(ravel::SourceKind::ToolResult)).count();
+    let authored = anns
+        .iter()
+        .filter(|a| a.source_kind == Some(ravel::SourceKind::Authored))
+        .count();
+    let quoted = anns
+        .iter()
+        .filter(|a| a.source_kind == Some(ravel::SourceKind::ToolResult))
+        .count();
     println!(
         "[reader:emojikey] harvested {} emojikey(s)  ({} authored / {} quoted-in-tool-result)",
         anns.len(),
@@ -59,7 +65,10 @@ fn main() -> Result<()> {
     let dump = store.dump_to_writer(RdfSerializer::from_format(RdfFormat::NQuads), Vec::new())?;
     let store2 = Store::new()?;
     store2.load_from_reader(RdfFormat::NQuads, dump.as_slice())?;
-    println!("[round-trip] re-loaded into fresh store: {} triples", store2.len()?);
+    println!(
+        "[round-trip] re-loaded into fresh store: {} triples",
+        store2.len()?
+    );
 
     // --- read the detections back THROUGH the triple term ---
     let oa = "http://www.w3.org/ns/oa#";
@@ -96,7 +105,11 @@ fn main() -> Result<()> {
         n += 1;
         let g = |k: &str| sol.get(k).map(|t| t.to_string()).unwrap_or_default();
         let sk = g("sk");
-        let sk = if sk.is_empty() { "?".to_string() } else { unq(&sk) };
+        let sk = if sk.is_empty() {
+            "?".to_string()
+        } else {
+            unq(&sk)
+        };
         println!(
             "  ✓ emojikey {n} [{sk}]: [ME|{}]~[CONTENT|{}]~[YOU|{}]  span={}..{}  via {}",
             unq(&g("me")),
