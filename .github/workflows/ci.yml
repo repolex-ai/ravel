@@ -4,9 +4,17 @@
 #   ontology     does ravel.ttl still have exactly the known domain-free properties?
 #   kit-mirror   is ontology/ravel/ravel.ttl byte-identical to git-lex-kit-ravel?
 #
-# fmt and clippy run but do not gate. Both were red when this workflow was
-# written (2026-09-17): 87 files unformatted, 8 clippy warnings. Flipping
-# either to gating is a one-line change once the tree is clean.
+# fmt GATES as of 2026-09-17: the tree was swept clean (f213fb7) and a
+# formatting drift now fails the build.
+#
+# clippy still runs advisory. Its remaining warnings are all one issue — four
+# calls to oxigraph's deprecated Store::query — and that migration is in
+# flight. This step flips to gating the moment it lands.
+#
+# Advisory is deliberately a temporary state, never a resting one. GitHub
+# reports a tolerated failure and a real pass as the same green, so an
+# advisory step's status cannot be read as a result — only the log can. Every
+# advisory step here therefore names what makes it gate.
 #
 # deploy-path is its own job because of a hazard specific to this engine: one
 # ~/.cargo/bin serves every soul on the machine, so a bad `cargo install`
@@ -49,8 +57,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo fmt --check (advisory)
-        continue-on-error: true
+      - name: cargo fmt --check
         run: cargo fmt --check
 
       - name: cargo clippy (advisory)
