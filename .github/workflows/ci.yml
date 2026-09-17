@@ -1,0 +1,174 @@
+# CI for ravel. Four jobs, each answering one question:
+#   rust         does it build and do the 37 tests pass, on both systems?
+#   deploy-path  does `cargo install` produce working binaries?
+#   ontology     does ravel.ttl still have exactly the known domain-free properties?
+#   kit-mirror   is ontology/ravel/ravel.ttl byte-identical to git-lex-kit-ravel?
+#
+# fmt and clippy run but do not gate. Both were red when this workflow was
+# written (2026-09-17): 87 files unformatted, 8 clippy warnings. Flipping
+# either to gating is a one-line change once the tree is clean.
+#
+# deploy-path is its own job because of a hazard specific to this engine: one
+# ~/.cargo/bin serves every soul on the machine, so a bad `cargo install`
+# breaks the whole fleet's transcript backups at once, and silently. The
+# install path is therefore tested, not assumed.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to a pull request makes the older run pointless. On main every
+# push keeps its run, so no commit goes without a verdict.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check (advisory)
+        continue-on-error: true
+        run: cargo fmt --check
+
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+  deploy-path:
+    name: deploy path (cargo install)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Exactly how every machine in the fleet deploys ravel.
+      - name: cargo install --path . --locked
+        run: cargo install --path . --locked --root "$RUNNER_TEMP/install"
+
+      # No binary here takes --version, so presence plus a real invocation is
+      # the smoke test. ravel-sync on a path that is not a soul repo must fail
+      # loudly (exit 1), never succeed quietly — silence and a wrong answer
+      # must not be the same observable state.
+      - name: binaries exist and fail loudly on bad input
+        shell: bash
+        run: |
+          bin="$RUNNER_TEMP/install/bin"
+          for b in ravel-sync ravel-ingest ravel-stats ravel-emojikey ravel-spike; do
+            if [ ! -x "$bin/$b" ]; then
+              echo "::error::cargo install did not produce $b"
+              exit 1
+            fi
+            echo "  ok: $b"
+          done
+          if "$bin/ravel-sync" /nonexistent-path-for-ci >/dev/null 2>&1; then
+            echo "::error::ravel-sync exited 0 on a path that is not a soul repo"
+            exit 1
+          fi
+          echo "  ok: ravel-sync fails loudly on a bad path"
+
+  ontology:
+    name: ontology (kit checker, known-baseline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install rdflib
+
+      - name: fetch check-kit-ontology.py from git-lex-kit-base
+        run: curl -sfL https://raw.githubusercontent.com/repolex-ai/git-lex-kit-base/main/reference/check-kit-ontology.py -o /tmp/check-kit-ontology.py
+
+      # The checker calls a property with no rdfs:domain an error, because in a
+      # normal kit ontology every property lands on a Thing and needs a shape
+      # and a markdown template. Ravel's annotation and belief layers are
+      # graph-only: their properties attach to annotation targets, Claim nodes
+      # and prov:SoftwareAgent nodes, none of which are Things, and `exhibits`
+      # appears only inside unasserted RDF 1.2 triple terms. Declaring
+      # rdfs:domain git-lex:Thing on these would assert something false to
+      # quiet a checker, so the six are accepted here by name.
+      #
+      # This gate is not "ignore the ontology job" — a seventh domain-free
+      # property, or any error of another kind, fails the run. Whether the
+      # checker itself should learn about graph-only layers is a question for
+      # the ontology court, not something to settle in a workflow file.
+      - name: check ravel.ttl against the known baseline
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 /tmp/check-kit-ontology.py ontology/ravel/ravel.ttl 2>&1 | tee /tmp/onto.out || true
+          echo "──────────────────────────────────────────"
+
+          grep '^ERROR' /tmp/onto.out > /tmp/errs || true
+          grep -E '^ERROR +property [A-Za-z]+: no rdfs:domain' /tmp/errs > /tmp/domainless || true
+
+          if [ "$(wc -l < /tmp/errs)" -ne "$(wc -l < /tmp/domainless)" ]; then
+            echo "::error::an ontology error appeared that is not the known domain-free case"
+            comm -13 <(sort /tmp/domainless) <(sort /tmp/errs)
+            exit 1
+          fi
+
+          got=$(sed -E 's/^ERROR +property ([A-Za-z]+):.*/\1/' /tmp/domainless | sort -u)
+          want=$(printf '%s\n' atTurn detectionType detectorName exhibits readerName textOrigin | sort)
+
+          if [ "$got" != "$want" ]; then
+            echo "::error::the set of domain-free properties changed."
+            echo "::error::If a new graph-only property is intended, add it to 'want' in this workflow."
+            echo "::error::If a property gained a domain, remove it from 'want'."
+            diff <(echo "$want") <(echo "$got") || true
+            exit 1
+          fi
+          echo "ontology matches the known baseline: 6 graph-only properties, no other errors"
+
+  kit-mirror:
+    name: ravel.ttl mirrored to git-lex-kit-ravel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Red whenever ravel.ttl lands on main before its mirror commit in
+      # git-lex-kit-ravel. That is the point: the mirror step is a rule, and
+      # this is what says it was skipped.
+      - name: compare with git-lex-kit-ravel main
+        run: |
+          curl -sfL https://raw.githubusercontent.com/repolex-ai/git-lex-kit-ravel/main/ontology/ravel/ravel.ttl -o /tmp/kit-ravel.ttl
+          if ! cmp -s ontology/ravel/ravel.ttl /tmp/kit-ravel.ttl; then
+            echo "::error::ontology/ravel/ravel.ttl differs from git-lex-kit-ravel on main."
+            echo "::error::Copy it to git-lex-kit-ravel/ontology/ravel/ravel.ttl, commit and push there."
+            diff -u /tmp/kit-ravel.ttl ontology/ravel/ravel.ttl | head -40
+            exit 1
+          fi
+          echo "identical"
