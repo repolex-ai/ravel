@@ -1023,8 +1023,12 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         let store = graph::open_read_only(&store_dir)?;
         let count = |q: &str| -> Result<String> {
             use oxigraph::model::Term;
-            use oxigraph::sparql::QueryResults;
-            if let QueryResults::Solutions(mut sols) = store.query(q)? {
+            use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+            if let QueryResults::Solutions(mut sols) = SparqlEvaluator::new()
+                .parse_query(q)?
+                .on_store(&store)
+                .execute()?
+            {
                 if let Some(s) = sols.next() {
                     if let Some((_, t)) = s?.iter().next() {
                         // lexical form only — "11994", not "11994"^^xsd:integer

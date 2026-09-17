@@ -9,11 +9,15 @@
 //! xsd:dateTime timestamps). Ad-hoc mode is how you poke the graph by hand.
 
 use anyhow::Result;
-use oxigraph::sparql::QueryResults;
+use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 
 fn scalar(store: &Store, q: &str) -> Result<String> {
-    if let QueryResults::Solutions(mut sols) = store.query(q)? {
+    if let QueryResults::Solutions(mut sols) = SparqlEvaluator::new()
+        .parse_query(q)?
+        .on_store(store)
+        .execute()?
+    {
         if let Some(s) = sols.next() {
             let s = s?;
             let val = s.iter().next().map(|(_, t)| t.to_string());
@@ -43,7 +47,11 @@ fn main() -> Result<()> {
     // Ad-hoc mode: `ravel-stats <dir> "SELECT ..."` runs the query and dumps rows.
     if let Some(q) = std::env::args().nth(2) {
         println!("=== ad-hoc query on {dir} ===\n{q}\n");
-        match store.query(&q)? {
+        match SparqlEvaluator::new()
+            .parse_query(&q)?
+            .on_store(&store)
+            .execute()?
+        {
             QueryResults::Solutions(sols) => {
                 let mut n = 0;
                 for s in sols {
@@ -88,9 +96,13 @@ fn main() -> Result<()> {
     );
 
     println!("\n--- top predicates ---");
-    if let QueryResults::Solutions(sols) = store.query(
-        "SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?p ORDER BY DESC(?n) LIMIT 20",
-    )? {
+    if let QueryResults::Solutions(sols) = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?p ORDER BY DESC(?n) LIMIT 20",
+        )?
+        .on_store(&store)
+        .execute()?
+    {
         for s in sols {
             let s = s?;
             let p = s.get("p").map(|t| t.to_string()).unwrap_or_default();
