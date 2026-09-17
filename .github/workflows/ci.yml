@@ -4,17 +4,16 @@
 #   ontology     does ravel.ttl still have exactly the known domain-free properties?
 #   kit-mirror   is ontology/ravel/ravel.ttl byte-identical to git-lex-kit-ravel?
 #
-# fmt GATES as of 2026-09-17: the tree was swept clean (f213fb7) and a
-# formatting drift now fails the build.
+# fmt and clippy both GATE as of 2026-09-17. The tree was swept clean — the
+# formatting in f213fb7, then the four deprecated oxigraph Store::query calls
+# migrated to SparqlEvaluator. There are no advisory steps left in this file:
+# every step here fails when it is unhappy.
 #
-# clippy still runs advisory. Its remaining warnings are all one issue — four
-# calls to oxigraph's deprecated Store::query — and that migration is in
-# flight. This step flips to gating the moment it lands.
-#
-# Advisory is deliberately a temporary state, never a resting one. GitHub
-# reports a tolerated failure and a real pass as the same green, so an
-# advisory step's status cannot be read as a result — only the log can. Every
-# advisory step here therefore names what makes it gate.
+# Recorded as the reason and not just the setting: advisory is a temporary
+# state, never a resting one. GitHub reports a tolerated failure and a genuine
+# pass as the same green, so an advisory step's status is not a result — only
+# its log is. If a step is ever made advisory again, it must name in a comment
+# the condition that ends it.
 #
 # deploy-path is its own job because of a hazard specific to this engine: one
 # ~/.cargo/bin serves every soul on the machine, so a bad `cargo install`
@@ -60,8 +59,7 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo clippy (advisory)
-        continue-on-error: true
+      - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo build
