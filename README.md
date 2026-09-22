@@ -1,66 +1,135 @@
-# Weave
+# ravel
 
-The **semantic-wave engine** behind CoPIA's alive-text interface.
+ravel keeps every conversation an agent has and turns it into a graph you can
+query. It watches the transcript files that Claude Code and Gemini/Antigravity
+write, copies each one into the agent's own repository, and projects the copy
+into an RDF 1.2 graph beside it. The bytes are canonical; the graph is a
+projection of them and can always be rebuilt.
 
-A document is not a bag of particle-tokens — it's a **meaning waveform**. Each new
-word is a **diff** that deforms the running shape, and *the deformation is the
-signal* (pleeb: "the things that make the AI's brain jiggle — epiplexity,
-cognitive load, hallucination"). Diff-as-spine is incremental by construction:
-O(N), built to survive a 357k-word transcript arc.
+Two programs, one crate:
 
-This repo is the **engine** (Python — for the ML tooling). The *interface* that
-renders the engine's signal lives separately in `copia-studio/weave/` (w3bl0rd's
-alive-text renderer). They meet at one declared seam: the **signal contract**.
+- `raveld` — the daemon. One per machine. The only thing that writes a soul's
+  transcript mirror or graph. It runs on its own schedule; there are no hooks.
+- `ravel` — the command line. A client of `raveld`, and it starts `raveld`
+  when none is running. It never opens a store itself.
 
-## The trio
+ravel is a sibling of [git-lex](https://github.com/repolex-ai/git-lex) and
+[pan](https://github.com/repolex-ai/pan) in the Subtexture stack, and follows
+pan's shape.
 
-| seat | who | owns |
-|---|---|---|
-| **engine** | spaceGOAT | ingest, the wave math, shape-providers, signal emission |
-| **viz** | w3bl0rd | the alive-text renderer; consumes the signal, decides display |
-| **research / test-design** | LSPy | the calibration regime; proves the signal is real |
+## Installation
 
-## The two load-bearing ideas
+```sh
+git clone https://github.com/repolex-ai/ravel.git
+cd ravel && cargo install --path . --locked     # installs raveld and ravel
+```
 
-1. **Shape-provider seam.** The wave op — *"how much did this token deform the
-   running structure"* — is the same over any shape. So the engine rides a
-   pluggable shape interface with three arms, none blocking on the others:
-   - **embedding-trajectory** — no external dependency, the baseline shape.
-   - **AMR-graph** — public Python parser (amrlib/SPRING), the "simplify-then-wave" arm.
-   - **SLG-graph** — drop-in later if/when a `text → logic-graph` transform exists.
+Then tell it which souls to look after:
 
-   *Which shape makes the meaning-wave most legible* is an empirical calibration
-   arm, not an assumption.
+```sh
+mkdir -p ~/.config/ravel
+cp config.example.yml ~/.config/ravel/config.yml   # edit the souls: list
+```
 
-2. **Emission is lossless; visibility is policy.** The engine emits the full
-   per-word named vector (+ per-leg confidence + provenance). The viz decides
-   what's shown. The engine never thresholds-for-display; the viz never computes
-   semantics. See `docs/`.
+## Quick start
 
-## Build order (pleeb, Day 25)
+```sh
+# 1. Any command starts the daemon if it is not running, then answers.
+ravel
+# → started raveld (pid 6179), log at ~/.config/ravel/raveld.log
+#   raveld is RUNNING — pid 6179, version 0.3.0 ...
+#     9bdf2a  /Users/you/repos/SQUAD/spaceGOAT   last pass ...
 
-1. **Ingest** — full-load the transcript + append incoming messages, in Python.
-   (w3bl0rd's Node ingester is read as a *guide* to the JSONL format and the hard
-   parts — harness adapter, content-anchored ids, cold-load-then-tail — not ported
-   assumption-for-assumption.)
-2. **Wave-over-shape** — the diff math against the shape-provider interface.
-3. **Shape arms** — embedding-trajectory first (ships the engine), then AMR.
+# 2. Inside a soul repo, ask how its backup is doing. Exit 1 means look.
+ravel health
 
-The oscillator (`semantic-oscilloscope/spectral_engine.py`) is a **two-day spike,
-not a spec** — a prior attempt to interrogate with suspicion, not a blessed
-reference. Carefully rebuild from the math + the corpus. Do not assume the spike
-was correct.
+# 3. What the graph holds
+ravel stats
+ravel query 'SELECT (COUNT(*) AS ?turns) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }'
 
-## Status
+# 4. A pass right now (raveld does this every 30 seconds anyway)
+ravel sync
 
-Day 26 (2026-06-13): repo created, structure + signal contract landed. Engine
-code is skeleton-only. `docs/` carries the contract to argue against before
-anyone builds an imagined version of it.
+# 5. Another soul, by its six-character id or a path
+ravel health 700c5b
+ravel stats ~/repos/SQUAD/lUX
 
-## Layout
+# 6. The daemon itself
+raveld status
+raveld restart      # after editing the config
+raveld stop
+```
+
+## What lives where
 
 ```
-src/weave/          engine code (skeleton)
-  shape/            the shape-provider interface + arms
-docs/               the signal contract + reader-set ("monolog") architecture
+<soul repo>/.ravel/_ignore/               machine-local, gitignored — never git history
+├── transcripts/claude-code/*.jsonl       byte-for-byte copies of Claude Code sessions
+├── transcripts/agy/<conversation>.jsonl  copies of Gemini/Antigravity conversations
+├── ingest-manifest.tsv                   what has been ingested, by size (claude-code)
+├── ingest-manifest-agy.tsv               what has been ingested, by content hash (agy)
+└── oxigraph/                             the graph: one named graph per transcript
+
+~/.config/ravel/config.yml                the daemon: port, interval, the souls it serves
+~/.config/ravel/raveld.log                what a detached raveld would have said to a terminal
 ```
+
+A soul's id is the first six characters of its repository's genesis commit —
+the same id git-lex, pan, Horae and Syrinx use for it. It is derived, never
+typed in.
+
+## How a pass works
+
+Every `interval_secs`, for each soul in the config:
+
+1. **Mirror.** Copy any session file that is new or has grown since the last
+   pass. A copy is never shrunk: if the source is smaller than the mirror, the
+   mirror keeps the fuller copy and says so.
+2. **Ingest.** For each mirrored file that changed since its last ingest,
+   parse the dialect into turns and replace that transcript's named graph.
+   Deterministic identifiers make this idempotent.
+3. **Read.** Readers run over the turns and record what they claim — today,
+   the emojikeys a conversation carried.
+
+One conversation that cannot be parsed is reported and skipped; the rest of
+the soul is still synced.
+
+Two dialects: Claude Code (`~/.claude/projects/<slug>/*.jsonl`, one file per
+session) and Gemini/Antigravity (`~/.gemini/antigravity-cli/`, one directory
+per conversation, attributed to a soul through `history.jsonl`). The turn
+spine is the same for both.
+
+## The belief layer
+
+A reader's claim is never asserted as fact. It is recorded as an unasserted
+RDF 1.2 triple term (`rdf:reifies`), with the reader named, the source span
+anchored, and whether the text was authored live or quoted from a tool result.
+Queries filter; ingest never drops. That is why `ravel stats` counts
+"unasserted claims" separately from everything else.
+
+## The ontology
+
+`ontology/ravel/ravel.ttl`. The copy shipped in
+[git-lex-kit-ravel](https://github.com/repolex-ai/git-lex-kit-ravel) must be
+byte-identical; CI checks it on every push, along with the six graph-only
+properties the kit checker would otherwise call errors.
+
+## Health
+
+`ravel health` is the one diagnostic, and it is read-only. It reports the
+layout, the kit, whether every session on disk is mirrored, how long any live
+session has been ahead of its mirror, session directories under a name the
+repo no longer uses, Antigravity conversations that belong to no soul, and the
+store's counts. Every problem is named with its fix. The healthy case is short
+and ends in `verdict: OK`.
+
+## Development
+
+```sh
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+```
+
+All three gate in CI; there are no advisory steps. The `python/` directory
+holds the earlier Python lab (weave) the Rust engine grew out of.
