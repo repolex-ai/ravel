@@ -1,6 +1,6 @@
 # CI for ravel. Four jobs, each answering one question:
-#   rust         does it build and do the 37 tests pass, on both systems?
-#   deploy-path  does `cargo install` produce working binaries?
+#   rust         does it build and do the tests pass, on both systems?
+#   deploy-path  does `cargo install` produce ravel and raveld, and do they answer?
 #   ontology     does ravel.ttl still have exactly the known domain-free properties?
 #   kit-mirror   is ontology/ravel/ravel.ttl byte-identical to git-lex-kit-ravel?
 #
@@ -84,26 +84,32 @@ jobs:
       - name: cargo install --path . --locked
         run: cargo install --path . --locked --root "$RUNNER_TEMP/install"
 
-      # No binary here takes --version, so presence plus a real invocation is
-      # the smoke test. ravel-sync on a path that is not a soul repo must fail
-      # loudly (exit 1), never succeed quietly — silence and a wrong answer
-      # must not be the same observable state.
-      - name: binaries exist and fail loudly on bad input
+      # Two programs, one crate (2026-09-22). Each answers --version with the
+      # crate version; raveld with a bad subcommand must fail loudly (exit 2),
+      # never succeed quietly — silence and a wrong answer must not be the
+      # same observable state.
+      - name: binaries exist, answer --version, and fail loudly on bad input
         shell: bash
         run: |
           bin="$RUNNER_TEMP/install/bin"
-          for b in ravel-sync ravel-ingest ravel-stats ravel-emojikey ravel-spike; do
+          want="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          for b in ravel raveld; do
             if [ ! -x "$bin/$b" ]; then
               echo "::error::cargo install did not produce $b"
               exit 1
             fi
-            echo "  ok: $b"
+            got="$("$bin/$b" --version)"
+            if [ "$got" != "$b $want" ]; then
+              echo "::error::$b --version printed '$got', expected '$b $want'"
+              exit 1
+            fi
+            echo "  ok: $got"
           done
-          if "$bin/ravel-sync" /nonexistent-path-for-ci >/dev/null 2>&1; then
-            echo "::error::ravel-sync exited 0 on a path that is not a soul repo"
+          if "$bin/raveld" definitely-not-a-subcommand >/dev/null 2>&1; then
+            echo "::error::raveld exited 0 on an unknown subcommand"
             exit 1
           fi
-          echo "  ok: ravel-sync fails loudly on a bad path"
+          echo "  ok: raveld fails loudly on bad input"
 
   ontology:
     name: ontology (kit checker, known-baseline)

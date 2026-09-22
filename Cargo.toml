@@ -1,6 +1,6 @@
 [package]
 name = "ravel"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Transcript-graph engine: a transcript becomes a graph of meaning. git-lex / Pool sibling."
 license = "Apache-2.0"
@@ -10,24 +10,18 @@ repository = "https://github.com/repolex-ai/ravel"
 name = "ravel"
 path = "src/lib.rs"
 
+# raveld — the daemon. One per machine; the only process that writes a soul's
+# transcript store. Mirrors and ingests every registered soul on its own
+# schedule. There are no hooks (goodlux, 2026-09-22).
 [[bin]]
-name = "ravel-spike"
-path = "src/bin/spike.rs"
+name = "raveld"
+path = "src/bin/raveld.rs"
 
-# Promote a proven reader through the engine: emojikey → real triple-term
-# annotations (replaces the spike's fake STRLEN>2000 detector with a real reader).
+# ravel — the command line. A thin client of raveld; starts it when it is not
+# running. Never opens a store itself.
 [[bin]]
-name = "ravel-emojikey"
-path = "src/bin/emojikey.rs"
-
-# Ingest many sessions into ONE persistent on-disk graph + query across them.
-[[bin]]
-name = "ravel-ingest"
-path = "src/bin/ingest.rs"
-
-[[bin]]
-name = "ravel-stats"
-path = "src/bin/stats.rs"
+name = "ravel"
+path = "src/bin/ravel.rs"
 
 [dependencies]
 # Same store as Pool — rdf-12 for triple terms (squad standard, not RDF-star).
@@ -38,7 +32,8 @@ chrono = "0.4"
 anyhow = "1"
 # Deterministic annotation IRIs (idempotent reimport — the w4r3z discipline).
 sha2 = "0.10"
-
-[[bin]]
-name = "ravel-sync"
-path = "src/bin/sync.rs"
+# The daemon's HTTP surface and its clock; the same crates pan uses.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde_yaml = "0.9"

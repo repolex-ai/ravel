@@ -1,0 +1,21 @@
+# raveld — the ravel daemon. One per machine; this file is its whole
+# configuration. Copy to ~/.config/ravel/config.yml and edit.
+#
+# Every entry under souls: is a soul repo. raveld keeps that soul's transcript
+# mirror and graph at <repo>/.ravel/_ignore/ and identifies the soul by the
+# first six characters of its genesis commit — the same id pan, git-lex,
+# Horae and Syrinx use. Nothing here is typed in but the paths.
+#
+# No file at all means no souls: raveld starts, and `ravel` says so by name.
+
+# Ruled 2026-09-22 (goodlux): 7881 for now.
+port: 7881
+
+# How often raveld looks for new or grown transcripts. A pass over an
+# unchanged soul costs about a second, so this can be short.
+interval_secs: 30
+
+souls:
+  - ~/repos/7R1PL3F0RC3/spaceGOAT
+  - ~/repos/7R1PL3F0RC3/W4R3Z
+  - ~/repos/7R1PL3F0RC3/lUX

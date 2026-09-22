@@ -14,6 +14,8 @@
 pub mod adapter;
 pub mod agy;
 pub mod annotate;
+pub mod client;
+pub mod daemon;
 pub mod graph;
 pub mod project;
 pub mod reader;

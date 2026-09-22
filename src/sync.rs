@@ -1,5 +1,5 @@
 //! Soul-sync — the ONE blessed entrypoint that brings a soul's ravel up to
-//! date, called by the `SessionEnd-ravel-sync` hook (and usable by hand).
+//! date. raveld runs it on its schedule; `ravel sync` runs it now.
 //!
 //! Two stages, both idempotent:
 //!
@@ -76,11 +76,7 @@ pub fn migrate_legacy_layout(repo: &Path) -> Result<usize> {
         }
         std::fs::rename(&old, &new)
             .with_context(|| format!("move {} → {}", old.display(), new.display()))?;
-        eprintln!(
-            "[ravel-sync] migrated {} → {}",
-            old.display(),
-            new.display()
-        );
+        eprintln!("[raveld] migrated {} → {}", old.display(), new.display());
         moved += 1;
     }
     Ok(moved)
@@ -195,6 +191,10 @@ pub struct AgyStats {
     /// Total `step_index` holes recorded across this soul's conversations.
     /// Expected to be roughly one per conversation; a spike means something else.
     pub gaps: usize,
+    /// Conversations this pass could not mirror or ingest, as `id: reason`.
+    /// One bad conversation is reported and skipped; the rest of the soul is
+    /// still synced. Refusing is right; refusing everything is not.
+    pub failed: Vec<String>,
 }
 
 /// Where Claude Code keeps this soul repo's session logs:
@@ -234,7 +234,7 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
             Ok(dst_len) if dst_len == src_len => unchanged += 1,
             Ok(dst_len) if dst_len > src_len => {
                 eprintln!(
-                    "[ravel-sync] REFUSING to shrink mirror of {} ({dst_len} → {src_len} bytes): source looks like a stale snapshot; mirror keeps the fuller copy",
+                    "[raveld] REFUSING to shrink mirror of {} ({dst_len} → {src_len} bytes): source looks like a stale snapshot; mirror keeps the fuller copy",
                     name.to_string_lossy()
                 );
                 unchanged += 1;
@@ -492,10 +492,10 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     st.unattributed = unattributed;
     if !st.unattributed.is_empty() {
         eprintln!(
-            "[ravel-sync] {} agy conversation(s) on disk are attributed to NO workspace and are therefore NOT backed up: {}\n\
-             [ravel-sync]   history.jsonl does not name them (it predates them, or they logged no prompt through it).\n\
-             [ravel-sync]   check the owner by hand: sqlite3 \"file:$HOME/.gemini/antigravity-cli/conversation_summaries.db?mode=ro\" \\\n\
-             [ravel-sync]     \"SELECT conversation_id, workspace_uris FROM conversation_summaries;\"",
+            "[raveld] {} agy conversation(s) on disk are attributed to NO workspace and are therefore NOT backed up: {}\n\
+             [raveld]   history.jsonl does not name them (it predates them, or they logged no prompt through it).\n\
+             [raveld]   check the owner by hand: sqlite3 \"file:$HOME/.gemini/antigravity-cli/conversation_summaries.db?mode=ro\" \\\n\
+             [raveld]     \"SELECT conversation_id, workspace_uris FROM conversation_summaries;\"",
             st.unattributed.len(),
             st.unattributed.join(", ")
         );
@@ -512,71 +512,90 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     let mut manifest = read_agy_manifest(repo);
 
     for c in &convs {
-        // MIRROR — by content hash. The source is rewritten in place while a
-        // session is live, so equal size proves nothing.
-        let to = mirror.join(format!("{}.jsonl", c.id));
-        let src_hash = file_sha256(&c.source)?;
-        let dst_hash = to.is_file().then(|| file_sha256(&to)).transpose()?;
-        if dst_hash.as_deref() == Some(src_hash.as_str()) {
-            st.unchanged += 1;
-        } else {
-            std::fs::copy(&c.source, &to)
-                .with_context(|| format!("copy {} → {}", c.source.display(), to.display()))?;
-            st.mirrored += 1;
-        }
-
-        // INGEST — skip when this exact content is already projected.
-        if manifest.get(&c.id) == Some(&src_hash) {
-            st.skipped += 1;
-            continue;
-        }
-        let jsonl = std::fs::read_to_string(&to)
-            .with_context(|| format!("read agy mirror {}", to.display()))?;
-        let parsed = agy::parse_transcript(&jsonl, &c.id)?;
-        st.gaps += parsed.gaps.len();
-        if !parsed.gaps.is_empty() {
+        if let Err(e) = sync_agy_one(c, &mirror, &store, &mut manifest, &mut st) {
             eprintln!(
-                "[ravel-sync] agy {}: step_index gap(s) at {:?} — the spine is left DISCONNECTED there rather than bridged (expected: the client burns an index on an interrupted step)",
-                &c.id[..8.min(c.id.len())],
-                parsed.gaps
+                "[raveld] agy {}: SKIPPED this pass — {e:#}",
+                &c.id[..8.min(c.id.len())]
             );
+            st.failed.push(format!("{}: {e:#}", c.id));
         }
-        if c.short_only && parsed.truncated_rows > 0 {
-            st.lossy.push(c.id.clone());
-            eprintln!(
-                "[ravel-sync] agy {}: LOSSY SOURCE — {} row(s) declare truncated_fields and there is no transcript_full.jsonl beside them; ingesting the short copy, which is NOT the whole conversation",
-                &c.id[..8.min(c.id.len())],
-                parsed.truncated_rows
-            );
-        }
-        if parsed.malformed_lines > 0 {
-            eprintln!(
-                "[ravel-sync] agy {}: {} unparseable line(s) skipped",
-                &c.id[..8.min(c.id.len())],
-                parsed.malformed_lines
-            );
-        }
-        if parsed.events.is_empty() {
-            manifest.insert(c.id.clone(), src_hash);
-            continue;
-        }
-        let anns = reader::emojikey_read(&parsed.events);
-        // Dialect-prefixed graph name: the named graph is the provenance unit,
-        // and which substrate a conversation came from is provenance.
-        let transcript_id = format!("agy-{}", c.id);
-        graph::ingest_transcript(
-            &store,
-            &parsed.events,
-            &anns,
-            &transcript_id,
-            soul::TURN_PARTITION,
-        )?;
-        manifest.insert(c.id.clone(), src_hash);
-        st.sessions += 1;
-        st.turns += parsed.events.len();
     }
     write_agy_manifest(repo, &manifest)?;
     Ok(st)
+}
+
+/// Mirror and ingest ONE conversation. An error here is that conversation's
+/// alone: the caller records it and moves on to the next.
+fn sync_agy_one(
+    c: &AgyConversation,
+    mirror: &Path,
+    store: &oxigraph::store::Store,
+    manifest: &mut std::collections::HashMap<String, String>,
+    st: &mut AgyStats,
+) -> Result<()> {
+    // MIRROR — by content hash. The source is rewritten in place while a
+    // session is live, so equal size proves nothing.
+    let to = mirror.join(format!("{}.jsonl", c.id));
+    let src_hash = file_sha256(&c.source)?;
+    let dst_hash = to.is_file().then(|| file_sha256(&to)).transpose()?;
+    if dst_hash.as_deref() == Some(src_hash.as_str()) {
+        st.unchanged += 1;
+    } else {
+        std::fs::copy(&c.source, &to)
+            .with_context(|| format!("copy {} → {}", c.source.display(), to.display()))?;
+        st.mirrored += 1;
+    }
+
+    // INGEST — skip when this exact content is already projected.
+    if manifest.get(&c.id) == Some(&src_hash) {
+        st.skipped += 1;
+        return Ok(());
+    }
+    let jsonl = std::fs::read_to_string(&to)
+        .with_context(|| format!("read agy mirror {}", to.display()))?;
+    let parsed = agy::parse_transcript(&jsonl, &c.id)?;
+    st.gaps += parsed.gaps.len();
+    if !parsed.gaps.is_empty() {
+        eprintln!(
+            "[raveld] agy {}: step_index gap(s) at {:?} — the spine is left DISCONNECTED there rather than bridged (expected: the client burns an index on an interrupted step)",
+            &c.id[..8.min(c.id.len())],
+            parsed.gaps
+        );
+    }
+    if c.short_only && parsed.truncated_rows > 0 {
+        st.lossy.push(c.id.clone());
+        eprintln!(
+            "[raveld] agy {}: LOSSY SOURCE — {} row(s) declare truncated_fields and there is no transcript_full.jsonl beside them; ingesting the short copy, which is NOT the whole conversation",
+            &c.id[..8.min(c.id.len())],
+            parsed.truncated_rows
+        );
+    }
+    if parsed.malformed_lines > 0 {
+        eprintln!(
+            "[raveld] agy {}: {} unparseable line(s) skipped",
+            &c.id[..8.min(c.id.len())],
+            parsed.malformed_lines
+        );
+    }
+    if parsed.events.is_empty() {
+        manifest.insert(c.id.clone(), src_hash);
+        return Ok(());
+    }
+    let anns = reader::emojikey_read(&parsed.events);
+    // Dialect-prefixed graph name: the named graph is the provenance unit,
+    // and which substrate a conversation came from is provenance.
+    let transcript_id = format!("agy-{}", c.id);
+    graph::ingest_transcript(
+        store,
+        &parsed.events,
+        &anns,
+        &transcript_id,
+        soul::TURN_PARTITION,
+    )?;
+    manifest.insert(c.id.clone(), src_hash);
+    st.sessions += 1;
+    st.turns += parsed.events.len();
+    Ok(())
 }
 
 /// Bring one soul's ravel fully up to date: mirror then ingest-the-mirror.
@@ -784,8 +803,8 @@ pub struct DiagFinding {
     pub line: String,
 }
 
-/// `ravel-sync --diagnostic` — the ONE diagnostic switch (Rob's rule: every
-/// tool gets exactly one, spelled `--diagnostic`). STRICTLY READ-ONLY: it
+/// `ravel health` — the ONE diagnostic (squad rule: every tool gets exactly
+/// one, and it is read-only). STRICTLY READ-ONLY: it
 /// reports a legacy layout, it never migrates one; it opens the store
 /// read-only; it creates nothing. Healthy output is short and ends in a
 /// one-line verdict; every problem is named with its fix.
@@ -805,32 +824,48 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         push(
             true,
             format!(
-                "layout: PRE-POCKET paths present ({}) — run `ravel-sync {}` to migrate",
+                "layout: PRE-POCKET paths present ({}) — run `ravel sync {}` to migrate",
                 legacy.join(", "),
                 repo.display()
             ),
         );
     }
 
-    // Kit + hook — is the backup wired to fire at all?
+    // Kit, and the hook it used to ship. raveld is the writer (2026-09-22):
+    // the SessionEnd hook is a SECOND writer while a `ravel-sync` binary is
+    // still installed beside it, and inert once that binary is gone.
     let kit_reg = std::fs::read_to_string(repo.join(".lex/repo.yml"))
         .map(|s| s.contains("git-lex-kit-ravel"))
         .unwrap_or(false);
+    if kit_reg {
+        push(false, "kit: git-lex-kit-ravel registered — OK".into());
+    } else {
+        push(
+            true,
+            "kit: git-lex-kit-ravel NOT in .lex/repo.yml — the pocket layout and its gitignore come from the kit \
+             (`git lex kit-add repolex-ai/git-lex-kit-ravel`, then kit-update)"
+                .into(),
+        );
+    }
     let hook = repo
         .join(".claude/hooks/SessionEnd-ravel-ravelsync.sh")
         .is_file();
-    match (kit_reg, hook) {
-        (true, true) => push(false, "kit: registered; hook: installed — OK".into()),
-        (_, false) => push(
+    let stale_bin = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".cargo/bin/ravel-sync").is_file())
+        .unwrap_or(false);
+    match (hook, stale_bin) {
+        (true, true) => push(
             true,
-            "hook: SessionEnd-ravel-ravelsync.sh MISSING — backups will not run on session end \
-             (install: `git lex kit-add repolex-ai/git-lex-kit-ravel`, then kit-update)"
+            "hook: legacy SessionEnd-ravel-ravelsync.sh present AND ~/.cargo/bin/ravel-sync still installed — \
+             two writers to one store; delete ~/.cargo/bin/ravel-sync (raveld syncs on its own)"
                 .into(),
         ),
-        (false, true) => push(
+        (true, false) => push(
             false,
-            "kit: not in .lex/repo.yml optional_kits (hook present — manual install?)".into(),
+            "hook: legacy SessionEnd-ravel-ravelsync.sh present, inert (no ravel-sync binary); the kit will stop shipping it"
+                .into(),
         ),
+        (false, _) => {}
     }
 
     // Mirror vs source.
@@ -883,7 +918,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             "mirror: {src_n} source session(s) → {current} current, {growing} growing (live, catches up at session end), {stale} stale, {missing} missing"
         );
         if stale > 0 || missing > 0 {
-            push(true, format!("{summary} — stale/missing with no live session means the hook did not fire; run `ravel-sync {}` and check the hook", repo.display()));
+            push(true, format!("{summary} — stale/missing with no live session means raveld has not passed over this soul; is it running? (`ravel`) — or run `ravel sync {}` now", repo.display()));
         } else {
             push(false, summary);
         }
@@ -897,7 +932,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             push(
                 true,
                 format!(
-                    "mirror age: {} live session(s) have been ahead of the mirror for over {} day(s) (worst: {worst}) — {:.1} MB currently exists in ONE place only. A session open this long has not fired SessionEnd since it opened; close it, or run `ravel-sync {}` now. Sessions: {}",
+                    "mirror age: {} live session(s) have been ahead of the mirror for over {} day(s) (worst: {worst}) — {:.1} MB currently exists in ONE place only. raveld re-mirrors a live session within a minute of it growing, so a lag this long means raveld was not running; start it (`ravel`) or run `ravel sync {}` now. Sessions: {}",
                     long_lag.len(),
                     GROWING_DIVERGENCE_LIMIT_SECS / 86_400,
                     unmirrored as f64 / 1_048_576.0,
@@ -941,7 +976,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 };
                 if sib.unmirrored > 0 {
                     push(true, format!(
-                        "other slugs: {} — {how}, {} of {} session(s) are NOT in this mirror ({:.1} MB unbacked-up). Bring them home: `ravel-sync {} {}`",
+                        "other slugs: {} — {how}, {} of {} session(s) are NOT in this mirror ({:.1} MB unbacked-up). Bring them home: `ravel sync {} {}`",
                         sib.slug, sib.unmirrored, sib.sessions,
                         sib.unmirrored_bytes as f64 / 1_048_576.0,
                         repo.display(),
@@ -981,7 +1016,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 if home < convs.len() {
                     push(
                         true,
-                        format!("{line} — run `ravel-sync {}`", repo.display()),
+                        format!("{line} — run `ravel sync {}`", repo.display()),
                     );
                 } else {
                     push(false, line);
@@ -1014,7 +1049,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         push(
             true,
             format!(
-                "store: {} is not an oxigraph store (no CURRENT) — mirror exists but nothing is ingested; run `ravel-sync {}`",
+                "store: {} is not an oxigraph store (no CURRENT) — mirror exists but nothing is ingested; run `ravel sync {}`",
                 store_dir.display(),
                 repo.display()
             ),
