@@ -165,6 +165,9 @@ pub struct SyncStats {
     /// Mirror files skipped at ingest because the manifest shows them
     /// unchanged since their last successful ingest.
     pub skipped: usize,
+    /// Transcripts this pass could not parse, as `path: reason`. One bad file
+    /// is reported and skipped; the rest of the soul still syncs.
+    pub failed: Vec<String>,
     /// The Gemini/Antigravity half, counted separately so a green claude-side
     /// number can never stand in for an agy-side one.
     pub agy: AgyStats,
@@ -204,7 +207,9 @@ pub fn claude_sessions_dir_for(repo: &Path) -> Result<PathBuf> {
     let abs = repo
         .canonicalize()
         .with_context(|| format!("canonicalize soul repo {}", repo.display()))?;
-    let slug = abs.to_string_lossy().replace('/', "-");
+    // Claude Code turns `/` AND `.` into `-`: spaceG.O.A.T. filed under
+    // spaceG-O-A-T-, TR1P.L3X under TR1P-L3X (verified 2026-09-22).
+    let slug = abs.to_string_lossy().replace(['/', '.'], "-");
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home)
         .join(".claude")
@@ -217,25 +222,50 @@ pub fn claude_sessions_dir_for(repo: &Path) -> Result<PathBuf> {
 /// (e.g. a frozen Raw/ archive of a session the mirror holds in fuller form)
 /// — never let it regress the mirror; warn and keep the fuller copy.
 /// Returns (copied, unchanged).
+/// Every `.jsonl` under `root`, recursively, sorted. Claude Code nests
+/// subagent and workflow transcripts under a session's directory
+/// (`<session>/subagents/*.jsonl`, `<session>/wf_*/*.jsonl`); a flat listing
+/// misses them. Measured 2026-09-22: W4R3Z had 21 top-level sessions and 411
+/// nested transcripts (114 MB) that no backup had ever touched.
+pub fn walk_jsonl(root: &Path) -> Vec<PathBuf> {
+    fn go(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                go(&p, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(root, &mut out);
+    out.sort();
+    out
+}
+
 fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
     std::fs::create_dir_all(dst).with_context(|| format!("create mirror dir {}", dst.display()))?;
     let (mut copied, mut unchanged) = (0usize, 0usize);
-    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
-        let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(name) = path.file_name() else {
+    for path in walk_jsonl(src) {
+        let Ok(rel) = path.strip_prefix(src) else {
             continue;
         };
-        let to = dst.join(name);
+        let to = dst.join(rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create mirror dir {}", parent.display()))?;
+        }
         let src_len = std::fs::metadata(&path)?.len();
         match std::fs::metadata(&to).map(|m| m.len()) {
             Ok(dst_len) if dst_len == src_len => unchanged += 1,
             Ok(dst_len) if dst_len > src_len => {
                 eprintln!(
                     "[raveld] REFUSING to shrink mirror of {} ({dst_len} → {src_len} bytes): source looks like a stale snapshot; mirror keeps the fuller copy",
-                    name.to_string_lossy()
+                    rel.display()
                 );
                 unchanged += 1;
             }
@@ -624,45 +654,46 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     if mirror.is_dir() {
         let store = graph::open(repo.join(STORE_SUBDIR))?;
         let mut manifest = read_manifest(repo);
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&mirror)
-            .with_context(|| format!("read mirror {}", mirror.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-            .collect();
-        paths.sort();
-        for path in &paths {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        for path in walk_jsonl(&mirror) {
+            // Keyed by the path relative to the mirror, so a nested subagent
+            // transcript never collides with a session's file of the same
+            // name. A top-level file's key is its bare filename, as before.
+            let Ok(rel) = path.strip_prefix(&mirror) else {
+                continue;
+            };
+            let name = rel.to_string_lossy().into_owned();
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             // Unchanged since its last successful ingest → the graph already
             // holds this projection; skip the parse. Makes a large backfilled
-            // mirror cost nothing at session end.
+            // mirror cost nothing per pass.
             if manifest.get(&name) == Some(&len) {
                 stats.skipped += 1;
                 continue;
             }
-            let jsonl = match std::fs::read_to_string(path) {
+            let jsonl = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("skip {}: {e}", path.display());
+                    eprintln!("[raveld] skip {}: {e}", path.display());
+                    stats.failed.push(format!("{name}: {e}"));
                     continue;
                 }
             };
-            let events = adapter::parse_transcript(&jsonl)?;
+            let events = match adapter::parse_transcript(&jsonl) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    eprintln!("[raveld] {name}: SKIPPED this pass — {e:#}");
+                    stats.failed.push(format!("{name}: {e:#}"));
+                    continue;
+                }
+            };
             if events.is_empty() {
                 manifest.insert(name, len);
                 continue;
             }
             let anns = reader::emojikey_read(&events);
-            let transcript_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("transcript");
+            let transcript_id = name.trim_end_matches(".jsonl");
             graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
-            manifest.insert(name, len);
+            manifest.insert(name.clone(), len);
             stats.sessions += 1;
             stats.turns += events.len();
             stats.keys += anns.len();
@@ -886,15 +917,11 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
         (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut long_lag: Vec<(String, u64, u64)> = Vec::new(); // (name, days behind, unmirrored bytes)
     if src.is_dir() {
-        for entry in std::fs::read_dir(&src)? {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
+        for path in walk_jsonl(&src) {
             src_n += 1;
             let meta = std::fs::metadata(&path)?;
             let age = secs_since(meta.modified()?, now);
-            let mirror_path = path.file_name().map(|n| mirror.join(n));
+            let mirror_path = path.strip_prefix(&src).ok().map(|r| mirror.join(r));
             let mirror_meta = mirror_path.as_ref().and_then(|p| std::fs::metadata(p).ok());
             let mirror_len = mirror_meta.as_ref().map(|m| m.len());
             // How long the mirror has been out of date: the mirror's own age
@@ -958,13 +985,26 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             format!("mirror: source dir {} absent; mirror exists (archived soul?) — verify the slug if this soul is active", src.display()),
         );
     } else {
-        push(
-            true,
-            format!(
-                "mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here",
-                src.display()
-            ),
-        );
+        // A Gemini-only soul (kira) has no Claude Code directory and never
+        // will; its backup is the agy shelf. Do not shout about the dialect
+        // it does not speak.
+        let agy_n = walk_jsonl(&repo.join(AGY_TRANSCRIPTS_SUBDIR)).len();
+        if agy_n > 0 {
+            push(
+                false,
+                format!(
+                    "mirror: no Claude Code sessions for this repo — Antigravity-only soul ({agy_n} conversation(s) mirrored under agy)"
+                ),
+            );
+        } else {
+            push(
+                true,
+                format!(
+                    "mirror: NO source dir ({}) and NO mirror — nothing has ever been backed up here",
+                    src.display()
+                ),
+            );
+        }
     }
 
     // Other session directories that hold this repo's history under a name it
@@ -1462,5 +1502,33 @@ mod tests {
         assert!(name.contains("ravel-sync-test-slug"));
         assert!(!name.contains('/'));
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Subagent and workflow transcripts nest under a session's directory;
+    /// the mirror keeps the same shape, and a second pass copies nothing.
+    #[test]
+    fn mirror_walks_nested_subagent_transcripts() {
+        let base = std::env::temp_dir().join("ravel-sync-test-nested");
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        fs::create_dir_all(src.join("s1/subagents")).unwrap();
+        fs::write(src.join("s1.jsonl"), "a\n").unwrap();
+        fs::write(src.join("s1/subagents/agent-x.jsonl"), "b\n").unwrap();
+        assert_eq!(mirror_jsonl(&src, &dst).unwrap(), (2, 0));
+        assert!(dst.join("s1/subagents/agent-x.jsonl").is_file());
+        assert_eq!(mirror_jsonl(&src, &dst).unwrap(), (0, 2));
+        assert_eq!(walk_jsonl(&dst).len(), 2);
+    }
+
+    /// Claude Code files `TR1P.L3X` under `TR1P-L3X`: dots become dashes.
+    #[test]
+    fn slug_turns_dots_into_dashes_like_claude_code() {
+        let repo = std::env::temp_dir().join("ravel-sync-test-TR1P.L3X");
+        fs::create_dir_all(&repo).unwrap();
+        let dir = claude_sessions_dir_for(&repo).unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with("ravel-sync-test-TR1P-L3X"), "{name}");
+        assert!(!name.contains('.'), "{name}");
     }
 }

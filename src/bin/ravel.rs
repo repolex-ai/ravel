@@ -202,7 +202,7 @@ fn sync(client: &Client, id: &str, sessions_dir: Option<&str>) -> Result<()> {
             s["agy_mirrored"], s["agy_unchanged"], s["agy_sessions"], s["agy_skipped"], s["agy_turns"], s["agy_gaps"]
         );
     }
-    for k in ["agy_lossy", "agy_unattributed", "agy_failed"] {
+    for k in ["failed", "agy_lossy", "agy_unattributed", "agy_failed"] {
         if let Some(list) = s[k].as_array() {
             if !list.is_empty() {
                 println!(
