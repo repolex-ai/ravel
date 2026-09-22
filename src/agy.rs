@@ -69,6 +69,9 @@ pub struct AgyParse {
     pub truncated_rows: usize,
     /// Lines that were not valid JSON. Tolerated per line, counted, reported.
     pub malformed_lines: usize,
+    /// Rows dropped because the client appended the same line twice
+    /// (byte-identical, same step_index). One turn written twice is one turn.
+    pub duplicate_rows: usize,
 }
 
 /// `RUNNING` is a possible TERMINAL state, not merely a transient one.
@@ -120,13 +123,26 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
     }
     rows.sort_by_key(|(i, _)| *i);
 
+    // The client sometimes appends the SAME line twice (seen 2026-09-22 on a
+    // live kira session: three step_index values each with two byte-identical
+    // RUNNING rows). One turn written twice is one turn: keep the first, count
+    // the rest. Two DIFFERENT rows under one index are two turns claiming one
+    // key, and that is still refused rather than merged.
+    rows.dedup_by(|b, a| {
+        let same = a.0 == b.0 && a.1 == b.1;
+        if same {
+            out.duplicate_rows += 1;
+        }
+        same
+    });
+
     // Gaps in the observed run. Duplicated indices would break the idempotency
     // key outright, so they are an error rather than a note.
     if let (Some((first, _)), Some((last, _))) = (rows.first(), rows.last()) {
         let present: std::collections::HashSet<u64> = rows.iter().map(|(i, _)| *i).collect();
         if present.len() != rows.len() {
             anyhow::bail!(
-                "conversation {conversation_id}: duplicate step_index — the idempotency key is not unique in this file; refusing to ingest rather than silently merging two turns"
+                "conversation {conversation_id}: duplicate step_index with DIFFERING rows — the idempotency key is not unique in this file; refusing to ingest rather than silently merging two turns"
             );
         }
         out.gaps = (*first..=*last).filter(|i| !present.contains(i)).collect();
@@ -394,6 +410,19 @@ mod tests {
         .join("\n");
         let err = parse_transcript(&dup, CONV).unwrap_err().to_string();
         assert!(err.contains("duplicate step_index"), "got: {err}");
+    }
+
+    /// The client's actual failure mode (kira, 2026-09-22): the SAME line
+    /// appended twice. That is one turn, kept once and counted.
+    #[test]
+    fn identical_duplicate_rows_are_one_turn() {
+        let row = r#"{"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"RUNNING","created_at":"2026-08-25T15:54:21Z","content":"a"}"#;
+        let next = r#"{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-25T15:54:22Z","content":"b"}"#;
+        let dup = [row, row, next].join("\n");
+        let p = parse_transcript(&dup, CONV).unwrap();
+        assert_eq!(p.duplicate_rows, 1);
+        assert_eq!(p.events.len(), 2, "two turns, not three");
+        assert!(p.gaps.is_empty());
     }
 
     #[test]

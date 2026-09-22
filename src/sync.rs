@@ -555,6 +555,13 @@ fn sync_agy_one(
         .with_context(|| format!("read agy mirror {}", to.display()))?;
     let parsed = agy::parse_transcript(&jsonl, &c.id)?;
     st.gaps += parsed.gaps.len();
+    if parsed.duplicate_rows > 0 {
+        eprintln!(
+            "[raveld] agy {}: {} byte-identical duplicate row(s) dropped — the client wrote the same step twice",
+            &c.id[..8.min(c.id.len())],
+            parsed.duplicate_rows
+        );
+    }
     if !parsed.gaps.is_empty() {
         eprintln!(
             "[raveld] agy {}: step_index gap(s) at {:?} — the spine is left DISCONNECTED there rather than bridged (expected: the client burns an index on an interrupted step)",
