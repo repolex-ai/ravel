@@ -650,6 +650,17 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         stats.mirrored = copied;
         stats.unchanged = unchanged;
     }
+    // A default pass also reads every PROVEN previous directory of this repo.
+    // A session open while the repo moved keeps writing under its old path;
+    // reading only the current one silently stops backing it up. Suspected
+    // directories are never read here — a name resemblance is not evidence.
+    if sessions_src.is_none() {
+        for sib in sibling_slugs_for(repo)?.into_iter().filter(|s| s.proven) {
+            let (copied, unchanged) = mirror_jsonl(&sib.dir, &mirror)?;
+            stats.mirrored += copied;
+            stats.unchanged += unchanged;
+        }
+    }
 
     if mirror.is_dir() {
         let store = graph::open(repo.join(STORE_SUBDIR))?;
@@ -729,10 +740,25 @@ fn slug_core(slug: &str) -> String {
 #[derive(Debug)]
 pub struct SiblingSlug {
     pub slug: String,
+    /// The directory itself, so a pass can mirror from it.
+    pub dir: PathBuf,
+    /// Top-level session files in that directory.
     pub sessions: usize,
-    /// Sessions in that directory with no counterpart in this repo's mirror.
+    /// Every transcript in it, nested subagent and workflow files included.
+    pub transcripts: usize,
+    /// Transcripts whose bytes are not all in this repo's mirror: missing, or
+    /// present but smaller than the source.
     pub unmirrored: usize,
+    /// Bytes the mirror is behind by, summed over `unmirrored`.
     pub unmirrored_bytes: u64,
+    /// Transcripts behind the mirror but written within [`SIBLING_LIVE_WINDOW`]
+    /// in a PROVEN directory: a live session the next pass will copy. Not a
+    /// finding; counted apart so it never hides in `unmirrored` or vanishes.
+    pub growing: usize,
+    /// Transcripts that also exist, at the same relative path, in this repo's
+    /// CURRENT directory. Two live copies of one session; the mirror can keep
+    /// only one, so this must be said out loud.
+    pub in_both: Vec<String>,
     /// True when at least one of its session files is ALREADY in this mirror —
     /// proof the directory served this repo, not a guess from its name.
     pub proven: bool,
@@ -749,17 +775,36 @@ pub struct SiblingSlug {
 /// April–May conversations, which a full backfill of the current slug swept
 /// past without a word.
 ///
+/// **The second blind spot (2026-09-24).** Counting by NAME is not counting
+/// bytes. Moving the repos behind a symlink (`~/repos` → `/Volumes/f00/repos`)
+/// left sessions that were open during the move writing to the old directory.
+/// Their names were already in the mirror, so health said "already mirrored"
+/// while seven souls' mirrors fell behind by megabytes and W4R3Z's new
+/// subagent transcripts were never copied at all. Now every transcript,
+/// nested ones included, is compared by size against the mirror.
+///
 /// Two classes, kept apart on purpose:
 ///   - **proven** — the directory holds at least one session file this repo's
 ///     mirror already has. Session ids are unique, so that is evidence, not
-///     resemblance.
+///     resemblance. A pass mirrors from proven directories automatically.
 ///   - **suspected** — the directory's slug normalizes to the same core as this
-///     repo's ([`slug_core`]). Reported so a human can look, never asserted.
+///     repo's ([`slug_core`]). Reported so a human can look, never asserted,
+///     never mirrored without a human naming it.
 pub fn sibling_slugs_for(repo: &Path) -> Result<Vec<SiblingSlug>> {
     let current = claude_sessions_dir_for(repo)?;
-    let Some(projects) = current.parent().map(Path::to_path_buf) else {
+    let Some(projects) = current.parent() else {
         return Ok(Vec::new());
     };
+    sibling_slugs_in(projects, &current, &repo.join(TRANSCRIPTS_SUBDIR))
+}
+
+/// How recently a proven directory's transcript may have been written and
+/// still count as "the next pass will copy it" rather than "behind". raveld
+/// passes every 30 s; five minutes is ten passes of slack.
+pub const SIBLING_LIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`sibling_slugs_for`] with every location given, so tests need no `$HOME`.
+fn sibling_slugs_in(projects: &Path, current: &Path, mirror: &Path) -> Result<Vec<SiblingSlug>> {
     if !projects.is_dir() {
         return Ok(Vec::new());
     }
@@ -768,17 +813,27 @@ pub fn sibling_slugs_for(repo: &Path) -> Result<Vec<SiblingSlug>> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let core = slug_core(&current_name);
-    let mirror = repo.join(TRANSCRIPTS_SUBDIR);
-    let mirrored: std::collections::HashSet<String> = std::fs::read_dir(&mirror)
+    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    // Top-level mirror filenames with their sizes. A hand backfill may have
+    // stored a session under a date prefix (`2026-07-23-<id>.jsonl`).
+    let top_mirrored: Vec<(String, u64)> = std::fs::read_dir(mirror)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter_map(|e| {
+                    let n = e.file_name().to_str()?.to_string();
+                    let l = e.metadata().ok().filter(|m| m.is_file())?.len();
+                    Some((n, l))
+                })
                 .collect()
         })
         .unwrap_or_default();
+    let current_rel: std::collections::HashSet<PathBuf> = walk_jsonl(current)
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(current).ok().map(Path::to_path_buf))
+        .collect();
 
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&projects)? {
+    for entry in std::fs::read_dir(projects)? {
         let dir = entry?.path();
         if !dir.is_dir() {
             continue;
@@ -789,43 +844,67 @@ pub fn sibling_slugs_for(repo: &Path) -> Result<Vec<SiblingSlug>> {
         if name == current_name {
             continue;
         }
-        let files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if files.is_empty() {
-            continue;
-        }
-        let names: Vec<String> = files
+        let all: Vec<PathBuf> = walk_jsonl(&dir);
+        let top: Vec<String> = all
             .iter()
+            .filter(|p| p.parent() == Some(dir.as_path()))
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
             .collect();
-        // A mirrored file may carry a date prefix from a hand backfill, so
-        // match on the session id appearing anywhere in a mirror filename.
-        let is_home = |n: &String| mirrored.iter().any(|m| m == n || m.ends_with(n.as_str()));
-        let proven = names.iter().any(is_home);
+        if top.is_empty() {
+            continue;
+        }
+        let dated = |n: &str| -> Option<u64> {
+            top_mirrored
+                .iter()
+                .filter(|(m, _)| m == n || m.ends_with(&format!("-{n}")))
+                .map(|(_, l)| *l)
+                .max()
+        };
+        let proven = top.iter().any(|n| dated(n).is_some());
         if !proven && slug_core(name) != core {
             continue;
         }
-        let unmirrored: Vec<&PathBuf> = files
-            .iter()
-            .zip(&names)
-            .filter(|(_, n)| !is_home(n))
-            .map(|(p, _)| p)
-            .collect();
+        let (mut unmirrored, mut behind, mut growing) = (0usize, 0u64, 0usize);
+        let mut in_both = Vec::new();
+        for p in &all {
+            let Ok(rel) = p.strip_prefix(&dir) else {
+                continue;
+            };
+            let Some(src_len) = len_of(p) else { continue };
+            let exact = len_of(&mirror.join(rel));
+            let have = if p.parent() == Some(dir.as_path()) {
+                let n = rel.to_string_lossy();
+                exact.max(dated(&n))
+            } else {
+                exact
+            }
+            .unwrap_or(0);
+            if have < src_len {
+                let live = std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age < SIBLING_LIVE_WINDOW);
+                if proven && live {
+                    growing += 1;
+                } else {
+                    unmirrored += 1;
+                    behind += src_len - have;
+                }
+            }
+            if current_rel.contains(rel) {
+                in_both.push(rel.to_string_lossy().into_owned());
+            }
+        }
         out.push(SiblingSlug {
             slug: name.to_string(),
-            sessions: files.len(),
-            unmirrored: unmirrored.len(),
-            unmirrored_bytes: unmirrored
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-                .sum(),
+            dir: dir.clone(),
+            sessions: top.len(),
+            transcripts: all.len(),
+            unmirrored,
+            unmirrored_bytes: behind,
+            growing,
+            in_both,
             proven,
         });
     }
@@ -1021,19 +1100,42 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
                 } else {
                     "suspected (name matches after normalizing)"
                 };
+                let dir = sib.dir.display();
+                let live = if sib.growing > 0 {
+                    format!(
+                        ", {} live (written in the last 5 min; the next pass copies them)",
+                        sib.growing
+                    )
+                } else {
+                    String::new()
+                };
                 if sib.unmirrored > 0 {
+                    let fix = if sib.proven {
+                        "raveld reads this directory on every pass, so it is failing or not running: check `ravel status`; by hand"
+                    } else {
+                        "raveld never reads a suspected directory; if it is this repo's, bring it home"
+                    };
                     push(true, format!(
-                        "other slugs: {} — {how}, {} of {} session(s) are NOT in this mirror ({:.1} MB unbacked-up). Bring them home: `ravel sync {} {}`",
-                        sib.slug, sib.unmirrored, sib.sessions,
+                        "other slugs: {} — {how}, {} of {} transcript(s) are NOT fully in this mirror ({:.1} MB behind){live}. {fix}: `ravel sync {} {dir}`",
+                        sib.slug, sib.unmirrored, sib.transcripts,
                         sib.unmirrored_bytes as f64 / 1_048_576.0,
                         repo.display(),
-                        std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
-                            .join(".claude").join("projects").join(&sib.slug).display(),
                     ));
                 } else {
-                    push(false, format!(
-                        "other slugs: {} — {how}, all {} session(s) already mirrored (history from a previous path is home)",
-                        sib.slug, sib.sessions,
+                    push(
+                        false,
+                        format!(
+                        "other slugs: {} — {how}, all {} transcript(s) mirrored in full{live}{}",
+                        sib.slug, sib.transcripts,
+                        if sib.proven { "; raveld reads it on every pass" } else { "" },
+                    ),
+                    );
+                }
+                if !sib.in_both.is_empty() {
+                    push(true, format!(
+                        "other slugs: {} — {} transcript(s) exist in BOTH this directory and the current one ({}); the mirror keeps only the larger copy, so check whether they diverged before either is lost",
+                        sib.slug, sib.in_both.len(),
+                        sib.in_both.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
                     ));
                 }
             }
@@ -1519,6 +1621,101 @@ mod tests {
         assert!(dst.join("s1/subagents/agent-x.jsonl").is_file());
         assert_eq!(mirror_jsonl(&src, &dst).unwrap(), (0, 2));
         assert_eq!(walk_jsonl(&dst).len(), 2);
+    }
+
+    /// Pinned from 2026-09-24: moving the repos behind a symlink left open
+    /// sessions writing to the OLD directory. Their names were in the mirror,
+    /// so health said "already mirrored" while the mirror fell behind. The
+    /// scan must compare BYTES, walk nested subagent files, honour a
+    /// date-prefixed backfill copy, and let a just-written file count as live.
+    #[test]
+    fn sibling_scan_counts_bytes_not_names() {
+        let base = std::env::temp_dir().join("ravel-sync-test-sibling-bytes");
+        let _ = fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let current = projects.join("-new-path-soul");
+        let old = projects.join("-old-path-soul");
+        let mirror = base.join("mirror");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(old.join("s2/subagents")).unwrap();
+        fs::create_dir_all(&mirror).unwrap();
+        let aged = |p: &Path| {
+            let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .unwrap();
+        };
+        // s1: grew after its last copy — same name, more bytes.
+        fs::write(old.join("s1.jsonl"), "a\nb\nc\n").unwrap();
+        fs::write(mirror.join("s1.jsonl"), "a\n").unwrap();
+        // s2: mirrored in full, but a nested subagent file never copied.
+        fs::write(old.join("s2.jsonl"), "x\n").unwrap();
+        fs::write(mirror.join("s2.jsonl"), "x\n").unwrap();
+        fs::write(old.join("s2/subagents/agent-a.jsonl"), "sub\n").unwrap();
+        // s3: only a date-prefixed backfill copy, full size — home.
+        fs::write(old.join("s3.jsonl"), "q\n").unwrap();
+        fs::write(mirror.join("2026-07-23-s3.jsonl"), "q\n").unwrap();
+        for p in walk_jsonl(&old) {
+            aged(&p);
+        }
+
+        let sibs = sibling_slugs_in(&projects, &current, &mirror).unwrap();
+        assert_eq!(sibs.len(), 1);
+        let sib = &sibs[0];
+        assert!(sib.proven);
+        assert_eq!((sib.sessions, sib.transcripts), (3, 4));
+        assert_eq!(sib.unmirrored, 2, "grown s1 and never-copied subagent");
+        assert_eq!(sib.unmirrored_bytes, 4 + 4);
+        assert_eq!(sib.growing, 0);
+
+        // Once mirrored from, nothing is behind.
+        mirror_jsonl(&old, &mirror).unwrap();
+        let sib = &sibling_slugs_in(&projects, &current, &mirror).unwrap()[0];
+        assert_eq!(sib.unmirrored, 0);
+
+        // A write in the last minutes is a live session, not a finding.
+        fs::write(old.join("s1.jsonl"), "a\nb\nc\nd\n").unwrap();
+        let sib = &sibling_slugs_in(&projects, &current, &mirror).unwrap()[0];
+        assert_eq!((sib.unmirrored, sib.growing), (0, 1));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A session present in both the old and the current directory is two
+    /// live copies of one id; the mirror can hold only one, so it is named.
+    /// And a directory that only LOOKS like ours is never proven.
+    #[test]
+    fn sibling_scan_names_overlap_and_keeps_suspects_apart() {
+        let base = std::env::temp_dir().join("ravel-sync-test-sibling-overlap");
+        let _ = fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let current = projects.join("-repos-SQUAD-spaceGOAT");
+        let old = projects.join("-old-SQUAD-spaceGOAT");
+        let lookalike = projects.join("-repos-SQUAD-spaceG-O-A-T-");
+        let mirror = base.join("mirror");
+        for d in [&current, &old, &lookalike, &mirror] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(current.join("dup.jsonl"), "1\n").unwrap();
+        fs::write(old.join("dup.jsonl"), "1\n2\n").unwrap();
+        fs::write(mirror.join("dup.jsonl"), "1\n2\n").unwrap();
+        fs::write(lookalike.join("other.jsonl"), "z\n").unwrap();
+
+        let sibs = sibling_slugs_in(&projects, &current, &mirror).unwrap();
+        let old_s = sibs
+            .iter()
+            .find(|s| s.slug == "-old-SQUAD-spaceGOAT")
+            .unwrap();
+        assert!(old_s.proven);
+        assert_eq!(old_s.in_both, vec!["dup.jsonl".to_string()]);
+        let look = sibs
+            .iter()
+            .find(|s| s.slug == "-repos-SQUAD-spaceG-O-A-T-")
+            .unwrap();
+        assert!(!look.proven, "a name resemblance is not evidence");
+        assert_eq!(
+            look.unmirrored, 1,
+            "a fresh file in a suspect dir is never 'live'"
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     /// Claude Code files `TR1P.L3X` under `TR1P-L3X`: dots become dashes.

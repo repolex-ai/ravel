@@ -1,6 +1,6 @@
 [package]
 name = "ravel"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Transcript-graph engine: a transcript becomes a graph of meaning. git-lex / Pool sibling."
 license = "Apache-2.0"
