@@ -93,8 +93,8 @@ ravel import 9bdf2a ~/Downloads/data-2026-04-06-10-54-07-batch-0000
 
 The export is copied byte for byte into `.ravel/_ignore/transcripts/claude-ai/`.
 Importing the same export again is a no-op (`already imported, nothing copied`).
-When you download an updated export later, ravel ingests new conversations and
-turns while skipping turns that are already current (`0 already current`). An
+When you download an updated export later, ravel ingests the conversations that
+are new or have grown and skips the rest (the count in `(N already current)`). An
 older export imported after a newer one never rolls a conversation back.
 
 ## The memory index
@@ -132,7 +132,7 @@ ravel memory run 50           # the same, at most 50 model calls
 ### How it works
 
 1. **Turn extraction**: Every ten minutes, `raveld` inspects new turns in the soul's transcripts. It extracts only authored prose from the human and the agent (skipping tool output and scratchpads), taking each turn once. A model writes concise, one-line past-tense facts (decisions, commands, errors, versions, results), each referencing the turn IDs it rests on (`ravel:fromTurn`).
-2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours from the Unix epoch. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`ravel:summarizes`).
+2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours counted from 2020-01-01T00:00:00Z. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`ravel:summarizes`).
 Because windows align to absolute time boundaries, backfilling historical transcripts only invalidates and re-summarizes the specific windows the imported turns land in, leaving the rest of the tree untouched.
 
 ### Cost controls and setup
@@ -155,7 +155,7 @@ To enable it:
    raveld restart
    ```
 
-Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Every call logs its token counts and price to `~/.config/ravel/memory-spend.tsv`. When the total spent reaches `memory_budget_usd`, `raveld` halts model calls immediately. For a squad of 20 souls, backfilling years of history cost about $99–130 total; once caught up, ongoing passes only read new turns.
+Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Every call logs its token counts and price to `~/.config/ravel/memory-spend.tsv`. When the total spent reaches `memory_budget_usd`, `raveld` makes no new calls (calls already in flight finish, so the total can pass the budget by a few cents). For one squad of 20 souls, the first full read was $99 and still running on 2026-10-04, heading for about $120–130; once caught up, passes read only new turns.
 
 ## What lives where
 
@@ -170,7 +170,7 @@ Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Eve
 ├── memory/                               the memory index logs: append-only, canonical
 │   ├── memories.jsonl                    level-0 memories extracted from turns
 │   ├── summaries.jsonl                   hierarchical window summaries
-│   └── extracted.tsv                     chunk progress tracking
+│   └── extracted.tsv                     ids of turns already read, one per line
 └── oxigraph/                             the graph: one named graph per transcript,
                                           plus memory-v1 for the memory index
 

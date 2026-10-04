@@ -131,18 +131,28 @@ fn by_path(souls: &[Value], p: &std::path::Path) -> Option<String> {
 }
 
 fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
+    let list = if souls.is_empty() {
+        "    (none)".to_string()
+    } else {
+        souls
+            .iter()
+            .map(|s| {
+                format!(
+                    "    {}  {}",
+                    s["id"].as_str().unwrap_or("?"),
+                    s["path"].as_str().unwrap_or("?")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let eg = souls
+        .first()
+        .and_then(|s| s["id"].as_str())
+        .unwrap_or("<id>");
     anyhow!(
-        "{} is not inside a registered soul. Registered: {}.\n  Add the repo under souls: in {} and run `raveld restart`.",
+        "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by id or path:\n    ravel health {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
         p.display(),
-        if souls.is_empty() {
-            "(none)".to_string()
-        } else {
-            souls
-                .iter()
-                .map(|s| format!("{} {}", s["id"].as_str().unwrap_or("?"), s["path"].as_str().unwrap_or("?")))
-                .collect::<Vec<_>>()
-                .join("; ")
-        },
         ravel::daemon::config::config_path().display()
     )
 }
