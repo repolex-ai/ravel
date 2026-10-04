@@ -8,6 +8,10 @@
 //!   GET  /souls/{id}/stats            counts: quads, graphs, turns, dated turns, claims, top predicates
 //!   POST /souls/{id}/query  {query}   SPARQL, W3C results JSON
 //!   GET  /souls/{id}/emojikeys[?origin=authored]
+//!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
+//!   GET  /souls/{id}/memory[?lines=N] the memory wake view (default 96 lines)
+//!   GET  /souls/{id}/memory/{node}    one node opened: a window's halves, a memory's turns
+//!   POST /souls/{id}/memory/run       a memory pass now (spends only within memory_budget_usd)
 //!   POST /shutdown                    stop, after answering
 //!
 //! Reads open the store read-only; only the sync pass writes.
@@ -56,6 +60,9 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .route("/sync", post(sync_all))
         .route("/souls/{id}/sync", post(sync_one))
         .route("/souls/{id}/import", post(import_one))
+        .route("/souls/{id}/memory", get(memory_view))
+        .route("/souls/{id}/memory/run", post(memory_run))
+        .route("/souls/{id}/memory/{node}", get(memory_open))
         .route("/souls/{id}/health", get(soul_health))
         .route("/souls/{id}/stats", get(soul_stats))
         .route("/souls/{id}/query", post(soul_query))
@@ -90,6 +97,7 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
         "config_problems": d.problems,
         "souls": d.souls.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         "passes": d.passes.load(std::sync::atomic::Ordering::Relaxed),
+        "memory": d.memory_status(),
     }))
 }
 
@@ -182,6 +190,104 @@ async fn import_one(
         "bytes": bytes,
         "summary": s,
     })))
+}
+
+#[derive(Deserialize)]
+struct MemoryViewQuery {
+    lines: Option<usize>,
+}
+
+fn now_hour() -> i64 {
+    crate::memory::hour_of(&chrono::Utc::now().to_rfc3339()).unwrap_or(i64::MAX)
+}
+
+async fn memory_view(
+    State(d): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<MemoryViewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let lines = q.lines.unwrap_or(96).max(1);
+    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
+        let ms = log.memories()?;
+        let sums = log.summaries()?;
+        let view = crate::memory_log::wake_view(&ms, &sums, now_hour(), lines);
+        Ok(json!({ "id": soul.id, "memories": ms.len(), "summaries": sums.len(), "lines": view }))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    Ok(Json(v))
+}
+
+async fn memory_open(
+    State(d): State<Shared>,
+    Path((id, node)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        use crate::memory::{hour_to_rfc3339, Node, Window};
+        use crate::memory_log::{node_text, tree_of, Line, MemoryLog};
+        let log = MemoryLog::for_soul(&soul.path);
+        let ms = log.memories()?;
+        let sums = log.summaries()?;
+        let (tree, by_id) = tree_of(&ms);
+        if let Some(w) = Window::parse(&node) {
+            let kids: Vec<Line> = tree
+                .children(w)
+                .into_iter()
+                .map(|c| {
+                    let text = node_text(&c, &by_id, &sums).unwrap_or_else(|| "(not summarized yet — open it)".into());
+                    match c {
+                        Node::Memory(mid) => {
+                            let ts = by_id.get(&mid).map(|m| m.ts.clone()).unwrap_or_default();
+                            Line { id: mid, level: 0, from: ts.clone(), to: ts, text }
+                        }
+                        Node::Window(cw) => Line {
+                            id: cw.id(),
+                            level: cw.level + 1,
+                            from: hour_to_rfc3339(cw.start()),
+                            to: hour_to_rfc3339(cw.end()),
+                            text,
+                        },
+                    }
+                })
+                .collect();
+            return Ok(json!({ "node": node, "kind": "window", "children": kids }));
+        }
+        let m = by_id
+            .get(&node)
+            .ok_or_else(|| anyhow::anyhow!("no memory or window {node:?} in {}", soul.id))?;
+        let store = open_store(&soul)?;
+        let mut turns = Vec::new();
+        for t in &m.turns {
+            let q = format!(
+                "SELECT ?ts ?role ?text WHERE {{ GRAPH ?g {{ <https://repolex.ai/ravel/Turn/{t}> <https://repolex.ai/ontology/ravel/timestamp> ?ts ; <https://repolex.ai/ontology/ravel/role> ?role . OPTIONAL {{ <https://repolex.ai/ravel/Turn/{t}> <https://repolex.ai/ontology/ravel/text> ?text }} }} }} LIMIT 1"
+            );
+            let row = graph::query_rows(&store, &q)?.into_iter().next().unwrap_or_default();
+            turns.push(json!({
+                "turn": t,
+                "ts": row.get("ts"),
+                "role": row.get("role"),
+                "text": row.get("text"),
+            }));
+        }
+        Ok(json!({ "node": node, "kind": "memory", "memory": m, "turns": turns }))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(not_found)?;
+    Ok(Json(v))
+}
+
+async fn memory_run(
+    State(d): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let r = d.memory_one(&soul.id, usize::MAX).await.map_err(internal)?;
+    Ok(Json(json!({ "id": soul.id, "report": r })))
 }
 
 async fn soul_health(

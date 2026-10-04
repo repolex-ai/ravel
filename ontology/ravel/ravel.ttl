@@ -50,7 +50,7 @@
     a owl:Ontology ;
     rdfs:label "Ravel ontology" ;
     rdfs:comment "Transcript-graph vocabulary: conversational turns and the reader-annotation layer over them. Graph-only — no authored documents." ;
-    owl:versionInfo "0.2.0" .
+    owl:versionInfo "0.3.0" .
 
 # ─── The spine ───────────────────────────────────────────────────────────────
 
@@ -131,6 +131,68 @@ ravel:atTurn a owl:ObjectProperty ;
 ravel:exhibits a owl:DatatypeProperty ;
     rdfs:label "exhibits" ;
     rdfs:comment "The world-claim predicate: <<( turn ravel:exhibits 'detection-slug' )>>. Appears ONLY inside unasserted RDF 1.2 triple terms (via rdf:reifies) — asserting it directly is a modeling error; the belief layer exists so the graph never asserts what a reader merely claims." ;
+    rdfs:range xsd:string .
+
+# ─── The memory index (repolex-ai/ravel#15) ──────────────────────────────────
+
+# Memory is DERIVED, like Turn: written by ravel's memory extractor and
+# summarizer (a model, recorded in memoryModel), projected from the soul's
+# `.ravel/_ignore/memory/` logs into the `memory-v1` named graph. One class
+# for both kinds of node (goodlux, 2026-10-04): a level-0 Memory is one line
+# extracted from turns (fromTurn); a higher one summarizes the two nodes
+# under a time window (summarizes). Text has its own property because
+# ravel:text has domain Turn.
+ravel:Memory a owl:Class ;
+    rdfs:subClassOf git-lex:Thing ;
+    rdfs:label "Memory" ;
+    rdfs:comment "One line of a soul's memory index: either a memory extracted from transcript turns (level 0) or a summary of the nodes under an aligned time window (level 1 and up)." .
+
+ravel:memoryId a owl:DatatypeProperty ;
+    rdfs:label "memoryId" ;
+    rdfs:comment "Unique identifier for this memory: 'm' plus a content hash for a level-0 memory, 'w<level>-<index>' for a window summary. Unique within the class." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:string .
+
+ravel:memoryText a owl:DatatypeProperty ;
+    rdfs:label "memoryText" ;
+    rdfs:comment "The memory's one line of text." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:string .
+
+ravel:memoryLevel a owl:DatatypeProperty ;
+    rdfs:label "memoryLevel" ;
+    rdfs:comment "0 for a memory extracted from turns; k+1 for the summary of a window of 2^k hours." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:integer .
+
+ravel:windowStart a owl:DatatypeProperty ;
+    rdfs:label "windowStart" ;
+    rdfs:comment "Start of the time this memory covers: a level-0 memory's earliest source turn, or the window's first hour." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:dateTime .
+
+ravel:windowEnd a owl:DatatypeProperty ;
+    rdfs:label "windowEnd" ;
+    rdfs:comment "End of the time this memory covers (exclusive for a window; equal to windowStart for a level-0 memory)." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:dateTime .
+
+ravel:summarizes a owl:ObjectProperty ;
+    rdfs:label "summarizes" ;
+    rdfs:comment "A summary to each node it was written from: the two halves of its window, or an hour's memories." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range ravel:Memory .
+
+ravel:fromTurn a owl:ObjectProperty ;
+    rdfs:label "fromTurn" ;
+    rdfs:comment "A level-0 memory to each transcript turn it rests on — the receipt." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range ravel:Turn .
+
+ravel:memoryModel a owl:DatatypeProperty ;
+    rdfs:label "memoryModel" ;
+    rdfs:comment "The model id that wrote this line (e.g. 'claude-haiku-4-5')." ;
+    rdfs:domain ravel:Memory ;
     rdfs:range xsd:string .
 
 # ─── DEFERRED (declared so absence reads as roadmap, not ignorance) ──────────

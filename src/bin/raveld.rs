@@ -145,6 +145,7 @@ fn serve() -> Result<()> {
     rt.block_on(async {
         let looper = d.clone();
         tokio::spawn(daemon::run_sync_loop(looper));
+        tokio::spawn(daemon::run_memory_loop(d.clone()));
         daemon::http::serve(d).await
     })
 }

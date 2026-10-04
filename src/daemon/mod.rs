@@ -262,3 +262,95 @@ pub async fn run_sync_loop(d: Arc<Daemon>) {
         tokio::time::sleep(interval).await;
     }
 }
+
+/// How often the memory loop looks for new turns to read.
+const MEMORY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Model calls per soul per memory pass: a backfill proceeds in steps.
+const MEMORY_CALLS_PER_PASS: usize = 3000;
+
+impl Daemon {
+    /// Whether the memory index may call a model, and if not, why — said by
+    /// name on /health, never a silent off.
+    pub fn memory_status(&self) -> String {
+        if self.cfg.memory_budget_usd <= 0.0 {
+            return "off — no memory_budget_usd in config.yml, so no model is ever called".into();
+        }
+        if !crate::memory_extract::key_path().is_file() {
+            return format!(
+                "off — no key at {}",
+                crate::memory_extract::key_path().display()
+            );
+        }
+        let spent = crate::memory_extract::Ledger::open(self.cfg.memory_budget_usd)
+            .map(|l| l.spent())
+            .unwrap_or(0.0);
+        format!(
+            "on — ${spent:.2} of ${:.2} spent",
+            self.cfg.memory_budget_usd
+        )
+    }
+
+    /// One memory pass over one soul: read new turns and write summaries
+    /// (outside the gate — it touches only the soul's memory logs), then
+    /// project the logs into the soul's `memory-v1` graph under the gate.
+    pub async fn memory_one(
+        self: &Arc<Self>,
+        id: &str,
+        max_calls: usize,
+    ) -> Result<crate::memory_extract::RunReport> {
+        let soul = self.soul(id)?.clone();
+        let budget = self.cfg.memory_budget_usd;
+        let path = soul.path.clone();
+        let sid = soul.id.clone();
+        let report = if budget > 0.0 && crate::memory_extract::key_path().is_file() {
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let llm = crate::memory_extract::Anthropic::from_key_file()?;
+                let ledger = crate::memory_extract::Ledger::open(budget)?;
+                crate::memory_extract::run_soul(&path, &sid, &llm, &ledger, max_calls)
+            })
+            .await
+            .map_err(|e| anyhow!("memory task panicked: {e}"))??
+        } else {
+            crate::memory_extract::RunReport {
+                stopped: Some(self.memory_status()),
+                ..Default::default()
+            }
+        };
+        let _g = self.gate.lock().await;
+        let path = soul.path.clone();
+        tokio::task::spawn_blocking(move || crate::memory_log::project_into_store(&path))
+            .await
+            .map_err(|e| anyhow!("memory projection panicked: {e}"))??;
+        Ok(report)
+    }
+}
+
+/// The memory schedule: every soul, every ten minutes, after a first wait so
+/// the transcript passes catch up first. Silent when the index is off; the
+/// reason is on /health.
+pub async fn run_memory_loop(d: Arc<Daemon>) {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    log(format!("memory index {}", d.memory_status()));
+    loop {
+        if d.cfg.memory_budget_usd > 0.0 && crate::memory_extract::key_path().is_file() {
+            let ids: Vec<String> = d.souls.iter().map(|s| s.id.clone()).collect();
+            for id in ids {
+                match d.memory_one(&id, MEMORY_CALLS_PER_PASS).await {
+                    Ok(r) if r.chunks + r.summaries > 0 || !r.failed.is_empty() || r.stopped.is_some() => log(format!(
+                        "{id}: memory read {} chunk(s) → {} memories, {} summaries, {} in / {} out tokens{}{}",
+                        r.chunks,
+                        r.memories,
+                        r.summaries,
+                        r.input_tokens,
+                        r.output_tokens,
+                        if r.failed.is_empty() { String::new() } else { format!("; {} FAILED: {}", r.failed.len(), r.failed.join(" | ")) },
+                        r.stopped.map(|s| format!("; stopped: {s}")).unwrap_or_default()
+                    )),
+                    Ok(_) => {}
+                    Err(e) => log(format!("{id}: memory pass FAILED — {e:#}")),
+                }
+            }
+        }
+        tokio::time::sleep(MEMORY_INTERVAL).await;
+    }
+}

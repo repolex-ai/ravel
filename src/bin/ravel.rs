@@ -10,6 +10,11 @@
 //!   ravel import [<soul>] <export-dir>  copy a claude.ai data export into the soul
 //!                                    and ingest it; safe to repeat, and a newer
 //!                                    export later adds to it
+//!   ravel memory [<soul>]            the whole history in about 96 lines: recent
+//!                                    memories word for word, older ones summarized
+//!   ravel memory open [<soul>] <id>  one line opened: a summary's two halves, or a
+//!                                    memory's source turns
+//!   ravel memory run [<soul>]        read new turns and write summaries now
 //!   ravel health [<soul>]            the read-only diagnostic; exit 1 = attention
 //!   ravel stats  [<soul>]            counts: quads, graphs, turns, claims, top predicates
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
@@ -32,6 +37,7 @@ fn usage() -> ! {
            ravel souls\n  \
            ravel sync   [<soul> [<sessions-dir>]]\n  \
            ravel import [<soul>] <export-dir>\n  \
+           ravel memory [<soul>] | memory open [<soul>] <id> | memory run [<soul>]\n  \
            ravel health [<soul>]\n  \
            ravel stats  [<soul>]\n  \
            ravel query  [<soul>] \"<sparql>\"\n  \
@@ -65,6 +71,12 @@ fn main() -> Result<()> {
         ["sync", s, dir] => sync(&client, &resolve(&client, Some(s))?, Some(dir)),
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
+        ["memory"] => memory(&client, &resolve(&client, None)?),
+        ["memory", "run"] => memory_run(&client, &resolve(&client, None)?),
+        ["memory", "run", s] => memory_run(&client, &resolve(&client, Some(s))?),
+        ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
+        ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
+        ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
         ["health"] => health(&client, &resolve(&client, None)?),
         ["health", s] => health(&client, &resolve(&client, Some(s))?),
         ["stats"] => stats(&client, &resolve(&client, None)?),
@@ -150,6 +162,7 @@ fn status(cfg: &DaemonConfig, client: &Client) -> Result<()> {
     for p in h["config_problems"].as_array().unwrap_or(&Vec::new()) {
         println!("  CONFIG PROBLEM: {}", p.as_str().unwrap_or("?"));
     }
+    println!("  memory index: {}", h["memory"].as_str().unwrap_or("?"));
     souls(client)
 }
 
@@ -175,6 +188,99 @@ fn souls(client: &Client) -> Result<()> {
                 ),
             }
         );
+    }
+    Ok(())
+}
+
+/// `2024-03-07T14:22:10Z` → `2024-03-07 14:22`.
+fn short(ts: &str) -> String {
+    ts.get(..16).unwrap_or(ts).replace('T', " ")
+}
+
+fn print_lines(lines: &[Value]) {
+    for l in lines {
+        let level = l["level"].as_u64().unwrap_or(0);
+        let when = if level == 0 {
+            short(l["from"].as_str().unwrap_or(""))
+        } else {
+            format!(
+                "{} → {}",
+                l["from"].as_str().unwrap_or("").get(..10).unwrap_or(""),
+                l["to"].as_str().unwrap_or("").get(..10).unwrap_or("")
+            )
+        };
+        println!(
+            "{when:<23}  {}  [{}]",
+            l["text"].as_str().unwrap_or(""),
+            l["id"].as_str().unwrap_or("")
+        );
+    }
+}
+
+fn memory(client: &Client, id: &str) -> Result<()> {
+    let v = client.get(&format!("/souls/{id}/memory"))?;
+    let lines = v["lines"].as_array().cloned().unwrap_or_default();
+    if lines.is_empty() {
+        println!(
+            "[ravel memory] {id}: no memories yet. `ravel` shows whether the memory index is on."
+        );
+        return Ok(());
+    }
+    println!(
+        "[ravel memory] {id}: {} memories, {} summaries — `ravel memory open <id>` opens any line",
+        v["memories"], v["summaries"]
+    );
+    print_lines(&lines);
+    Ok(())
+}
+
+fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
+    let v = client.get(&format!("/souls/{id}/memory/{node}"))?;
+    if v["kind"] == "window" {
+        print_lines(v["children"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+        return Ok(());
+    }
+    let m = &v["memory"];
+    println!(
+        "{}  {}",
+        short(m["ts"].as_str().unwrap_or("")),
+        m["text"].as_str().unwrap_or("")
+    );
+    for t in v["turns"].as_array().cloned().unwrap_or_default() {
+        let text = t["text"].as_str().unwrap_or("(no text)");
+        let clipped: String = text.chars().take(600).collect();
+        println!(
+            "\n--- {} {} turn {}\n{}{}",
+            short(t["ts"].as_str().unwrap_or("")),
+            t["role"].as_str().unwrap_or("?"),
+            t["turn"].as_str().unwrap_or("?"),
+            clipped,
+            if text.chars().count() > 600 {
+                " […]"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn memory_run(client: &Client, id: &str) -> Result<()> {
+    let v = client.post(&format!("/souls/{id}/memory/run"), None)?;
+    let r = &v["report"];
+    println!(
+        "[ravel memory run] {id}: read {} chunk(s) → {} memories, {} summaries; {} in / {} out tokens",
+        r["chunks"], r["memories"], r["summaries"], r["input_tokens"], r["output_tokens"]
+    );
+    if let Some(s) = r["stopped"].as_str() {
+        println!("[ravel memory run] stopped: {s}");
+    }
+    let failed = r["failed"].as_array().cloned().unwrap_or_default();
+    for f in &failed {
+        eprintln!("[ravel memory run] FAILED {}", f.as_str().unwrap_or("?"));
+    }
+    if !failed.is_empty() {
+        std::process::exit(1);
     }
     Ok(())
 }

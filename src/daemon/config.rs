@@ -6,6 +6,7 @@
 //! souls:
 //!   - ~/repos/7R1PL3F0RC3/spaceGOAT
 //!   - ~/repos/7R1PL3F0RC3/W4R3Z
+//! memory_budget_usd: 100   # optional; the memory index spends nothing without it
 //! ```
 //!
 //! A missing file is not an error: the daemon starts with no souls and says
@@ -29,6 +30,7 @@ struct Raw {
     interval_secs: Option<u64>,
     #[serde(default)]
     souls: Vec<String>,
+    memory_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,11 @@ pub struct DaemonConfig {
     pub interval_secs: u64,
     /// Soul repo paths, `~` expanded, in file order.
     pub souls: Vec<PathBuf>,
+    /// The most the memory index may spend on model calls, in US dollars,
+    /// counted from `memory-spend.tsv`. Zero (the default) means the memory
+    /// index never calls a model: nothing billed unless a human wrote a number
+    /// here (goodlux, 2026-10-04).
+    pub memory_budget_usd: f64,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -92,6 +99,7 @@ impl DaemonConfig {
             port: raw.port.unwrap_or(DEFAULT_PORT),
             interval_secs: raw.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
             souls: raw.souls.iter().map(|s| expand_tilde(s)).collect(),
+            memory_budget_usd: raw.memory_budget_usd.unwrap_or(0.0),
         })
     }
 
