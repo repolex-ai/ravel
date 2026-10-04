@@ -635,7 +635,7 @@ pub fn run_soul(
                         report.lock().unwrap().stopped.get_or_insert(e.to_string());
                         break;
                     }
-                    match llm.json(SUMMARY_SYSTEM, &text, &summary_schema(), 512) {
+                    match llm.json(SUMMARY_SYSTEM, &text, &summary_schema(), 2048) {
                         Ok((v, i, o)) => {
                             let sm = Summary {
                                 window: w.id(),

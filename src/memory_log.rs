@@ -162,9 +162,11 @@ pub struct Line {
 
 /// The wake view: the whole history in at most `budget` lines.
 ///
-/// A window whose summary is missing or stale is shown opened — its children
-/// instead — so the view never hides memories behind a summary that does not
-/// say what is under it.
+/// A window whose summary is missing or stale is opened — its children shown
+/// instead — while the view has room; past the budget it is one line saying it
+/// is unsummarized or stale. Never a summary passed off as covering memories it
+/// does not mention, and never more than `budget` lines (the view printed
+/// 3.5 MB mid-backfill before this rule).
 pub fn wake_view(
     memories: &[Memory],
     summaries: &HashMap<String, Summary>,
@@ -201,9 +203,33 @@ pub fn wake_view(
                         text: s.text.clone(),
                     }),
                     None => {
-                        for c in tree.children(*w).into_iter().rev() {
-                            stack.push(c);
+                        // Open it only while the view stays within budget.
+                        // Past that, one honest line stands for the window:
+                        // the old summary marked stale, or a count.
+                        let kids = tree.children(*w);
+                        if out.len() + stack.len() + kids.len() <= budget {
+                            for c in kids.into_iter().rev() {
+                                stack.push(c);
+                            }
+                            continue;
                         }
+                        let n = tree.memories_in(*w).len();
+                        let text = match summaries.get(&w.id()) {
+                            Some(old) => {
+                                format!("[stale — {n} memories under it now] {}", old.text)
+                            }
+                            None => format!(
+                                "[not summarized yet — {n} memories; open {} to read them]",
+                                w.id()
+                            ),
+                        };
+                        out.push(Line {
+                            id: w.id(),
+                            level: w.level + 1,
+                            from: hour_to_rfc3339(w.start()),
+                            to: hour_to_rfc3339(w.end()),
+                            text,
+                        });
                     }
                 }
             }
@@ -368,11 +394,19 @@ mod tests {
         let (tree, by_id) = tree_of(&ms);
         let w = Window::containing(hour_of(&ms[0].ts).unwrap(), 0);
         assert_eq!(tree.representative(w), Some(Node::Window(w)));
-        // No summary: both memories show.
-        let v = wake_view(&ms, &HashMap::new(), now, 1);
+        // No summary, room to open: both memories show.
+        let v = wake_view(&ms, &HashMap::new(), now, 2);
         assert_eq!(
             v.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
+        );
+        // No summary, no room: one line says so, and the budget holds.
+        let v = wake_view(&ms, &HashMap::new(), now, 1);
+        assert_eq!(v.len(), 1);
+        assert!(
+            v[0].text.starts_with("[not summarized yet — 2 memories"),
+            "{}",
+            v[0].text
         );
         // A current summary: one line.
         let mut sums = HashMap::new();
@@ -393,11 +427,20 @@ mod tests {
         // A stale one (a back-dated memory landed in the hour): opened again.
         let mut ms2 = ms.clone();
         ms2.push(mem("c", "2024-01-01T00:05:00Z"));
-        let v = wake_view(&ms2, &sums, now, 1);
+        let v = wake_view(&ms2, &sums, now, 3);
         assert_eq!(
             v.len(),
             3,
             "the old summary does not mention c, so it must not stand for it"
+        );
+        // No room to open it: the old text, marked stale with the new count.
+        let v = wake_view(&ms2, &sums, now, 1);
+        assert_eq!(v.len(), 1);
+        assert!(
+            v[0].text
+                .starts_with("[stale — 3 memories under it now] both"),
+            "{}",
+            v[0].text
         );
     }
 
@@ -453,5 +496,28 @@ mod tests {
         store
             .load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Mid-backfill: thousands of memories, no summaries yet. The view must
+    /// still fit its budget.
+    #[test]
+    fn a_view_with_no_summaries_still_fits_the_budget() {
+        let ms: Vec<Memory> = (0..5000)
+            .map(|i| Memory {
+                id: format!("m{i}"),
+                ts: hour_to_rfc3339(30_000 + i * 2),
+                text: format!("memory {i}"),
+                turns: vec![format!("t{i}")],
+                model: "t".into(),
+            })
+            .collect();
+        let v = wake_view(&ms, &HashMap::new(), 50_000, 96);
+        assert!(v.len() <= 96, "{} lines", v.len());
+        assert!(v.len() > 50);
     }
 }
