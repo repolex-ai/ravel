@@ -302,13 +302,15 @@ fn import(client: &Client, id: &str, dir: &str) -> Result<()> {
         Some(serde_json::json!({ "path": abs.display().to_string() })),
     )?;
     let s = &v["summary"];
-    println!(
-        "[ravel import] {id} {}: {} ({} file(s), {} bytes)",
-        v["export"].as_str().unwrap_or("?"),
-        v["status"].as_str().unwrap_or("?"),
-        v["files"],
-        v["bytes"]
-    );
+    let export = v["export"].as_str().unwrap_or("?");
+    if v["status"] == "copied" {
+        println!(
+            "[ravel import] {id} {export}: copied ({} file(s), {} bytes)",
+            v["files"], v["bytes"]
+        );
+    } else {
+        println!("[ravel import] {id} {export}: already imported, nothing copied");
+    }
     println!(
         "[ravel import] {id} claude.ai: {} export(s) → ingested {} conversation(s), {} turns ({} already current)",
         s["claude_ai_exports"], s["claude_ai_conversations"], s["claude_ai_turns"], s["claude_ai_skipped"]

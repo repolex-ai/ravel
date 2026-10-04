@@ -1,7 +1,8 @@
 //! raveld — the ravel daemon.
 //!
 //!   raveld          run in the foreground; refuses if a raveld is already up
-//!   raveld restart  kill EVERY raveld on this machine, then run in the foreground
+//!   raveld restart  kill EVERY raveld on this machine, then start one detached
+//!                   (logging to ~/.config/ravel/raveld.log), the way `ravel` does
 //!   raveld start    the same as restart, kept because fingers remember it
 //!   raveld stop     kill EVERY raveld on this machine and exit
 //!   raveld status   say whether one is running, and what it has been doing
@@ -35,8 +36,13 @@ fn main() -> Result<()> {
             serve()
         }
         ["restart"] | ["start"] => {
+            // Detached, not in this terminal: a restart that ties the daemon
+            // to the shell that typed it dies when that window closes
+            // (found running ravel's own docs check, 2026-10-04).
             stop_all();
-            serve()
+            let cfg = DaemonConfig::load()?;
+            client::ensure_running(&cfg)?;
+            status()
         }
         ["stop"] => {
             stop_all();

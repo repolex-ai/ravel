@@ -19,3 +19,10 @@ souls:
   - ~/repos/7R1PL3F0RC3/spaceGOAT
   - ~/repos/7R1PL3F0RC3/W4R3Z
   - ~/repos/7R1PL3F0RC3/lUX
+
+# The memory index (`ravel memory`) reads transcripts with Claude Haiku 4.5 and
+# writes one-line memories and summaries. It calls no model, and spends
+# nothing, unless this is set AND an API key is in
+# ~/.config/ravel/anthropic-api-key (chmod 600). raveld stops calling the model
+# when ~/.config/ravel/memory-spend.tsv adds up to this many US dollars.
+# memory_budget_usd: 50
