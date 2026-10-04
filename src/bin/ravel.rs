@@ -7,6 +7,9 @@
 //!   ravel sync   [<soul> [<sessions-dir>]]  a pass now (raveld does this on its own anyway);
 //!                                    <sessions-dir> reads another directory's session files
 //!                                    into this soul — how a sibling slug's history comes home
+//!   ravel import [<soul>] <export-dir>  copy a claude.ai data export into the soul
+//!                                    and ingest it; safe to repeat, and a newer
+//!                                    export later adds to it
 //!   ravel health [<soul>]            the read-only diagnostic; exit 1 = attention
 //!   ravel stats  [<soul>]            counts: quads, graphs, turns, claims, top predicates
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
@@ -28,6 +31,7 @@ fn usage() -> ! {
            ravel\n  \
            ravel souls\n  \
            ravel sync   [<soul> [<sessions-dir>]]\n  \
+           ravel import [<soul>] <export-dir>\n  \
            ravel health [<soul>]\n  \
            ravel stats  [<soul>]\n  \
            ravel query  [<soul>] \"<sparql>\"\n  \
@@ -59,6 +63,8 @@ fn main() -> Result<()> {
         ["sync"] => sync(&client, &resolve(&client, None)?, None),
         ["sync", s] => sync(&client, &resolve(&client, Some(s))?, None),
         ["sync", s, dir] => sync(&client, &resolve(&client, Some(s))?, Some(dir)),
+        ["import", dir] => import(&client, &resolve(&client, None)?, dir),
+        ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
         ["health"] => health(&client, &resolve(&client, None)?),
         ["health", s] => health(&client, &resolve(&client, Some(s))?),
         ["stats"] => stats(&client, &resolve(&client, None)?),
@@ -169,6 +175,35 @@ fn souls(client: &Client) -> Result<()> {
                 ),
             }
         );
+    }
+    Ok(())
+}
+
+fn import(client: &Client, id: &str, dir: &str) -> Result<()> {
+    let abs = std::path::Path::new(dir)
+        .canonicalize()
+        .with_context(|| format!("{dir} does not exist"))?;
+    let v = client.post(
+        &format!("/souls/{id}/import"),
+        Some(serde_json::json!({ "path": abs.display().to_string() })),
+    )?;
+    let s = &v["summary"];
+    println!(
+        "[ravel import] {id} {}: {} ({} file(s), {} bytes)",
+        v["export"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("?"),
+        v["files"],
+        v["bytes"]
+    );
+    println!(
+        "[ravel import] {id} claude.ai: {} export(s) → ingested {} conversation(s), {} turns ({} already current)",
+        s["claude_ai_exports"], s["claude_ai_conversations"], s["claude_ai_turns"], s["claude_ai_skipped"]
+    );
+    if let Some(f) = s["claude_ai_failed"].as_array().filter(|f| !f.is_empty()) {
+        for x in f {
+            eprintln!("[ravel import] FAILED {}", x.as_str().unwrap_or("?"));
+        }
+        std::process::exit(1);
     }
     Ok(())
 }

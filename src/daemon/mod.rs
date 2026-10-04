@@ -46,6 +46,11 @@ pub struct SyncSummary {
     pub agy_unattributed: Vec<String>,
     pub agy_lossy: Vec<String>,
     pub agy_failed: Vec<String>,
+    pub claude_ai_exports: usize,
+    pub claude_ai_conversations: usize,
+    pub claude_ai_turns: usize,
+    pub claude_ai_skipped: usize,
+    pub claude_ai_failed: Vec<String>,
 }
 
 impl From<&SyncStats> for SyncSummary {
@@ -67,6 +72,11 @@ impl From<&SyncStats> for SyncSummary {
             agy_unattributed: s.agy.unattributed.clone(),
             agy_lossy: s.agy.lossy.clone(),
             agy_failed: s.agy.failed.clone(),
+            claude_ai_exports: s.claude_ai.exports,
+            claude_ai_conversations: s.claude_ai.conversations,
+            claude_ai_turns: s.claude_ai.turns,
+            claude_ai_skipped: s.claude_ai.skipped,
+            claude_ai_failed: s.claude_ai.failed.clone(),
         }
     }
 }
@@ -150,6 +160,27 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    /// Copy a claude.ai export into one soul, then run a pass so it is in the
+    /// graph when this returns. Under the same gate as a pass: the copy and the
+    /// ingest never race a daemon pass over the same soul.
+    pub async fn import(
+        self: &Arc<Self>,
+        id: &str,
+        src: std::path::PathBuf,
+    ) -> Result<(sync::ImportOutcome, SyncSummary)> {
+        let soul = self.soul(id)?.clone();
+        let outcome = {
+            let _g = self.gate.lock().await;
+            let path = soul.path.clone();
+            tokio::task::spawn_blocking(move || sync::import_claude_ai(&path, &src))
+                .await
+                .map_err(|e| anyhow!("import task panicked: {e}"))??
+        };
+        log(format!("{}: import {outcome:?}", soul.id));
+        let summary = self.sync_one(&soul.id, None).await?;
+        Ok((outcome, summary))
+    }
+
     /// Run one pass over one soul. Serialized: a second caller waits.
     /// `sessions_src` overrides where the harness's session files are read
     /// from — how a sibling slug's history is brought home; `None` is the
@@ -213,10 +244,17 @@ pub async fn run_sync_loop(d: Arc<Daemon>) {
         let results = d.sync_all().await;
         for (id, r) in &results {
             if let Ok(s) = r {
-                if s.mirrored + s.sessions + s.agy_mirrored + s.agy_sessions > 0 {
+                if s.mirrored
+                    + s.sessions
+                    + s.agy_mirrored
+                    + s.agy_sessions
+                    + s.claude_ai_conversations
+                    > 0
+                {
                     log(format!(
-                        "{id}: mirrored {} → ingested {} session(s), {} turns; agy mirrored {} → {} conversation(s)",
-                        s.mirrored, s.sessions, s.turns, s.agy_mirrored, s.agy_sessions
+                        "{id}: mirrored {} → ingested {} session(s), {} turns; agy mirrored {} → {} conversation(s); claude.ai {} conversation(s), {} turns",
+                        s.mirrored, s.sessions, s.turns, s.agy_mirrored, s.agy_sessions,
+                        s.claude_ai_conversations, s.claude_ai_turns
                     ));
                 }
             }

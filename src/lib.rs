@@ -14,6 +14,7 @@
 pub mod adapter;
 pub mod agy;
 pub mod annotate;
+pub mod claude_ai;
 pub mod client;
 pub mod daemon;
 pub mod graph;

@@ -173,6 +173,32 @@ pub struct EmojikeyHit {
 /// This is the "see graphs of sessions" query — it reaches into every session's
 /// named graph (`GRAPH ?g`) and pulls the emojikeys the readers found, with the
 /// session they came from and whether they were authored or quoted.
+/// Run a SELECT and return each row as variable → plain value (an IRI's
+/// string, a literal's lexical form). For callers that want values, not
+/// RDF terms.
+pub fn query_rows(
+    store: &Store,
+    q: &str,
+) -> Result<Vec<std::collections::HashMap<String, String>>> {
+    let QueryResults::Solutions(solutions) = SparqlEvaluator::new()
+        .parse_query(q)?
+        .on_store(store)
+        .execute()?
+    else {
+        anyhow::bail!("expected SELECT solutions");
+    };
+    let mut rows = Vec::new();
+    for sol in solutions {
+        let sol = sol?;
+        rows.push(
+            sol.iter()
+                .map(|(v, t)| (v.as_str().to_string(), term_value(t)))
+                .collect(),
+        );
+    }
+    Ok(rows)
+}
+
 pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<Vec<EmojikeyHit>> {
     let filter = match only_source_kind {
         Some(sk) => format!(r#"FILTER(?sk = "{sk}")"#),

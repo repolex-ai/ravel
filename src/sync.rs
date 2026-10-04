@@ -40,6 +40,13 @@ pub const TRANSCRIPTS_SUBDIR: &str = ".ravel/_ignore/transcripts/claude-code";
 /// first use.
 pub const AGY_TRANSCRIPTS_SUBDIR: &str = ".ravel/_ignore/transcripts/agy";
 
+/// Claude desktop / claude.ai exports, one directory per export, kept byte for
+/// byte under the export's own name (`data-2026-04-06-10-54-07-batch-0000`).
+/// Every export ever imported stays here; a later one never replaces an
+/// earlier one (goodlux, 2026-10-04: the dump is kept in `.ravel`, and a new
+/// dump months later must import without trouble).
+pub const CLAUDE_AI_SUBDIR: &str = ".ravel/_ignore/transcripts/claude-ai";
+
 /// The graph store, relative to the soul repo root.
 pub const STORE_SUBDIR: &str = ".ravel/_ignore/oxigraph";
 
@@ -171,6 +178,22 @@ pub struct SyncStats {
     /// The Gemini/Antigravity half, counted separately so a green claude-side
     /// number can never stand in for an agy-side one.
     pub agy: AgyStats,
+    /// The claude.ai export half, same reason.
+    pub claude_ai: ClaudeAiStats,
+}
+
+/// What the claude.ai pass did.
+#[derive(Debug, Default)]
+pub struct ClaudeAiStats {
+    /// Exports present under [`CLAUDE_AI_SUBDIR`].
+    pub exports: usize,
+    /// Conversations (re)projected this pass: new, or grown since last time.
+    pub conversations: usize,
+    pub turns: usize,
+    /// Conversations already in the graph at their newest version.
+    pub skipped: usize,
+    /// `id: reason`; one bad conversation never stops the rest.
+    pub failed: Vec<String>,
 }
 
 /// What the agy pass did. `unattributed` is the load-bearing field: a
@@ -716,7 +739,226 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     // Antigravity conversations pays nothing, and a failure on one side must
     // not be able to silently swallow the other's numbers.
     stats.agy = sync_agy(repo)?;
+    stats.claude_ai = sync_claude_ai(repo)?;
     Ok(stats)
+}
+
+// ─────────────────────────── Claude desktop / claude.ai ───────────────────────────
+//
+// Imported, not watched: an export is a file the human downloads, so nothing
+// here looks for new ones. `import_claude_ai` copies an export into the soul;
+// every pass then makes sure each conversation in every export is in the
+// graph at its newest version. Older history arriving after newer history is
+// the normal case here, not an edge case.
+
+/// Per-conversation ingest bookkeeping: `<conversation uuid>\t<version key>`,
+/// plus one `export:<name>\t<bytes of its conversations.json>` line per
+/// export, which is what lets an unchanged shelf cost one stat per export
+/// instead of a 256 MB parse every 30 seconds.
+const CLAUDE_AI_MANIFEST: &str = ".ravel/_ignore/ingest-manifest-claude-ai.tsv";
+
+/// The outcome of `import_claude_ai`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// Copied into the soul; the next pass ingests it.
+    Copied {
+        name: String,
+        files: usize,
+        bytes: u64,
+    },
+    /// An export of this name is already here with identical bytes.
+    AlreadyImported { name: String },
+}
+
+/// Copy a claude.ai export directory into this soul, byte for byte.
+///
+/// Refuses, and changes nothing, when the source is not an export or when an
+/// export of the same name is already here with DIFFERENT bytes: two different
+/// files under one name is a question for a human, not something to settle by
+/// overwriting. The copy goes to a temporary directory first and is renamed
+/// into place only after every file's hash matches its source.
+pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
+    use crate::claude_ai::is_export_dir;
+    if !is_export_dir(src) {
+        anyhow::bail!(
+            "{} is not a claude.ai export: it needs {}",
+            src.display(),
+            crate::claude_ai::EXPORT_FILES.join(" and ")
+        );
+    }
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("export path {} has no usable name", src.display()))?
+        .to_string();
+    let files: Vec<PathBuf> = std::fs::read_dir(src)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    let shelf = repo.join(CLAUDE_AI_SUBDIR);
+    let dest = shelf.join(&name);
+    if dest.exists() {
+        for f in &files {
+            let there = dest.join(f.file_name().unwrap_or_default());
+            if !there.is_file() || file_sha256(&there)? != file_sha256(f)? {
+                anyhow::bail!(
+                    "an export named {name} is already in {} with different contents ({} differs); nothing was copied",
+                    shelf.display(),
+                    f.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        }
+        return Ok(ImportOutcome::AlreadyImported { name });
+    }
+    std::fs::create_dir_all(&shelf).with_context(|| format!("create {}", shelf.display()))?;
+    let tmp = shelf.join(format!(".{name}.importing"));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+    let mut bytes = 0u64;
+    for f in &files {
+        let to = tmp.join(f.file_name().unwrap_or_default());
+        bytes += std::fs::copy(f, &to)
+            .with_context(|| format!("copy {} → {}", f.display(), to.display()))?;
+        if file_sha256(&to)? != file_sha256(f)? {
+            std::fs::remove_dir_all(&tmp)?;
+            anyhow::bail!(
+                "copy of {} does not match its source; nothing was imported",
+                f.display()
+            );
+        }
+    }
+    std::fs::rename(&tmp, &dest).with_context(|| format!("move {} into place", dest.display()))?;
+    Ok(ImportOutcome::Copied {
+        name,
+        files: files.len(),
+        bytes,
+    })
+}
+
+fn read_tsv(path: &Path) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once('\t')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_tsv(path: &Path, m: &std::collections::HashMap<String, String>) -> Result<()> {
+    let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
+    lines.sort();
+    let tmp = path.with_extension("tsv.tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Make sure every conversation in every imported export is in the graph at
+/// its newest version.
+///
+/// When the same conversation is in several exports, the copy with the larger
+/// version key (`updated_at`, then message count) wins, so an older export
+/// imported after a newer one can never roll a conversation back. A
+/// conversation present in an old export and missing from a new one (deleted
+/// on claude.ai) is kept: the record does not forget because the source did.
+pub fn sync_claude_ai(repo: &Path) -> Result<ClaudeAiStats> {
+    use crate::claude_ai::{conversation_events, read_conversations, version_key};
+    let mut st = ClaudeAiStats::default();
+    let shelf = repo.join(CLAUDE_AI_SUBDIR);
+    if !shelf.is_dir() {
+        return Ok(st);
+    }
+    let mut exports: Vec<PathBuf> = std::fs::read_dir(&shelf)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && !p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                && crate::claude_ai::is_export_dir(p)
+        })
+        .collect();
+    exports.sort();
+    st.exports = exports.len();
+    if exports.is_empty() {
+        return Ok(st);
+    }
+    let manifest_path = repo.join(CLAUDE_AI_MANIFEST);
+    let mut manifest = read_tsv(&manifest_path);
+    let export_key = |p: &Path| -> Result<(String, String)> {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let len = std::fs::metadata(p.join("conversations.json"))?.len();
+        Ok((format!("export:{name}"), len.to_string()))
+    };
+    let mut all_seen = true;
+    for e in &exports {
+        let (k, v) = export_key(e)?;
+        if manifest.get(&k) != Some(&v) {
+            all_seen = false;
+        }
+    }
+    if all_seen {
+        return Ok(st);
+    }
+
+    // Newest version of every conversation across all exports.
+    let mut best: std::collections::HashMap<String, (String, crate::claude_ai::Conversation)> =
+        std::collections::HashMap::new();
+    for e in &exports {
+        for c in read_conversations(e)? {
+            let key = version_key(&c);
+            let newer = best.get(&c.uuid).is_none_or(|(k, _)| key > *k);
+            if newer {
+                best.insert(c.uuid.clone(), (key, c));
+            }
+        }
+    }
+
+    let store = graph::open(repo.join(STORE_SUBDIR))?;
+    let mut ids: Vec<&String> = best.keys().collect();
+    ids.sort();
+    for id in ids {
+        let (key, c) = &best[id];
+        if manifest.get(id.as_str()) == Some(key) {
+            st.skipped += 1;
+            continue;
+        }
+        let events = conversation_events(c);
+        if !events.is_empty() {
+            let anns = reader::emojikey_read(&events);
+            let graph_id = format!("claude-ai-{id}");
+            if let Err(err) =
+                graph::ingest_transcript(&store, &events, &anns, &graph_id, soul::TURN_PARTITION)
+            {
+                st.failed.push(format!("{id}: {err:#}"));
+                continue;
+            }
+            st.conversations += 1;
+            st.turns += events.len();
+        }
+        manifest.insert(id.clone(), key.clone());
+    }
+    // An export is marked done only when every conversation in it made it;
+    // otherwise the next pass looks again and retries the failures.
+    if st.failed.is_empty() {
+        for e in &exports {
+            let (k, v) = export_key(e)?;
+            manifest.insert(k, v);
+        }
+    }
+    write_tsv(&manifest_path, &manifest)?;
+    Ok(st)
 }
 
 /// A slug reduced to its comparable core: lowercase, punctuation dropped.
@@ -1727,5 +1969,109 @@ mod tests {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with("ravel-sync-test-TR1P-L3X"), "{name}");
         assert!(!name.contains('.'), "{name}");
+    }
+}
+
+#[cfg(test)]
+mod claude_ai_tests {
+    use super::*;
+    use crate::claude_ai::tests::write_fixture;
+
+    fn fresh(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("ravel-claude-ai-{name}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("soul")).unwrap();
+        base
+    }
+
+    /// Turns in the store, and the text of one turn.
+    fn turns(repo: &Path) -> (usize, Option<String>) {
+        let store = graph::open(repo.join(STORE_SUBDIR)).unwrap();
+        let q = "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }";
+        let n = graph::query_rows(&store, q).unwrap()[0]["n"]
+            .parse()
+            .unwrap();
+        let q = "SELECT ?x WHERE { GRAPH ?g { <https://repolex.ai/ravel/Turn/m4> <https://repolex.ai/ontology/ravel/text> ?x } }";
+        let x = graph::query_rows(&store, q)
+            .unwrap()
+            .first()
+            .map(|r| r["x"].clone());
+        (n, x)
+    }
+
+    #[test]
+    fn import_copies_ingests_and_repeating_it_changes_nothing() {
+        let base = fresh("repeat");
+        let repo = base.join("soul");
+        let export = base.join("data-2024-01-02-batch-0000");
+        write_fixture(&export, false);
+
+        let out = import_claude_ai(&repo, &export).unwrap();
+        assert!(matches!(out, ImportOutcome::Copied { files: 2, .. }));
+        let st = sync_claude_ai(&repo).unwrap();
+        assert_eq!((st.exports, st.conversations, st.turns), (1, 2, 3));
+        assert_eq!(turns(&repo).0, 3);
+
+        // Same export again: recognized, nothing copied, nothing re-projected.
+        let out = import_claude_ai(&repo, &export).unwrap();
+        assert!(matches!(out, ImportOutcome::AlreadyImported { .. }));
+        let st = sync_claude_ai(&repo).unwrap();
+        assert_eq!(
+            (st.conversations, st.skipped),
+            (0, 0),
+            "an unchanged shelf is not even parsed"
+        );
+        assert_eq!(turns(&repo).0, 3);
+    }
+
+    #[test]
+    fn a_newer_export_adds_and_an_older_one_never_rolls_back() {
+        let base = fresh("newer");
+        let repo = base.join("soul");
+        // Names sort OPPOSITE to age, so only the version key, never the
+        // directory order, can pick the right copy.
+        let old = base.join("export-b-older");
+        let new = base.join("export-a-newer");
+        write_fixture(&old, false);
+        write_fixture(&new, true); // c2 has grown by one reply, m4
+
+        // Newer first, older after: the order history really arrives in.
+        import_claude_ai(&repo, &new).unwrap();
+        sync_claude_ai(&repo).unwrap();
+        assert_eq!(turns(&repo), (4, Some("and more".to_string())));
+
+        import_claude_ai(&repo, &old).unwrap();
+        let st = sync_claude_ai(&repo).unwrap();
+        assert_eq!(st.exports, 2);
+        assert_eq!(st.conversations, 0, "the older export holds nothing newer");
+        assert_eq!(
+            turns(&repo),
+            (4, Some("and more".to_string())),
+            "m4 survives"
+        );
+    }
+
+    #[test]
+    fn a_different_export_under_a_known_name_is_refused() {
+        let base = fresh("clash");
+        let repo = base.join("soul");
+        let a = base.join("one").join("data-x");
+        let b = base.join("two").join("data-x");
+        write_fixture(&a, false);
+        write_fixture(&b, true);
+        import_claude_ai(&repo, &a).unwrap();
+        let err = import_claude_ai(&repo, &b).unwrap_err().to_string();
+        assert!(err.contains("different contents"), "{err}");
+    }
+
+    #[test]
+    fn a_directory_that_is_not_an_export_is_refused() {
+        let base = fresh("notexport");
+        let repo = base.join("soul");
+        let d = base.join("random");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("conversations.json"), "[]").unwrap();
+        assert!(import_claude_ai(&repo, &d).is_err());
+        assert!(!repo.join(CLAUDE_AI_SUBDIR).exists());
     }
 }

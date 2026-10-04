@@ -55,6 +55,7 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .route("/souls", get(souls))
         .route("/sync", post(sync_all))
         .route("/souls/{id}/sync", post(sync_one))
+        .route("/souls/{id}/import", post(import_one))
         .route("/souls/{id}/health", get(soul_health))
         .route("/souls/{id}/stats", get(soul_stats))
         .route("/souls/{id}/query", post(soul_query))
@@ -151,6 +152,36 @@ async fn sync_one(
     Ok(Json(
         json!({ "id": soul.id, "path": soul.path.display().to_string(), "summary": s }),
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct ImportBody {
+    path: String,
+}
+
+async fn import_one(
+    State(d): State<Shared>,
+    Path(id): Path<String>,
+    Json(b): Json<ImportBody>,
+) -> Result<Json<Value>, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let src = std::path::PathBuf::from(&b.path);
+    if !src.is_dir() {
+        return Err(bad(format!("{} is not a directory", src.display())));
+    }
+    let (outcome, s) = d.import(&soul.id, src).await.map_err(bad)?;
+    let (status, name, files, bytes) = match outcome {
+        crate::sync::ImportOutcome::Copied { name, files, bytes } => ("copied", name, files, bytes),
+        crate::sync::ImportOutcome::AlreadyImported { name } => ("already imported", name, 0, 0),
+    };
+    Ok(Json(json!({
+        "id": soul.id,
+        "status": status,
+        "export": name,
+        "files": files,
+        "bytes": bytes,
+        "summary": s,
+    })))
 }
 
 async fn soul_health(
