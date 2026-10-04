@@ -11,7 +11,7 @@
 //!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
 //!   GET  /souls/{id}/memory[?lines=N] the memory wake view (default 96 lines)
 //!   GET  /souls/{id}/memory/{node}    one node opened: a window's halves, a memory's turns
-//!   POST /souls/{id}/memory/run       a memory pass now (spends only within memory_budget_usd)
+//!   POST /souls/{id}/memory/run [{calls}]  a memory pass now, at most `calls` model calls (spends only within memory_budget_usd)
 //!   POST /shutdown                    stop, after answering
 //!
 //! Reads open the store read-only; only the sync pass writes.

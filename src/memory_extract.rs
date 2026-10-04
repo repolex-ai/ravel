@@ -409,11 +409,13 @@ pub fn pending_chunks(
 
 // ───────────────────────────── prompts ─────────────────────────────
 
-const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation between a human and an AI agent and write the memories worth keeping from it.
+const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation between a human and an AI agent and write down what is worth remembering about THEM and THEIR WORK — the way a colleague's notebook would, not an encyclopedia.
 
-A memory is one line, at most 200 characters, that someone reading it months later would want: a decision and who made it, a fact learned, a result measured, a thing built or shipped, a mistake and its fix, a preference or rule stated, a question left open. Use the real names, file paths, commands, numbers and versions from the text. Write plain statements in the past tense, not commentary about the conversation.
+Keep: what the human or the agent did, built, changed, shipped or broke; decisions and who made them; results and measurements; problems hit and how they were solved; preferences, rules and corrections the human gave; plans and open questions; people, projects and places in their life.
 
-Write nothing for greetings, small talk, or steps with no lasting result. Zero memories is a fine answer. Never invent what the text does not say.
+Do not keep general knowledge the agent explained (what a library is, how a technique works, the history of a tool, a list of options) unless the human acted on it — then keep the action and its outcome, not the explanation. Do not keep the human merely asking a question.
+
+Each memory is one line, at most 200 characters, plain past tense, with the real names, paths, commands, versions and numbers. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer. Never invent what the text does not say.
 
 For each memory give the numbers of the turns it rests on.";
 

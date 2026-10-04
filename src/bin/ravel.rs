@@ -14,7 +14,8 @@
 //!                                    memories word for word, older ones summarized
 //!   ravel memory open [<soul>] <id>  one line opened: a summary's two halves, or a
 //!                                    memory's source turns
-//!   ravel memory run [<soul>]        read new turns and write summaries now
+//!   ravel memory run [<soul>] [<calls>]  read new turns and write summaries now,
+//!                                    at most <calls> model calls when given
 //!   ravel health [<soul>]            the read-only diagnostic; exit 1 = attention
 //!   ravel stats  [<soul>]            counts: quads, graphs, turns, claims, top predicates
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
@@ -72,8 +73,14 @@ fn main() -> Result<()> {
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
         ["memory"] => memory(&client, &resolve(&client, None)?),
-        ["memory", "run"] => memory_run(&client, &resolve(&client, None)?),
-        ["memory", "run", s] => memory_run(&client, &resolve(&client, Some(s))?),
+        ["memory", "run"] => memory_run(&client, &resolve(&client, None)?, None),
+        ["memory", "run", n] if n.parse::<usize>().is_ok() => {
+            memory_run(&client, &resolve(&client, None)?, n.parse().ok())
+        }
+        ["memory", "run", s] => memory_run(&client, &resolve(&client, Some(s))?, None),
+        ["memory", "run", s, n] => {
+            memory_run(&client, &resolve(&client, Some(s))?, Some(n.parse()?))
+        }
         ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
         ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
         ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
@@ -265,8 +272,9 @@ fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
     Ok(())
 }
 
-fn memory_run(client: &Client, id: &str) -> Result<()> {
-    let v = client.post(&format!("/souls/{id}/memory/run"), None)?;
+fn memory_run(client: &Client, id: &str, calls: Option<usize>) -> Result<()> {
+    let body = calls.map(|n| serde_json::json!({ "calls": n }));
+    let v = client.post(&format!("/souls/{id}/memory/run"), body)?;
     let r = &v["report"];
     println!(
         "[ravel memory run] {id}: read {} chunk(s) → {} memories, {} summaries; {} in / {} out tokens",
