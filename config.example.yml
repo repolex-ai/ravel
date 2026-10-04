@@ -1,12 +1,14 @@
 # raveld — the ravel daemon. One per machine; this file is its whole
 # configuration. Copy to ~/.config/ravel/config.yml and edit.
 #
-# Every entry under souls: is a soul repo. raveld keeps that soul's transcript
-# mirror and graph at <repo>/.ravel/_ignore/ and identifies the soul by the
-# first six characters of its genesis commit — the same id pan, git-lex,
-# Horae and Syrinx use. Nothing here is typed in but the paths.
+# Every entry under souls: is a soul repository (home-relative `~/` or absolute).
+# raveld keeps that soul's transcript mirror, memory logs, and oxigraph store at
+# <repo>/.ravel/_ignore/ and identifies the soul by the first six characters of
+# its genesis commit — the same id pan, git-lex, Horae and Syrinx use.
+# Nothing here is typed in but the paths.
 #
 # No file at all means no souls: raveld starts, and `ravel` says so by name.
+# After editing this file, apply changes by running `raveld restart`.
 
 # Ruled 2026-09-22 (goodlux): 7881 for now.
 port: 7881
@@ -21,8 +23,13 @@ souls:
   - ~/repos/7R1PL3F0RC3/lUX
 
 # The memory index (`ravel memory`) reads transcripts with Claude Haiku 4.5 and
-# writes one-line memories and summaries. It calls no model, and spends
-# nothing, unless this is set AND an API key is in
-# ~/.config/ravel/anthropic-api-key (chmod 600). raveld stops calling the model
-# when ~/.config/ravel/memory-spend.tsv adds up to this many US dollars.
+# writes one-line memories and hierarchical window summaries.
+#
+# It is completely disabled by default — calling no model and spending nothing —
+# unless memory_budget_usd is set to a positive dollar cap AND an Anthropic API
+# key is placed in ~/.config/ravel/anthropic-api-key (chmod 600).
+#
+# Every model call is priced and recorded in ~/.config/ravel/memory-spend.tsv.
+# raveld stops calling the model as soon as spend reaches this ceiling.
 # memory_budget_usd: 50
+

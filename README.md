@@ -39,6 +39,8 @@ cp config.example.yml ~/.config/ravel/config.yml   # edit the souls: list
 
 ## Quick start
 
+Commands default to the soul repository you are currently in. To query or inspect another soul from anywhere, pass its six-character genesis ID or repository path (`ravel <command> <soul>`).
+
 ```sh
 # 1. Any command starts the daemon if it is not running, then answers.
 ravel
@@ -58,7 +60,13 @@ ravel query 'SELECT (COUNT(DISTINCT ?t) AS ?turns) WHERE { GRAPH ?g { ?t a <http
 ravel health 700c5b
 ravel stats ~/repos/SQUAD/lUX
 
-# 5. The daemon itself
+# 5. List all registered souls and sync status
+ravel souls
+
+# 6. Trigger an immediate sync pass (raveld runs every 30 seconds anyway)
+ravel sync
+
+# 7. The daemon itself
 raveld status
 raveld restart      # after editing the config; stops every raveld, starts one detached
 raveld stop
@@ -74,20 +82,30 @@ Download your data from claude.ai (Settings → Privacy → Export data), unzip
 it, and import the folder into the soul it belongs to:
 
 ```sh
+# Inside the soul repo:
 ravel import ~/Downloads/data-2026-04-06-10-54-07-batch-0000
+
+# Or from anywhere, passing the soul ID or path first:
+ravel import 9bdf2a ~/Downloads/data-2026-04-06-10-54-07-batch-0000
 # [ravel import] 9bdf2a data-2026-04-06-10-54-07-batch-0000: copied (4 file(s), 267818192 bytes)
 # [ravel import] 9bdf2a claude.ai: 1 export(s) → ingested 1431 conversation(s), 31353 turns (0 already current)
 ```
 
-The export is kept byte for byte in the soul. Importing the same one again
-does nothing. A newer export months later adds what is new or has grown; an
-older one imported after a newer one can never roll a conversation back.
+The export is copied byte for byte into `.ravel/_ignore/transcripts/claude-ai/`.
+Importing the same export again is a no-op (`already imported, nothing copied`).
+When you download an updated export later, ravel ingests new conversations and
+turns while skipping turns that are already current (`0 already current`). An
+older export imported after a newer one never rolls a conversation back.
 
 ## The memory index
 
+The memory index gives an agent its full conversational history in about 96
+lines: recent memories word for word, older ones rolled up into hierarchical
+summaries.
+
 ```sh
 ravel memory                  # the whole history in about 96 lines
-ravel memory open w0-33830    # a summary opened into the lines under it
+ravel memory open w0-33830    # a window summary opened into the lines under it
 ravel memory open mec170751e01cedc   # a memory, with the turns it came from
 ravel memory run              # read new turns and write summaries now
 ravel memory run 50           # the same, at most 50 model calls
@@ -101,23 +119,43 @@ ravel memory run 50           # the same, at most 50 model calls
 2026-10-04 14:33         Fixed ravel bug where 75 one-hour summaries failed due to 512-token output cap. ...  [m...]
 ```
 
-Recent memories are shown word for word, older ones only through summaries.
-A line in square brackets at the start ("not summarized yet", "stale") means
-the summary for that stretch is still being written.
+### Reading and drilling down
 
-How it works: raveld reads each soul's transcripts every ten minutes, keeping
-only what the human and the agent wrote (no tool output), each turn once. A
-model writes one-line memories citing the turns they rest on, then a one-line
-summary for every aligned window of 2^k hours that holds memories. History
-imported later only re-summarizes the windows it lands in.
+- **Line tags**: Each line ends with an identifier in brackets:
+  - `[m<hash>]` — an atomic level-0 memory extracted directly from conversation turns.
+  - `[w<k>-<index>]` — a summary covering an aligned time window of $2^k$ hours (e.g. `w0` covers 1 hour, `w1` covers 2 hours, `w2` covers 4 hours).
+- **Drill-down with `ravel memory open <id>`**:
+  - Opening a window summary (`w0-33830`) expands it into the child memories or smaller window summaries under it.
+  - Opening an atomic memory (`mec170751e01cedc`) prints the memory text followed by the exact transcript turns (speaker role, timestamp, turn ID, and dialogue excerpt) that produced it.
+- **Status markers**: A bracketed prefix at the start of a line (`[not summarized yet — N memories]` or `[stale — N memories under it now]`) indicates that the window is waiting for a summarization pass. The view strictly adheres to its ~96 line budget rather than dumping unsummarized memories into the terminal.
 
-**It costs money, and is off until you turn it on.** It uses Claude Haiku 4.5.
-Put an Anthropic API key in `~/.config/ravel/anthropic-api-key` (`chmod 600`;
-never in your shell environment) and set `memory_budget_usd` in the config.
-Every call is priced into `~/.config/ravel/memory-spend.tsv`; raveld stops at
-the budget. For one squad of 20 souls, the first full read was $99 and still
-running when this was written (2026-10-04), heading for about $120–130. After
-that, only new turns are read.
+### How it works
+
+1. **Turn extraction**: Every ten minutes, `raveld` inspects new turns in the soul's transcripts. It extracts only authored prose from the human and the agent (skipping tool output and scratchpads), taking each turn once. A model writes concise, one-line past-tense facts (decisions, commands, errors, versions, results), each referencing the turn IDs it rests on (`ravel:fromTurn`).
+2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours from the Unix epoch. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`ravel:summarizes`).
+Because windows align to absolute time boundaries, backfilling historical transcripts only invalidates and re-summarizes the specific windows the imported turns land in, leaving the rest of the tree untouched.
+
+### Cost controls and setup
+
+The memory index is **completely disabled by default**; it calls no models and spends nothing until configured.
+
+To enable it:
+
+1. **Save your Anthropic API key** in `~/.config/ravel/anthropic-api-key` and restrict permissions:
+   ```sh
+   chmod 600 ~/.config/ravel/anthropic-api-key
+   ```
+   Ravel reads the key directly from disk; it is never read from environment variables to prevent accidental leaks to child processes.
+2. **Set a dollar budget** in `~/.config/ravel/config.yml`:
+   ```yaml
+   memory_budget_usd: 50
+   ```
+3. **Restart the daemon**:
+   ```sh
+   raveld restart
+   ```
+
+Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Every call logs its token counts and price to `~/.config/ravel/memory-spend.tsv`. When the total spent reaches `memory_budget_usd`, `raveld` halts model calls immediately. For a squad of 20 souls, backfilling years of history cost about $99–130 total; once caught up, ongoing passes only read new turns.
 
 ## What lives where
 
@@ -129,15 +167,17 @@ that, only new turns are read.
 ├── ingest-manifest.tsv                   what has been ingested, by size (claude-code)
 ├── ingest-manifest-agy.tsv               what has been ingested, by content hash (agy)
 ├── ingest-manifest-claude-ai.tsv         each conversation's ingested version (claude.ai)
-├── memory/                               the memory index: memories.jsonl, summaries.jsonl,
-│                                         extracted.tsv — append-only, canonical
+├── memory/                               the memory index logs: append-only, canonical
+│   ├── memories.jsonl                    level-0 memories extracted from turns
+│   ├── summaries.jsonl                   hierarchical window summaries
+│   └── extracted.tsv                     chunk progress tracking
 └── oxigraph/                             the graph: one named graph per transcript,
                                           plus memory-v1 for the memory index
 
-~/.config/ravel/config.yml                the daemon: port, interval, souls, memory budget
-~/.config/ravel/raveld.log                what a detached raveld would have said to a terminal
-~/.config/ravel/anthropic-api-key         the memory index's key, read by ravel only
-~/.config/ravel/memory-spend.tsv          one line per model call, with its price
+~/.config/ravel/config.yml                daemon config: port, interval, souls, memory budget
+~/.config/ravel/raveld.log                log output from detached daemon
+~/.config/ravel/anthropic-api-key         Anthropic API key for memory index (chmod 600)
+~/.config/ravel/memory-spend.tsv          audit ledger: timestamp, soul, tokens, USD per call
 ```
 
 A soul's id is the first six characters of its repository's genesis commit —
@@ -179,9 +219,11 @@ Queries filter; ingest never drops. That is why `ravel stats` counts
 `ontology/ravel/ravel.ttl`. The copy shipped in
 [git-lex-kit-ravel](https://github.com/repolex-ai/git-lex-kit-ravel) must be
 byte-identical; CI checks it on every push, along with the six graph-only
-properties the kit checker would otherwise call errors. Memory nodes are
-`ravel:Memory`, linked to their turns by `ravel:fromTurn` and to the nodes they
-summarize by `ravel:summarizes`.
+properties the kit checker would otherwise call errors.
+
+The store partitions data into named graphs under `https://repolex.ai/ravel/NamedGraph/`:
+- **Transcripts**: Each transcript has its own named graph (`<…/NamedGraph/<transcript_id>>`) containing `ravel:Turn` nodes linked by `ravel:parentTurn`.
+- **Memory index**: The memory index projects into `<https://repolex.ai/ravel/NamedGraph/memory-v1>`. Memory nodes are `ravel:Memory`, carrying `ravel:memoryId`, `ravel:memoryLevel`, `ravel:memoryText`, `ravel:windowStart`, and `ravel:windowEnd`. Level-0 memories link to their source turns with `ravel:fromTurn`; window summaries link to child nodes with `ravel:summarizes`.
 
 ## Health
 
