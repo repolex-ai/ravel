@@ -222,6 +222,9 @@ pub struct ProseTurn {
 pub struct Conversation {
     pub source: &'static str,
     pub id: String,
+    /// Where it happened, as far as the source says: a working directory, or
+    /// a claude.ai chat's title. Tells the model which project it is reading.
+    pub place: String,
     pub turns: Vec<ProseTurn>,
 }
 
@@ -271,9 +274,13 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .into_owned();
+            let place = first_cwd(&s)
+                .map(|c| format!("working directory {c}"))
+                .unwrap_or_default();
             out.push(Conversation {
                 source: "claude-code",
                 id,
+                place,
                 turns: to_turns(&ev),
             });
         }
@@ -299,6 +306,7 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
             out.push(Conversation {
                 source: "agy",
                 id,
+                place: String::new(),
                 turns: to_turns(&parsed.events),
             });
         }
@@ -321,9 +329,15 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
             }
         }
         for (id, (_, c)) in best {
+            let place = if c.name.is_empty() {
+                "a Claude desktop chat".to_string()
+            } else {
+                format!("a Claude desktop chat titled {:?}", c.name)
+            };
             out.push(Conversation {
                 source: "claude.ai",
                 id,
+                place,
                 turns: to_turns(&crate::claude_ai::conversation_events(&c)),
             });
         }
@@ -336,7 +350,62 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
 pub struct Chunk {
     pub source: &'static str,
     pub conversation: String,
+    pub place: String,
     pub turns: Vec<ProseTurn>,
+}
+
+/// The first `"cwd":"…"` in a Claude Code transcript.
+fn first_cwd(jsonl: &str) -> Option<String> {
+    let i = jsonl.find("\"cwd\":\"")? + 7;
+    let rest = &jsonl[i..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// Peer messages reach a session as user-role turns wrapped in
+/// `<channel source=… from_cwd=… …>`. Read raw, they look like the human
+/// speaking, and the model credits the reader with what a peer said
+/// (w3bl0rd's accuracy check, 2026-10-05). Name the sender instead.
+fn relabel_channels(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("<channel ") {
+        out.push_str(&rest[..i]);
+        // The tag ends at the first '>' outside a quoted attribute value.
+        let mut quoted = false;
+        let end = rest[i..].char_indices().find_map(|(k, ch)| match ch {
+            '"' => {
+                quoted = !quoted;
+                None
+            }
+            '>' if !quoted => Some(k),
+            _ => None,
+        });
+        let Some(end) = end else {
+            out.push_str(&rest[i..]);
+            return out;
+        };
+        let tag = &rest[i..i + end];
+        let attr = |name: &str| {
+            let k = format!("{name}=\"");
+            tag.find(&k).and_then(|j| {
+                let v = &tag[j + k.len()..];
+                v.find('"').map(|e| v[..e].to_string())
+            })
+        };
+        let who = attr("from_cwd")
+            .and_then(|c| {
+                c.trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .map(str::to_string)
+            })
+            .or_else(|| attr("from_id"))
+            .unwrap_or_else(|| "unnamed".into());
+        out.push_str(&format!("[message from another agent, {who}:]"));
+        rest = &rest[i + end + 1..];
+    }
+    out.push_str(rest);
+    out.replace("</channel>", "")
 }
 
 fn clip(s: &str) -> String {
@@ -389,6 +458,7 @@ pub fn pending_chunks(
                 chunks.push(Chunk {
                     source: c.source,
                     conversation: c.id.clone(),
+                    place: c.place.clone(),
                     turns: std::mem::take(&mut cur),
                 });
                 chars = 0;
@@ -400,6 +470,7 @@ pub fn pending_chunks(
             chunks.push(Chunk {
                 source: c.source,
                 conversation: c.id.clone(),
+                place: c.place.clone(),
                 turns: cur,
             });
         }
@@ -409,17 +480,19 @@ pub fn pending_chunks(
 
 // ───────────────────────────── prompts ─────────────────────────────
 
-const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation between a human and an AI agent and write down what is worth remembering about THEM and THEIR WORK — the way a colleague's notebook would, not an encyclopedia.
+const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation and write down what is worth remembering about the people and agents in it and their work — the way a colleague's notebook would, not an encyclopedia.
 
-Keep: what the human or the agent did, built, changed, shipped or broke; decisions and who made them; results and measurements; problems hit and how they were solved; preferences, rules and corrections the human gave; plans and open questions; people, projects and places in their life.
+Who is who: 'agent' turns are the AI agent named in the header. 'human' turns are usually the human the agent works for, but a human turn that starts with [message from another agent, NAME:] is a message from that other agent, and a human turn whose text says who sent it ('w3bl0rd here', 'from spaceGOAT') is from that sender. Credit every action, finding and decision to whoever actually did it. Reading or being told something is not doing it.
 
-Do not keep general knowledge the agent explained (what a library is, how a technique works, the history of a tool, a list of options) unless the human acted on it — then keep the action and its outcome, not the explanation. Do not keep the human merely asking a question.
+Keep: what was done, built, changed, shipped or broken; decisions and who made them; results and measurements; problems hit and how they were solved; preferences, rules and corrections given; plans and open questions; people, projects and places.
 
-Each memory is one line, at most 200 characters, plain past tense, with the real names, paths, commands, versions and numbers. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer. Never invent what the text does not say.
+Do not keep general knowledge an agent explained (what a library is, how a technique works, a list of options) unless someone acted on it — then keep the action and its outcome. Do not keep someone merely asking a question.
+
+Each memory is one line, at most 200 characters, plain past tense. It names who acted and which project, repository or thing it concerns (use the working directory or chat title in the header when the text does not say). Copy names, paths, commands, versions and numbers exactly as written; if a detail is not in the text, leave it out — never fill a gap. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer.
 
 For each memory give the numbers of the turns it rests on.";
 
-const SUMMARY_SYSTEM: &str = "You merge lines from a memory log, oldest first, into ONE line of at most 200 characters that keeps what matters most: the decisions, results and things made, with their real names and numbers. Plain past-tense statements. Never add what the lines do not say.";
+const SUMMARY_SYSTEM: &str = "You merge lines from a memory log, oldest first, into ONE line of at most 200 characters that keeps what matters most: the decisions, results and things made, who did them, and the projects they belong to, with their real names and numbers. Never credit one actor with what another did. Never add what the lines do not say. If the lines repeat each other, say it once.";
 
 fn extract_schema() -> Value {
     json!({
@@ -452,9 +525,14 @@ fn summary_schema() -> Value {
     })
 }
 
-fn chunk_prompt(c: &Chunk) -> String {
+fn chunk_prompt(c: &Chunk, agent: &str) -> String {
+    let place = if c.place.is_empty() {
+        String::new()
+    } else {
+        format!(" It took place in {}.", c.place)
+    };
     let mut s = format!(
-        "Source: {} conversation {}. Turns {} to {}.\n\n",
+        "The agent in this conversation is {agent}.{place} Source: {} conversation {}. Turns {} to {}.\n\n",
         c.source,
         c.conversation,
         c.turns.first().map(|t| t.ts.as_str()).unwrap_or("?"),
@@ -465,7 +543,12 @@ fn chunk_prompt(c: &Chunk) -> String {
             continue;
         }
         let who = if t.role == "user" { "human" } else { "agent" };
-        s += &format!("[{}] {who} ({}):\n{}\n\n", i + 1, t.ts, t.text);
+        s += &format!(
+            "[{}] {who} ({}):\n{}\n\n",
+            i + 1,
+            t.ts,
+            relabel_channels(&t.text)
+        );
     }
     s
 }
@@ -477,11 +560,16 @@ fn memory_id(first_turn: &str, text: &str) -> String {
 }
 
 /// Read one chunk into memories. A chunk with no prose costs nothing.
-pub fn extract_chunk(llm: &dyn Llm, c: &Chunk) -> Result<(Vec<Memory>, u64, u64)> {
+pub fn extract_chunk(llm: &dyn Llm, c: &Chunk, agent: &str) -> Result<(Vec<Memory>, u64, u64)> {
     if c.turns.iter().all(|t| t.text.is_empty()) {
         return Ok((Vec::new(), 0, 0));
     }
-    let (v, i, o) = llm.json(EXTRACT_SYSTEM, &chunk_prompt(c), &extract_schema(), 4096)?;
+    let (v, i, o) = llm.json(
+        EXTRACT_SYSTEM,
+        &chunk_prompt(c, agent),
+        &extract_schema(),
+        4096,
+    )?;
     let mut out = Vec::new();
     for m in v["memories"].as_array().cloned().unwrap_or_default() {
         let text = m["text"].as_str().unwrap_or("").trim().to_string();
@@ -557,6 +645,11 @@ pub fn run_soul(
     max_calls: usize,
 ) -> Result<RunReport> {
     let log = MemoryLog::for_soul(repo);
+    // The soul's name, as its repo directory spells it: who "agent" is.
+    let agent = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| soul.to_string());
     let report = Mutex::new(RunReport::default());
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let take_call = || -> Result<()> {
@@ -585,7 +678,7 @@ pub fn run_soul(
                         break;
                     }
                 }
-                match extract_chunk(llm, &c) {
+                match extract_chunk(llm, &c, &agent) {
                     Ok((ms, i, o)) => {
                         let _g = write.lock().unwrap();
                         let ids: Vec<String> = c.turns.iter().map(|t| t.id.clone()).collect();
@@ -751,6 +844,7 @@ mod tests {
         let a = Conversation {
             source: "claude-code",
             id: "a".into(),
+            place: String::new(),
             turns: vec![
                 turn("t1", "2026-01-01T10:00:00Z", "x"),
                 turn("t2", "2026-01-01T10:01:00Z", "y"),
@@ -760,6 +854,7 @@ mod tests {
         let b = Conversation {
             source: "claude-code",
             id: "b".into(),
+            place: String::new(),
             turns: vec![
                 turn("t1", "2026-01-01T10:00:00Z", "x"),
                 turn("t2", "2026-01-01T10:01:00Z", "y"),
@@ -853,5 +948,34 @@ mod tests {
         );
         // Nothing read is recorded as read: the turns wait for the next pass.
         assert!(MemoryLog::for_soul(&repo).extracted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_peer_message_is_labelled_with_its_sender() {
+        let t = "<channel source=\"plugin:subtext:subtext\" from_id=\"6l8p\" from_summary=\"Day 26 > stuff\" from_cwd=\"/Users/rob/repos/7R1PL3F0RC3/spaceGOAT\" sent_at=\"x\">\nRead the calibration section.\n</channel>";
+        let r = relabel_channels(t);
+        assert!(
+            r.starts_with("[message from another agent, spaceGOAT:]"),
+            "{r}"
+        );
+        assert!(r.contains("Read the calibration section."));
+        assert!(!r.contains("<channel") && !r.contains("</channel>"));
+        assert_eq!(relabel_channels("plain text"), "plain text");
+    }
+
+    #[test]
+    fn the_header_names_the_agent_and_the_place() {
+        let c = Chunk {
+            source: "claude-code",
+            conversation: "x".into(),
+            place: "working directory /repos/W3BL0RD".into(),
+            turns: vec![turn("t1", "2026-01-01T00:00:00Z", "hi")],
+        };
+        let p = chunk_prompt(&c, "W3BL0RD");
+        assert!(p.starts_with("The agent in this conversation is W3BL0RD. It took place in working directory /repos/W3BL0RD."), "{p}");
+        assert_eq!(
+            first_cwd(r#"{"x":1,"cwd":"/a/b","y":2}"#).as_deref(),
+            Some("/a/b")
+        );
     }
 }

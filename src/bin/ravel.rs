@@ -60,6 +60,9 @@ fn main() -> Result<()> {
             return Ok(());
         }
         ["--help"] | ["-h"] | ["help"] => usage(),
+        // ravel has no flags; `ravel memory --help` must not be read as a
+        // soul id (w3bl0rd, 2026-10-05).
+        args if args.iter().any(|x| x.starts_with('-')) => usage(),
         _ => {}
     }
     let cfg = DaemonConfig::load()?;
