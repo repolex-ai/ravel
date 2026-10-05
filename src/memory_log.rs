@@ -14,7 +14,7 @@
 //! - `dropped.tsv`: memories the number check refused (a number the model
 //!   was never shown), with that number. Audit only.
 
-use crate::memory::{hour_of, hour_to_rfc3339, Node, Tree, Window};
+use crate::memory::{hour_of, hour_to_rfc3339, Node, Rule, Tree, Window};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -179,6 +179,42 @@ pub struct Line {
     pub from: String,
     pub to: String,
     pub text: String,
+    /// True when the line stands in for a summary not written yet, or one
+    /// gone stale: the UI can mark it without matching its text.
+    pub pending: bool,
+    /// Which rule put the line in the view: "age", "present" or "opened".
+    pub rule: &'static str,
+}
+
+/// The wake view within a character budget: the most lines (up to
+/// `max_lines`) whose texts add up to at most `max_chars`. Fewer lines
+/// forces the age rule to coarser windows in the past — a line budget alone
+/// let a bursty history fill 96 lines with 1- to 32-hour pieces and never use
+/// its multi-week summaries (w3bl0rd, 2026-10-05).
+pub fn wake_view_fit(
+    memories: &[Memory],
+    summaries: &HashMap<String, Summary>,
+    now_hour: i64,
+    max_lines: usize,
+    max_chars: usize,
+) -> Vec<Line> {
+    let size = |v: &[Line]| v.iter().map(|l| l.text.chars().count()).sum::<usize>();
+    let (mut lo, mut hi) = (1usize, max_lines.max(1));
+    let mut best = wake_view(memories, summaries, now_hour, lo);
+    if size(&best) > max_chars {
+        return best;
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let v = wake_view(memories, summaries, now_hour, mid);
+        if size(&v) <= max_chars {
+            lo = mid;
+            best = v;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 /// The wake view: the whole history in at most `budget` lines.
@@ -195,9 +231,13 @@ pub fn wake_view(
     budget: usize,
 ) -> Vec<Line> {
     let (tree, by_id) = tree_of(memories);
-    let mut stack: Vec<Node> = tree.cover(now_hour, budget).into_iter().rev().collect();
+    let mut stack: Vec<(Node, Rule)> = tree
+        .cover_ruled(now_hour, budget)
+        .into_iter()
+        .rev()
+        .collect();
     let mut out = Vec::new();
-    while let Some(n) = stack.pop() {
+    while let Some((n, rule)) = stack.pop() {
         match &n {
             Node::Memory(id) => {
                 if let Some(m) = by_id.get(id) {
@@ -207,6 +247,8 @@ pub fn wake_view(
                         from: m.ts.clone(),
                         to: m.ts.clone(),
                         text: m.text.clone(),
+                        pending: false,
+                        rule: rule.tag(),
                     });
                 }
             }
@@ -222,6 +264,8 @@ pub fn wake_view(
                         from: hour_to_rfc3339(w.start()),
                         to: hour_to_rfc3339(w.end()),
                         text: s.text.clone(),
+                        pending: false,
+                        rule: rule.tag(),
                     }),
                     None => {
                         // Open it only while the view stays within budget.
@@ -230,7 +274,7 @@ pub fn wake_view(
                         let kids = tree.children(*w);
                         if out.len() + stack.len() + kids.len() <= budget {
                             for c in kids.into_iter().rev() {
-                                stack.push(c);
+                                stack.push((c, Rule::Opened));
                             }
                             continue;
                         }
@@ -250,6 +294,8 @@ pub fn wake_view(
                             from: hour_to_rfc3339(w.start()),
                             to: hour_to_rfc3339(w.end()),
                             text,
+                            pending: true,
+                            rule: rule.tag(),
                         });
                     }
                 }
@@ -540,5 +586,56 @@ mod budget_tests {
         let v = wake_view(&ms, &HashMap::new(), 50_000, 96);
         assert!(v.len() <= 96, "{} lines", v.len());
         assert!(v.len() > 50);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    /// A bursty history with every summary written: a tight character budget
+    /// must reach coarser windows than the line budget alone would use.
+    #[test]
+    fn a_character_budget_climbs_to_coarser_windows() {
+        // bursts of 6 memories every ~200 hours, 3,000 memories, long texts
+        let ms: Vec<Memory> = (0..3000)
+            .map(|i| Memory {
+                id: format!("m{i}"),
+                ts: hour_to_rfc3339(30_000 + (i / 6) * 200 + (i % 6)),
+                text: "x".repeat(150),
+                turns: vec![format!("t{i}")],
+                model: "t".into(),
+            })
+            .collect();
+        let (tree, by_id) = tree_of(&ms);
+        let now = 30_000 + 500 * 200 + 50;
+        let mut sums: HashMap<String, Summary> = HashMap::new();
+        for w in tree.summary_windows(now) {
+            let d = children_digest(&tree, w, &by_id, &sums).unwrap();
+            sums.insert(
+                w.id(),
+                Summary {
+                    window: w.id(),
+                    digest: d,
+                    text: "y".repeat(150),
+                    model: "t".into(),
+                    written: "x".into(),
+                },
+            );
+        }
+        let wide = wake_view_fit(&ms, &sums, now, 96, usize::MAX);
+        let tight = wake_view_fit(&ms, &sums, now, 96, 3_000);
+        let size = |v: &[Line]| v.iter().map(|l| l.text.chars().count()).sum::<usize>();
+        let top = |v: &[Line]| v.iter().map(|l| l.level).max().unwrap();
+        assert!(size(&tight) <= 3_000, "{}", size(&tight));
+        assert!(tight.len() < wide.len());
+        assert!(
+            top(&tight) > top(&wide),
+            "tight {} vs wide {}",
+            top(&tight),
+            top(&wide)
+        );
+        assert!(tight.iter().all(|l| !l.pending));
+        assert!(tight.iter().any(|l| l.rule == "age"));
     }
 }

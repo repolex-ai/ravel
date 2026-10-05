@@ -11,6 +11,7 @@
 //!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
 //!   GET  /souls/{id}/memory[?lines=N] the memory wake view (default 96 lines)
 //!   GET  /souls/{id}/memory/{node}    one node opened: a window's halves, a memory's turns
+//!   GET  /souls/{id}/memory-progress  turns, turns read, memories, summary windows, pending, done
 //!   POST /souls/{id}/memory/run [{calls}]  a memory pass now, at most `calls` model calls (spends only within memory_budget_usd)
 //!   POST /shutdown                    stop, after answering
 //!
@@ -62,6 +63,7 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .route("/souls/{id}/import", post(import_one))
         .route("/souls/{id}/memory", get(memory_view))
         .route("/souls/{id}/memory/run", post(memory_run))
+        .route("/souls/{id}/memory-progress", get(memory_progress))
         .route("/souls/{id}/memory/{node}", get(memory_open))
         .route("/souls/{id}/health", get(soul_health))
         .route("/souls/{id}/stats", get(soul_stats))
@@ -98,6 +100,8 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
         "souls": d.souls.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         "passes": d.passes.load(std::sync::atomic::Ordering::Relaxed),
         "memory": d.memory_status(),
+        "memory_state": d.memory_state(),
+        "memory_paused_reason": d.memory_refused.lock().ok().and_then(|r| r.clone()),
     }))
 }
 
@@ -195,7 +199,13 @@ async fn import_one(
 #[derive(Deserialize)]
 struct MemoryViewQuery {
     lines: Option<usize>,
+    chars: Option<usize>,
 }
+
+/// The wake view's default size: at most 96 lines and 24,000 characters
+/// (about 6,000 tokens), whichever binds first.
+const VIEW_LINES: usize = 96;
+const VIEW_CHARS: usize = 24_000;
 
 fn now_hour() -> i64 {
     crate::memory::hour_of(&chrono::Utc::now().to_rfc3339()).unwrap_or(i64::MAX)
@@ -207,12 +217,13 @@ async fn memory_view(
     Query(q): Query<MemoryViewQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let soul = d.soul(&id).map_err(not_found)?.clone();
-    let lines = q.lines.unwrap_or(96).max(1);
+    let lines = q.lines.unwrap_or(VIEW_LINES).max(1);
+    let chars = q.chars.unwrap_or(VIEW_CHARS).max(1);
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let ms = log.memories()?;
         let sums = log.summaries()?;
-        let view = crate::memory_log::wake_view(&ms, &sums, now_hour(), lines);
+        let view = crate::memory_log::wake_view_fit(&ms, &sums, now_hour(), lines, chars);
         Ok(json!({ "id": soul.id, "memories": ms.len(), "summaries": sums.len(), "lines": view }))
     })
     .await
@@ -238,11 +249,13 @@ async fn memory_open(
                 .children(w)
                 .into_iter()
                 .map(|c| {
-                    let text = node_text(&c, &by_id, &sums).unwrap_or_else(|| "(not summarized yet — open it)".into());
+                    let found = node_text(&c, &by_id, &sums);
+                    let pending = found.is_none();
+                    let text = found.unwrap_or_else(|| "(not summarized yet — open it)".into());
                     match c {
                         Node::Memory(mid) => {
                             let ts = by_id.get(&mid).map(|m| m.ts.clone()).unwrap_or_default();
-                            Line { id: mid, level: 0, from: ts.clone(), to: ts, text }
+                            Line { id: mid, level: 0, from: ts.clone(), to: ts, text, pending, rule: "opened" }
                         }
                         Node::Window(cw) => Line {
                             id: cw.id(),
@@ -250,6 +263,8 @@ async fn memory_open(
                             from: hour_to_rfc3339(cw.start()),
                             to: hour_to_rfc3339(cw.end()),
                             text,
+                            pending,
+                            rule: "opened",
                         },
                     }
                 })
@@ -278,6 +293,57 @@ async fn memory_open(
     .await
     .map_err(internal)?
     .map_err(not_found)?;
+    Ok(Json(v))
+}
+
+/// How far a soul's memory index has got, for a UI's soul list: whether it
+/// is done, not just how big it is (w3bl0rd, 2026-10-05). `turns` counts
+/// distinct Turn nodes in the store; `turns_read` is turns the extractor has
+/// read; `pending_windows` are summaries missing or stale.
+async fn memory_progress(
+    State(d): State<Shared>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        use crate::memory_log::{children_digest, tree_of, MemoryLog};
+        let log = MemoryLog::for_soul(&soul.path);
+        let ms = log.memories()?;
+        let sums = log.summaries()?;
+        let read = log.extracted()?.len();
+        let (tree, by_id) = tree_of(&ms);
+        let needed = tree.summary_windows(now_hour());
+        let pending = needed
+            .iter()
+            .filter(|w| {
+                let d = children_digest(&tree, **w, &by_id, &sums);
+                sums.get(&w.id()).map(|s| Some(s.digest.as_str()) != d.as_deref()).unwrap_or(true)
+            })
+            .count();
+        let turns = match open_store(&soul) {
+            Ok(store) => graph::query_rows(
+                &store,
+                "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }",
+            )?
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0),
+            Err(_) => 0,
+        };
+        Ok(json!({
+            "id": soul.id,
+            "turns": turns,
+            "turns_read": read,
+            "memories": ms.len(),
+            "summary_windows": needed.len(),
+            "pending_windows": pending,
+            "done": turns > 0 && read as u64 >= turns && pending == 0,
+        }))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
     Ok(Json(v))
 }
 

@@ -302,6 +302,23 @@ impl Daemon {
         )
     }
 
+    /// The memory index's state as one word for a UI: "off", "on" or
+    /// "paused" (an account refusal is standing). No money in it.
+    pub fn memory_state(&self) -> &'static str {
+        if self.cfg.memory_budget_usd <= 0.0 || !crate::memory_extract::key_path().is_file() {
+            "off"
+        } else if self
+            .memory_refused
+            .lock()
+            .map(|r| r.is_some())
+            .unwrap_or(false)
+        {
+            "paused"
+        } else {
+            "on"
+        }
+    }
+
     /// One memory pass over one soul: read new turns and write summaries
     /// (outside the gate — it touches only the soul's memory logs), then
     /// project the logs into the soul's `memory-v1` graph under the gate.

@@ -101,6 +101,27 @@ impl Window {
     }
 }
 
+/// Why a node is in the wake view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    /// Kept whole by the age rule: its span is small next to its age.
+    Age,
+    /// Opened with lines left over after the age rule, nearest the present.
+    Present,
+    /// Shown because the window above it has no current summary yet.
+    Opened,
+}
+
+impl Rule {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Rule::Age => "age",
+            Rule::Present => "present",
+            Rule::Opened => "opened",
+        }
+    }
+}
+
 /// What stands for a span of time in the tree: one memory, or a window node.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Node {
@@ -225,6 +246,15 @@ impl Tree {
     /// `alpha` is found by bisection so the result fits the budget, then any
     /// lines left over are spent opening the newest windows.
     pub fn cover(&self, now_hour: i64, budget: usize) -> Vec<Node> {
+        self.cover_ruled(now_hour, budget)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// [`Tree::cover`], with the rule that put each node in the view: the
+    /// age rule, or the leftover budget spent on the present.
+    pub fn cover_ruled(&self, now_hour: i64, budget: usize) -> Vec<(Node, Rule)> {
         if self.is_empty() || budget == 0 {
             return Vec::new();
         }
@@ -240,18 +270,19 @@ impl Tree {
                 best = c;
             }
         }
+        let mut best: Vec<(Node, Rule)> = best.into_iter().map(|n| (n, Rule::Age)).collect();
         // Spend what is left on the present, where detail is worth most.
         loop {
-            let open = best.iter().rposition(|n| matches!(n, Node::Window(_)));
+            let open = best.iter().rposition(|(n, _)| matches!(n, Node::Window(_)));
             let Some(i) = open else { break };
-            let Node::Window(w) = best[i].clone() else {
+            let Node::Window(w) = best[i].0.clone() else {
                 break;
             };
             let kids = self.children(w);
             if best.len() - 1 + kids.len() > budget {
                 break;
             }
-            best.splice(i..=i, kids);
+            best.splice(i..=i, kids.into_iter().map(|k| (k, Rule::Present)));
         }
         best
     }
