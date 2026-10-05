@@ -103,6 +103,9 @@ pub struct Daemon {
     /// One pass at a time across all souls.
     gate: tokio::sync::Mutex<()>,
     pub shutdown: Notify,
+    /// The last account-level refusal from the model API, shown on /health
+    /// until a pass gets through.
+    pub memory_refused: Mutex<Option<String>>,
 }
 
 pub fn log(msg: impl AsRef<str>) {
@@ -129,6 +132,7 @@ impl Daemon {
             state: Mutex::new(state),
             gate: tokio::sync::Mutex::new(()),
             shutdown: Notify::new(),
+            memory_refused: Mutex::new(None),
         })
     }
 
@@ -335,7 +339,13 @@ pub async fn run_memory_loop(d: Arc<Daemon>) {
         if d.cfg.memory_budget_usd > 0.0 && crate::memory_extract::key_path().is_file() {
             let ids: Vec<String> = d.souls.iter().map(|s| s.id.clone()).collect();
             for id in ids {
-                match d.memory_one(&id, MEMORY_CALLS_PER_PASS).await {
+                let res = d.memory_one(&id, MEMORY_CALLS_PER_PASS).await;
+                let refused = res
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.stopped.clone())
+                    .filter(|s| s.starts_with("the Anthropic account refused"));
+                match res {
                     Ok(r) if r.chunks + r.summaries > 0 || !r.failed.is_empty() || r.stopped.is_some() => log(format!(
                         "{id}: memory read {} chunk(s) → {} memories, {} summaries, {} in / {} out tokens{}{}",
                         r.chunks,
@@ -349,6 +359,17 @@ pub async fn run_memory_loop(d: Arc<Daemon>) {
                     Ok(_) => {}
                     Err(e) => log(format!("{id}: memory pass FAILED — {e:#}")),
                 }
+                // An account-level refusal applies to every soul: stop this
+                // round instead of asking twenty times.
+                if let Some(note) = refused {
+                    *d.memory_refused.lock().unwrap() = Some(format!(
+                        "{} ({})",
+                        note,
+                        Local::now().format("%Y-%m-%d %H:%M")
+                    ));
+                    break;
+                }
+                *d.memory_refused.lock().unwrap() = None;
             }
         }
         tokio::time::sleep(MEMORY_INTERVAL).await;

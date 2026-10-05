@@ -512,6 +512,26 @@ pub fn extract_chunk(llm: &dyn Llm, c: &Chunk) -> Result<(Vec<Memory>, u64, u64)
     Ok((out, i, o))
 }
 
+/// The API refusing because the ACCOUNT is out of allowance (a Console spend
+/// limit, or credits), not because of this request. Every later call would
+/// fail the same way, so the run stops instead of failing chunk after chunk.
+/// Seen 2026-10-05: "You have reached your specified API usage limits. You
+/// will regain access on 2026-11-01 at 00:00 UTC."
+fn is_account_limit(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    m.contains("API usage limits") || m.contains("credit balance is too low")
+}
+
+fn account_limit_note(e: &anyhow::Error) -> String {
+    let m = format!("{e:#}");
+    let detail = m
+        .split("\"message\":\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or("usage limit reached");
+    format!("the Anthropic account refused: {detail}")
+}
+
 // ───────────────────────────── the run ─────────────────────────────
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -586,11 +606,15 @@ pub fn run_soul(
                             Err(e) => r.failed.push(format!("{}: {e:#}", c.conversation)),
                         }
                     }
-                    Err(e) => report
-                        .lock()
-                        .unwrap()
-                        .failed
-                        .push(format!("{} {}: {e:#}", c.source, c.conversation)),
+                    Err(e) => {
+                        let mut r = report.lock().unwrap();
+                        if is_account_limit(&e) {
+                            r.stopped.get_or_insert(account_limit_note(&e));
+                            break;
+                        }
+                        r.failed
+                            .push(format!("{} {}: {e:#}", c.source, c.conversation));
+                    }
                 }
             });
         }
@@ -659,11 +683,14 @@ pub fn run_soul(
                                 Err(e) => r.failed.push(format!("{}: {e:#}", w.id())),
                             }
                         }
-                        Err(e) => report
-                            .lock()
-                            .unwrap()
-                            .failed
-                            .push(format!("{}: {e:#}", w.id())),
+                        Err(e) => {
+                            let mut r = report.lock().unwrap();
+                            if is_account_limit(&e) {
+                                r.stopped.get_or_insert(account_limit_note(&e));
+                                break;
+                            }
+                            r.failed.push(format!("{}: {e:#}", w.id()));
+                        }
                     }
                 });
             }
@@ -793,5 +820,38 @@ mod tests {
         assert!(r.stopped.as_deref().unwrap_or("").contains("budget"));
         assert_eq!((r.chunks, r.memories), (0, 0));
         assert!(!base.join("spend.tsv").exists(), "nothing was charged");
+    }
+
+    struct Refused;
+    impl Llm for Refused {
+        fn model(&self) -> &str {
+            "refused"
+        }
+        fn json(&self, _: &str, _: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+            anyhow::bail!("Messages API 400 Bad Request: {{\"error\":{{\"message\":\"You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.\",\"type\":\"invalid_request_error\"}}}}")
+        }
+    }
+
+    #[test]
+    fn an_account_refusal_stops_the_run_instead_of_failing_every_chunk() {
+        let base = std::env::temp_dir().join("ravel-memory-refused-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("soul");
+        crate::claude_ai::tests::write_fixture(
+            &repo.join(crate::sync::CLAUDE_AI_SUBDIR).join("e"),
+            true,
+        );
+        let ledger = Ledger::open_at(base.join("spend.tsv"), 10.0).unwrap();
+        let r = run_soul(&repo, "test", &Refused, &ledger, 100).unwrap();
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        let stop = r.stopped.unwrap_or_default();
+        assert!(
+            stop.starts_with(
+                "the Anthropic account refused: You have reached your specified API usage limits"
+            ),
+            "{stop}"
+        );
+        // Nothing read is recorded as read: the turns wait for the next pass.
+        assert!(MemoryLog::for_soul(&repo).extracted().unwrap().is_empty());
     }
 }
