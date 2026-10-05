@@ -243,6 +243,12 @@ fn authored(e: &crate::Event) -> String {
         .join("\n")
 }
 
+/// Claude Code's compaction summary arrives as a user turn that opens with
+/// this sentence. It is a model's summary of earlier turns that are already
+/// read on their own: a copy of a copy, never a source (4m41th34's check,
+/// 2026-10-05).
+const COMPACTION_OPENING: &str = "This session is being continued from a previous conversation";
+
 fn to_turns(events: &[crate::Event]) -> Vec<ProseTurn> {
     events
         .iter()
@@ -251,7 +257,14 @@ fn to_turns(events: &[crate::Event]) -> Vec<ProseTurn> {
                 id: e.event_id.clone(),
                 ts: e.timestamp.clone()?,
                 role: e.role.clone(),
-                text: authored(e),
+                text: {
+                    let t = authored(e);
+                    if t.trim_start().starts_with(COMPACTION_OPENING) {
+                        String::new()
+                    } else {
+                        t
+                    }
+                },
             })
         })
         .collect()
@@ -377,6 +390,7 @@ impl Speakers {
     fn relabel_human(&self, text: &str) -> String {
         let t = relabel_channels(text);
         let t = relabel_pastes(&t);
+        let t = mark_quote_backs(&t);
         if t.starts_with("[message from another agent") {
             return t;
         }
@@ -429,6 +443,77 @@ impl Speakers {
         }
         None
     }
+}
+
+/// The first number in `memory` that `source` never shows, if any.
+///
+/// Checked: every run of digits joined by `.,:-/` with at least two digits
+/// (versions, dates, times, amounts), and any number written as a multiple or
+/// a percentage ("4x", "2.5×", "30%"), single digits included. Commas are
+/// ignored on both sides so "1,200" matches "1200". Not checked: lone single
+/// digits, which are everywhere.
+pub fn unseen_number(memory: &str, source: &str) -> Option<String> {
+    let src: String = source.replace(',', "").to_lowercase();
+    let chars: Vec<char> = memory.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit()
+                || (".,:-/".contains(chars[i])
+                    && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())))
+        {
+            i += 1;
+        }
+        let token: String = chars[start..i].iter().collect();
+        let digits = token.chars().filter(|c| c.is_ascii_digit()).count();
+        let suffix = chars.get(i).copied();
+        let multiple = matches!(suffix, Some('x' | '×' | 'X'))
+            && !chars.get(i + 1).is_some_and(|c| c.is_alphanumeric());
+        let percent = suffix == Some('%');
+        let bare = token.replace(',', "");
+        if multiple {
+            let forms = [
+                format!("{bare}x"),
+                format!("{bare}×"),
+                format!("{bare} x"),
+                format!("{bare} times"),
+            ];
+            if !forms.iter().any(|f| src.contains(f.as_str())) {
+                return Some(format!("{token}x"));
+            }
+        } else if percent {
+            if !src.contains(&format!("{bare}%")) && !src.contains(&format!("{bare} percent")) {
+                return Some(format!("{token}%"));
+            }
+        } else if digits >= 2 && !src.contains(&bare) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// The human's habit of quoting earlier words and answering on the same line
+/// (`"…" <- my comment`) made the extractor credit the quoted words, usually
+/// the agent's, to the human (w4r3z's check, 2026-10-05). Mark those lines.
+fn mark_quote_backs(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            let quoted = t.starts_with('"') || t.starts_with('\u{201c}');
+            let reply = t.contains("\" <-") || t.contains("\u{201d} <-") || t.contains("\"<-");
+            if quoted && reply {
+                format!("[the human quoting earlier words, then replying after <-:] {t}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A paste is the human relaying someone else's words, not speaking.
@@ -586,17 +671,19 @@ pub fn pending_chunks(
 
 const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation and write down what is worth remembering about the people and agents in it and their work — the way a colleague's notebook would, not an encyclopedia.
 
-Who is who: 'agent' turns are the AI agent named in the header. 'human' turns are usually the human the agent works for, but a human turn that starts with [message from another agent, NAME:] is a message from that other agent, and a human turn whose text says who sent it ('w3bl0rd here', 'from spaceGOAT') is from that sender. Credit every action, finding and decision to whoever actually did it. Reading or being told something is not doing it.
+Who is who: 'agent' turns are the AI agent named in the header. 'human' turns are usually the human the agent works for, but a human turn that starts with [message from another agent, NAME:] is a message from that other agent, text inside [pasted by the human …] … [end of paste] is someone else's words that the human passed along, and a human turn whose text says who sent it ('w3bl0rd here', 'from spaceGOAT') is from that sender. Credit every action, finding and decision to whoever actually did it. Reading or being told something is not doing it. When someone reports what another person said or decided ('Rob ruled …', 'goodlux said …'), credit the original speaker and name who relayed it; never turn a relay into that person speaking, and keep the ruling's exact direction. Words the human puts in quotation marks, above all a quote followed by '<-' and a comment, are someone else's words (usually the agent's, quoted back); only the comment is the human's. Asking for something is not doing it: if the human asks and the agent does it, the agent did it at the human's request. A question is not a decision; keep who asked whom. No answer is not a refusal. Reading, reviewing or quoting someone else's work (a file, another agent's session) is not authoring it: credit the author.
 
 Keep: what was done, built, changed, shipped or broken; decisions and who made them; results and measurements; problems hit and how they were solved; preferences, rules and corrections given; plans and open questions; people, projects and places.
 
+Keep each claim's status: a guess, hypothesis or proposal stays one ('suspected', 'proposed', 'planned'); only what was tested, shipped or agreed is a fact. If a later turn reverses an earlier decision, keep the final one and say it replaced the earlier.
+
 Do not keep general knowledge an agent explained (what a library is, how a technique works, a list of options) unless someone acted on it — then keep the action and its outcome. Do not keep someone merely asking a question.
 
-Each memory is one line, at most 200 characters, plain past tense. It names who acted and which project, repository or thing it concerns (use the working directory or chat title in the header when the text does not say). Copy names, paths, commands, versions and numbers exactly as written; if a detail is not in the text, leave it out — never fill a gap. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer.
+Each memory is one line, at most 200 characters, plain past tense. It names who acted and which project, repository or thing it concerns (use the working directory or chat title in the header when the text does not say). Copy names, paths, commands, versions, dates and numbers exactly as written. Never compute a number: no ratios, totals, speedups or conversions that the text does not state itself. If a detail is not in the text, leave it out — never fill a gap. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer.
 
 For each memory give the numbers of the turns it rests on.";
 
-const SUMMARY_SYSTEM: &str = "You merge lines from a memory log, oldest first, into ONE line of at most 200 characters that keeps what matters most: the decisions, results and things made, who did them, and the projects they belong to, with their real names and numbers. Never credit one actor with what another did. Never add what the lines do not say. If the lines repeat each other, say it once.";
+const SUMMARY_SYSTEM: &str = "You merge lines from a memory log, oldest first, into ONE line of at most 200 characters that keeps what matters most: the decisions, results and things made, who did them, and the projects they belong to, with their real names and numbers. Keep each actor's own actions; never move an action or ruling from one actor to another, and never chain separate things into a sequence the lines do not state. If a later line reverses an earlier one, keep the later and say it replaced the earlier. A hypothesis or plan stays one. Never add a number or detail the lines do not contain. If lines repeat each other, say it once.";
 
 fn extract_schema() -> Value {
     json!({
@@ -636,8 +723,15 @@ fn chunk_prompt(c: &Chunk, sp: &Speakers) -> String {
     } else {
         format!(" It took place in {}.", c.place)
     };
+    // A soul can sit in more than one seat; say which this one was.
+    let seat = match c.source {
+        "agy" => " The agent was running on Gemini, through Antigravity.",
+        "claude-code" => " The agent was running on Claude, in Claude Code.",
+        "claude.ai" => " The agent was Claude, in the Claude desktop app.",
+        _ => "",
+    };
     let mut s = format!(
-        "The agent in this conversation is {agent}.{place} Source: {} conversation {}. Turns {} to {}.\n\n",
+        "The agent in this conversation is {agent}.{seat}{place} Source: {} conversation {}. Turns {} to {}.\n\n",
         c.source,
         c.conversation,
         c.turns.first().map(|t| t.ts.as_str()).unwrap_or("?"),
@@ -669,20 +763,30 @@ fn memory_id(first_turn: &str, text: &str) -> String {
 }
 
 /// Read one chunk into memories. A chunk with no prose costs nothing.
-pub fn extract_chunk(llm: &dyn Llm, c: &Chunk, sp: &Speakers) -> Result<(Vec<Memory>, u64, u64)> {
+/// Returns the memories kept, the lines dropped by the number check (with
+/// the unseen number), and the token counts.
+pub fn extract_chunk(
+    llm: &dyn Llm,
+    c: &Chunk,
+    sp: &Speakers,
+) -> Result<(Vec<Memory>, Vec<String>, u64, u64)> {
     if c.turns.iter().all(|t| t.text.is_empty()) {
-        return Ok((Vec::new(), 0, 0));
+        return Ok((Vec::new(), Vec::new(), 0, 0));
     }
-    let (v, i, o) = llm.json(
-        EXTRACT_SYSTEM,
-        &chunk_prompt(c, sp),
-        &extract_schema(),
-        4096,
-    )?;
+    let prompt = chunk_prompt(c, sp);
+    let (v, i, o) = llm.json(EXTRACT_SYSTEM, &prompt, &extract_schema(), 4096)?;
     let mut out = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
     for m in v["memories"].as_array().cloned().unwrap_or_default() {
         let text = m["text"].as_str().unwrap_or("").trim().to_string();
         if text.is_empty() {
+            continue;
+        }
+        // A number the model was never shown is a number it made up
+        // (M3RCUR14L's "4x" from 54.8 vs 3.3; w3bl0rd's "1978"). Drop the
+        // memory rather than keep a confident wrong figure.
+        if let Some(n) = unseen_number(&text, &prompt) {
+            dropped.push(format!("{n}: {text}"));
             continue;
         }
         let mut turns: Vec<&ProseTurn> = m["turns"]
@@ -706,7 +810,7 @@ pub fn extract_chunk(llm: &dyn Llm, c: &Chunk, sp: &Speakers) -> Result<(Vec<Mem
             model: llm.model().to_string(),
         });
     }
-    Ok((out, i, o))
+    Ok((out, dropped, i, o))
 }
 
 /// The API refusing because the ACCOUNT is out of allowance (a Console spend
@@ -735,6 +839,8 @@ fn account_limit_note(e: &anyhow::Error) -> String {
 pub struct RunReport {
     pub chunks: usize,
     pub memories: usize,
+    /// Memories thrown away by the number check (see `dropped.tsv`).
+    pub dropped: usize,
     pub summaries: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -792,13 +898,14 @@ pub fn run_soul(
                     }
                 }
                 match extract_chunk(llm, &c, &agent) {
-                    Ok((ms, i, o)) => {
+                    Ok((ms, gone, i, o)) => {
                         let _g = write.lock().unwrap();
                         let ids: Vec<String> = c.turns.iter().map(|t| t.id.clone()).collect();
                         let rec = (|| -> Result<()> {
                             if i + o > 0 {
                                 ledger.record(soul, i, o)?;
                             }
+                            log.append_dropped(&gone)?;
                             log.append_chunk(&ms, &ids)
                         })();
                         let mut r = report.lock().unwrap();
@@ -806,6 +913,7 @@ pub fn run_soul(
                             Ok(()) => {
                                 r.chunks += 1;
                                 r.memories += ms.len();
+                                r.dropped += gone.len();
                                 r.input_tokens += i;
                                 r.output_tokens += o;
                             }
@@ -1091,7 +1199,7 @@ mod tests {
                 peers: vec![],
             },
         );
-        assert!(p.starts_with("The agent in this conversation is W3BL0RD. It took place in working directory /repos/W3BL0RD."), "{p}");
+        assert!(p.starts_with("The agent in this conversation is W3BL0RD. The agent was running on Claude, in Claude Code. It took place in working directory /repos/W3BL0RD."), "{p}");
         assert_eq!(
             first_cwd(r#"{"x":1,"cwd":"/a/b","y":2}"#).as_deref(),
             Some("/a/b")
@@ -1152,5 +1260,71 @@ mod tests {
             !r.contains("<pasted_content") && !r.starts_with("[message from"),
             "the human typed the first line"
         );
+    }
+
+    #[test]
+    fn a_number_the_model_was_never_shown_is_caught() {
+        let src = "[1] agent: 54.8 vs 3.3 images per running hour; samples 22:40-23:55Z on 2026-09-08. Cost 1,200 USD.";
+        // M3RCUR14L's case: a ratio nobody stated
+        assert_eq!(
+            unseen_number("Low priority gave 4x throughput", src).as_deref(),
+            Some("4x")
+        );
+        // w3bl0rd's case: a year nobody said
+        assert_eq!(
+            unseen_number("like the original 1978 prop", src).as_deref(),
+            Some("1978")
+        );
+        // what was said passes, in any comma form
+        assert_eq!(
+            unseen_number(
+                "54.8 vs 3.3 images/hour at 22:40 on 2026-09-08, cost 1200 USD",
+                src
+            ),
+            None
+        );
+        assert_eq!(unseen_number("cost $1,200", src), None);
+        // a lone digit is not checked; a stated multiple passes
+        assert_eq!(unseen_number("ran 3 workers", src), None);
+        assert_eq!(
+            unseen_number("about 16x faster", "[1] it was 16x faster"),
+            None
+        );
+        assert_eq!(
+            unseen_number("cut 30% of cost", src).as_deref(),
+            Some("30%")
+        );
+    }
+
+    #[test]
+    fn a_quote_back_is_marked_as_not_the_humans_words() {
+        let w = squad();
+        let r = w.relabel_human(
+            "\"paid API providers configurable\" <- this will just be a passthrough from iris",
+        );
+        assert!(
+            r.starts_with("[the human quoting earlier words, then replying after <-:] \"paid"),
+            "{r}"
+        );
+        assert_eq!(
+            w.relabel_human("plain words <- no quote"),
+            "plain words <- no quote"
+        );
+    }
+
+    #[test]
+    fn a_compaction_summary_is_never_a_source() {
+        let e = crate::Event {
+            event_id: "c1".into(),
+            parent_id: None,
+            role: "user".into(),
+            timestamp: Some("2026-01-01T00:00:00Z".into()),
+            text: Some("This session is being continued from a previous conversation that ran out of context. Summary: ...".into()),
+            text_provenance: vec![],
+            thinking: None,
+        };
+        let t = to_turns(&[e]);
+        assert_eq!(t.len(), 1, "still marked read");
+        assert!(t[0].text.is_empty(), "but never given to the model");
     }
 }

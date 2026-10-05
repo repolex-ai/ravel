@@ -212,9 +212,22 @@ fn souls(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// `2024-03-07T14:22:10Z` → `2024-03-07 14:22`.
+/// An RFC 3339 instant in this machine's local time: `2024-03-07 06:22`.
+/// Memories are stored in UTC; shown in UTC, a late-evening event lands on
+/// the next day (4m41th34's "conscious on 08-04" was 08-03 local).
 fn short(ts: &str) -> String {
-    ts.get(..16).unwrap_or(ts).replace('T', " ")
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| ts.get(..16).unwrap_or(ts).replace('T', " "))
+}
+
+/// The local date of an RFC 3339 instant.
+fn day(ts: &str) -> String {
+    short(ts).get(..10).unwrap_or("").to_string()
 }
 
 fn print_lines(lines: &[Value]) {
@@ -225,8 +238,8 @@ fn print_lines(lines: &[Value]) {
         } else {
             format!(
                 "{} → {}",
-                l["from"].as_str().unwrap_or("").get(..10).unwrap_or(""),
-                l["to"].as_str().unwrap_or("").get(..10).unwrap_or("")
+                day(l["from"].as_str().unwrap_or("")),
+                day(l["to"].as_str().unwrap_or(""))
             )
         };
         println!(

@@ -11,6 +11,8 @@
 //!   the LAST line for a window wins and the earlier ones stay as history.
 //! - `extracted.tsv`: turn ids already read by the extractor, so each turn is
 //!   read once however many transcript files repeat it.
+//! - `dropped.tsv`: memories the number check refused (a number the model
+//!   was never shown), with that number. Audit only.
 
 use crate::memory::{hour_of, hour_to_rfc3339, Node, Tree, Window};
 use anyhow::{Context, Result};
@@ -93,6 +95,25 @@ impl MemoryLog {
         let mut f = open_append(&self.path("extracted.tsv"))?;
         for t in turn_ids {
             writeln!(f, "{t}")?;
+        }
+        Ok(())
+    }
+
+    /// Memories the number check threw away, one per line with the number it
+    /// could not find: the audit trail for the guard, never read back.
+    pub fn append_dropped(&self, lines: &[String]) -> Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let mut f = open_append(&self.path("dropped.tsv"))?;
+        for l in lines {
+            writeln!(
+                f,
+                "{}\t{}",
+                chrono::Utc::now().to_rfc3339(),
+                l.replace(['\n', '\t'], " ")
+            )?;
         }
         Ok(())
     }
