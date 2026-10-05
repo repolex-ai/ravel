@@ -288,8 +288,16 @@ impl Daemon {
         let spent = crate::memory_extract::Ledger::open(self.cfg.memory_budget_usd)
             .map(|l| l.spent())
             .unwrap_or(0.0);
+        let paused = self
+            .memory_refused
+            .lock()
+            .ok()
+            .and_then(|r| r.clone())
+            .map(|r| format!("; PAUSED — {r}"))
+            .unwrap_or_default();
         format!(
-            "on — ${spent:.2} of ${:.2} spent",
+            "on — ${:.2} of ${:.2} spent{paused}",
+            spent.max(0.0),
             self.cfg.memory_budget_usd
         )
     }
