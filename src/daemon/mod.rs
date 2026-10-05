@@ -306,11 +306,17 @@ impl Daemon {
         let budget = self.cfg.memory_budget_usd;
         let path = soul.path.clone();
         let sid = soul.id.clone();
+        // Every soul this daemon serves, by repo name: who a peer can be.
+        let peers: Vec<String> = self
+            .souls
+            .iter()
+            .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
         let report = if budget > 0.0 && crate::memory_extract::key_path().is_file() {
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let llm = crate::memory_extract::Anthropic::from_key_file()?;
                 let ledger = crate::memory_extract::Ledger::open(budget)?;
-                crate::memory_extract::run_soul(&path, &sid, &llm, &ledger, max_calls)
+                crate::memory_extract::run_soul(&path, &sid, &peers, &llm, &ledger, max_calls)
             })
             .await
             .map_err(|e| anyhow!("memory task panicked: {e}"))??

@@ -354,6 +354,110 @@ pub struct Chunk {
     pub turns: Vec<ProseTurn>,
 }
 
+/// Who can speak in a soul's conversation besides the human: the soul
+/// itself, and its peers (every other soul raveld serves).
+pub struct Speakers {
+    pub agent: String,
+    pub peers: Vec<String>,
+}
+
+fn name_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+impl Speakers {
+    /// A human turn, with what is not the human's own words marked: peer
+    /// messages that arrived through a channel wrapper, pastes the human
+    /// relayed, and peer messages typed straight into the session (herdr
+    /// delivers `agent prompt` as bare input, so only the sender's sign-on
+    /// line says who it is — w3bl0rd, 2026-10-05).
+    fn relabel_human(&self, text: &str) -> String {
+        let t = relabel_channels(text);
+        let t = relabel_pastes(&t);
+        if t.starts_with("[message from another agent") {
+            return t;
+        }
+        match self.typed_sender(&t) {
+            Some(name) => format!("[message from another agent, {name}:]\n{t}"),
+            None => t,
+        }
+    }
+
+    /// The sender named on the first line by the squad's sign-on habits —
+    /// "A — B." (to A, from B), "A → B:" (from A, to B), "X here" — when it is
+    /// a known peer. Leaky by nature, so it fires only on a peer's name.
+    fn typed_sender(&self, text: &str) -> Option<String> {
+        let line: String = text.lines().next()?.chars().take(200).collect();
+        let me = name_key(&self.agent);
+        let known = |cand: &str| -> Option<String> {
+            let k = name_key(cand);
+            if k.is_empty() || k == me {
+                return None;
+            }
+            self.peers.iter().find(|p| name_key(p) == k).cloned()
+        };
+        let words: Vec<&str> = line.split_whitespace().collect();
+        // "X here", "X here (Y)"
+        for (i, w) in words.iter().enumerate() {
+            if name_key(w) == "here" && i > 0 {
+                if let Some(n) = known(words[i - 1]) {
+                    return Some(n);
+                }
+                if let Some(n) = words.get(i + 1).and_then(|p| known(p)) {
+                    return Some(n);
+                }
+            }
+        }
+        // "A → B:" — the sender is A
+        for arrow in ["→", "->"] {
+            if let Some((a, _)) = line.split_once(arrow) {
+                if let Some(n) = a.split_whitespace().last().and_then(known) {
+                    return Some(n);
+                }
+            }
+        }
+        // "A — B." — the sender is B
+        for dash in [" — ", " – "] {
+            if let Some((_, b)) = line.split_once(dash) {
+                if let Some(n) = b.split_whitespace().next().and_then(known) {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// A paste is the human relaying someone else's words, not speaking.
+fn relabel_pastes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let open = rest.find("<pasted_content");
+        let close = rest.find("</pasted_content");
+        let next = match (open, close) {
+            (Some(o), Some(c)) => Some((o.min(c), o < c)),
+            (Some(o), None) => Some((o, true)),
+            (None, Some(c)) => Some((c, false)),
+            (None, None) => None,
+        };
+        let Some((i, opening)) = next else { break };
+        out.push_str(&rest[..i]);
+        let end = rest[i..].find('>').map(|e| i + e + 1).unwrap_or(rest.len());
+        out.push_str(if opening {
+            "[pasted by the human — someone else's words, not the human's own:]"
+        } else {
+            "[end of paste]"
+        });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The first `"cwd":"…"` in a Claude Code transcript.
 fn first_cwd(jsonl: &str) -> Option<String> {
     let i = jsonl.find("\"cwd\":\"")? + 7;
@@ -525,7 +629,8 @@ fn summary_schema() -> Value {
     })
 }
 
-fn chunk_prompt(c: &Chunk, agent: &str) -> String {
+fn chunk_prompt(c: &Chunk, sp: &Speakers) -> String {
+    let agent = &sp.agent;
     let place = if c.place.is_empty() {
         String::new()
     } else {
@@ -547,7 +652,11 @@ fn chunk_prompt(c: &Chunk, agent: &str) -> String {
             "[{}] {who} ({}):\n{}\n\n",
             i + 1,
             t.ts,
-            relabel_channels(&t.text)
+            if t.role == "user" {
+                sp.relabel_human(&t.text)
+            } else {
+                relabel_channels(&t.text)
+            }
         );
     }
     s
@@ -560,13 +669,13 @@ fn memory_id(first_turn: &str, text: &str) -> String {
 }
 
 /// Read one chunk into memories. A chunk with no prose costs nothing.
-pub fn extract_chunk(llm: &dyn Llm, c: &Chunk, agent: &str) -> Result<(Vec<Memory>, u64, u64)> {
+pub fn extract_chunk(llm: &dyn Llm, c: &Chunk, sp: &Speakers) -> Result<(Vec<Memory>, u64, u64)> {
     if c.turns.iter().all(|t| t.text.is_empty()) {
         return Ok((Vec::new(), 0, 0));
     }
     let (v, i, o) = llm.json(
         EXTRACT_SYSTEM,
-        &chunk_prompt(c, agent),
+        &chunk_prompt(c, sp),
         &extract_schema(),
         4096,
     )?;
@@ -640,16 +749,20 @@ pub struct RunReport {
 pub fn run_soul(
     repo: &Path,
     soul: &str,
+    peers: &[String],
     llm: &dyn Llm,
     ledger: &Ledger,
     max_calls: usize,
 ) -> Result<RunReport> {
     let log = MemoryLog::for_soul(repo);
     // The soul's name, as its repo directory spells it: who "agent" is.
-    let agent = repo
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| soul.to_string());
+    let agent = Speakers {
+        agent: repo
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| soul.to_string()),
+        peers: peers.to_vec(),
+    };
     let report = Mutex::new(RunReport::default());
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let take_call = || -> Result<()> {
@@ -885,14 +998,14 @@ mod tests {
         let shelf = repo.join(crate::sync::CLAUDE_AI_SUBDIR).join("export-1");
         crate::claude_ai::tests::write_fixture(&shelf, true);
         let ledger = Ledger::open_at(base.join("spend.tsv"), 10.0).unwrap();
-        let r = run_soul(&repo, "test", &Fake, &ledger, 100).unwrap();
+        let r = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
         assert!(r.failed.is_empty(), "{:?}", r.failed);
         assert_eq!(r.chunks, 2, "two conversations with prose");
         assert_eq!(r.memories, 2, "the memory citing turn 99 is dropped");
         assert!(ledger.spent() > 0.0);
         // A second run finds nothing to do and spends nothing.
         let before = ledger.spent();
-        let r2 = run_soul(&repo, "test", &Fake, &ledger, 100).unwrap();
+        let r2 = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
         assert_eq!((r2.chunks, r2.memories, r2.summaries), (0, 0, 0));
         assert_eq!(ledger.spent(), before);
         // The log reads back.
@@ -911,7 +1024,7 @@ mod tests {
             true,
         );
         let ledger = Ledger::open_at(base.join("spend.tsv"), 0.0).unwrap();
-        let r = run_soul(&repo, "test", &Fake, &ledger, 100).unwrap();
+        let r = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
         assert!(r.stopped.as_deref().unwrap_or("").contains("budget"));
         assert_eq!((r.chunks, r.memories), (0, 0));
         assert!(!base.join("spend.tsv").exists(), "nothing was charged");
@@ -937,7 +1050,7 @@ mod tests {
             true,
         );
         let ledger = Ledger::open_at(base.join("spend.tsv"), 10.0).unwrap();
-        let r = run_soul(&repo, "test", &Refused, &ledger, 100).unwrap();
+        let r = run_soul(&repo, "test", &[], &Refused, &ledger, 100).unwrap();
         assert!(r.failed.is_empty(), "{:?}", r.failed);
         let stop = r.stopped.unwrap_or_default();
         assert!(
@@ -971,11 +1084,73 @@ mod tests {
             place: "working directory /repos/W3BL0RD".into(),
             turns: vec![turn("t1", "2026-01-01T00:00:00Z", "hi")],
         };
-        let p = chunk_prompt(&c, "W3BL0RD");
+        let p = chunk_prompt(
+            &c,
+            &Speakers {
+                agent: "W3BL0RD".into(),
+                peers: vec![],
+            },
+        );
         assert!(p.starts_with("The agent in this conversation is W3BL0RD. It took place in working directory /repos/W3BL0RD."), "{p}");
         assert_eq!(
             first_cwd(r#"{"x":1,"cwd":"/a/b","y":2}"#).as_deref(),
             Some("/a/b")
+        );
+    }
+
+    fn squad() -> Speakers {
+        Speakers {
+            agent: "W3BL0RD".into(),
+            peers: ["spaceGOAT", "W4R3Z", "lUX", "kira", "TR1P.L3X"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_typed_peer_message_is_recognised_by_its_sign_on() {
+        let w = squad();
+        // to w3bl0rd, from w4r3z
+        assert_eq!(
+            w.typed_sender("w3bl0rd — w4r3z. The tab names are wrong."),
+            Some("W4R3Z".into())
+        );
+        // from spacegoat, to w3bl0rd
+        assert_eq!(
+            w.typed_sender("spaceGOAT → w3bl0rd: thanks"),
+            Some("spaceGOAT".into())
+        );
+        assert_eq!(
+            w.typed_sender("Hi W3BL0RD, kira here. Parse status:"),
+            Some("kira".into())
+        );
+        assert_eq!(
+            w.typed_sender("Hi spaceGOAT, Selkie here (lUX). Rob asked"),
+            Some("lUX".into())
+        );
+        // the human, and names that are not peers, stay the human's
+        assert_eq!(w.typed_sender("ok, start"), None);
+        assert_eq!(w.typed_sender("I'm here — let's go"), None);
+        assert_eq!(
+            w.typed_sender("w3bl0rd here"),
+            None,
+            "the agent's own name is not a peer"
+        );
+        assert!(w
+            .relabel_human("w3bl0rd — w4r3z. hi")
+            .starts_with("[message from another agent, W4R3Z:]\n"));
+    }
+
+    #[test]
+    fn a_paste_is_marked_as_someone_elses_words() {
+        let w = squad();
+        let t = "look at this\n\n<pasted_content id=\"5463\">\nw3bl0rd → spaceGOAT: done\n</pasted_content id=\"5463\">\nthoughts?";
+        let r = w.relabel_human(t);
+        assert!(r.contains("[pasted by the human — someone else's words, not the human's own:]\nw3bl0rd → spaceGOAT: done\n[end of paste]"), "{r}");
+        assert!(
+            !r.contains("<pasted_content") && !r.starts_with("[message from"),
+            "the human typed the first line"
         );
     }
 }
