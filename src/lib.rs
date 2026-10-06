@@ -21,6 +21,7 @@ pub mod graph;
 pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;
+pub mod memory_relive;
 pub mod project;
 pub mod reader;
 pub mod soul;

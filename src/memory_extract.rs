@@ -177,7 +177,7 @@ impl Ledger {
         *self.spent.lock().unwrap()
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let s = self.spent();
         if s >= self.budget {
             anyhow::bail!(
@@ -188,7 +188,7 @@ impl Ledger {
         Ok(())
     }
 
-    fn record(&self, soul: &str, input: u64, output: u64) -> Result<()> {
+    pub(crate) fn record(&self, soul: &str, input: u64, output: u64) -> Result<()> {
         use std::io::Write;
         let usd = input as f64 / 1e6 * PRICE_IN + output as f64 / 1e6 * PRICE_OUT;
         let mut spent = self.spent.lock().unwrap();
@@ -387,7 +387,7 @@ impl Speakers {
     /// relayed, and peer messages typed straight into the session (herdr
     /// delivers `agent prompt` as bare input, so only the sender's sign-on
     /// line says who it is — w3bl0rd, 2026-10-05).
-    fn relabel_human(&self, text: &str) -> String {
+    pub(crate) fn relabel_human(&self, text: &str) -> String {
         let t = relabel_channels(text);
         let t = relabel_pastes(&t);
         let t = mark_quote_backs(&t);
@@ -554,7 +554,7 @@ fn first_cwd(jsonl: &str) -> Option<String> {
 /// `<channel source=… from_cwd=… …>`. Read raw, they look like the human
 /// speaking, and the model credits the reader with what a peer said
 /// (w3bl0rd's accuracy check, 2026-10-05). Name the sender instead.
-fn relabel_channels(text: &str) -> String {
+pub(crate) fn relabel_channels(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find("<channel ") {
@@ -597,7 +597,7 @@ fn relabel_channels(text: &str) -> String {
     out.replace("</channel>", "")
 }
 
-fn clip(s: &str) -> String {
+pub(crate) fn clip(s: &str) -> String {
     if s.len() <= TURN_CHARS {
         return s.to_string();
     }
@@ -707,7 +707,7 @@ fn extract_schema() -> Value {
     })
 }
 
-fn summary_schema() -> Value {
+pub(crate) fn summary_schema() -> Value {
     json!({
         "type": "object",
         "properties": {"text": {"type": "string"}},
@@ -818,12 +818,12 @@ pub fn extract_chunk(
 /// fail the same way, so the run stops instead of failing chunk after chunk.
 /// Seen 2026-10-05: "You have reached your specified API usage limits. You
 /// will regain access on 2026-11-01 at 00:00 UTC."
-fn is_account_limit(e: &anyhow::Error) -> bool {
+pub(crate) fn is_account_limit(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}");
     m.contains("API usage limits") || m.contains("credit balance is too low")
 }
 
-fn account_limit_note(e: &anyhow::Error) -> String {
+pub(crate) fn account_limit_note(e: &anyhow::Error) -> String {
     let m = format!("{e:#}");
     let detail = m
         .split("\"message\":\"")

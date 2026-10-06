@@ -57,6 +57,12 @@ impl MemoryLog {
         }
     }
 
+    /// A log in any directory: a relive test writes beside the soul, never
+    /// into its `.ravel/`.
+    pub fn at(dir: PathBuf) -> Self {
+        MemoryLog { dir }
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
