@@ -2,16 +2,17 @@
 //! the test bench for the relive backfill, run by hand before any full run.
 //!
 //!   ravel-relive plan <soul-repo> <from> <to>
-//!   ravel-relive run  <soul-repo> <from> <to> <out-dir> <max-usd> [max-calls]
+//!   ravel-relive run  <soul-repo> <from> <to> <out-dir> <backend> [max-calls] [minimal]
 //!
 //! `from` and `to` are RFC 3339 prefixes compared as strings ("2026-06-01").
-//! `max-usd` is what this run may add to the spend ledger; nothing is called
-//! once it is reached.
+//! `backend` is `sub:<model>` (Claude Code on the subscription, e.g.
+//! `sub:haiku`, or `sub:haiku+think` to keep extended thinking on) or `api:<max-usd>` (Haiku on the API key; `max-usd` is what
+//! this run may add to the spend ledger).
 
 use anyhow::{bail, Result};
-use ravel::memory_extract::{Anthropic, Ledger, Speakers};
+use ravel::memory_extract::{Anthropic, ClaudeCode, Ledger, Llm, Speakers};
 use ravel::memory_log::MemoryLog;
-use ravel::memory_relive::{plan, relive};
+use ravel::memory_relive::{plan, relive, Prompt};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -22,20 +23,36 @@ fn main() -> Result<()> {
             let (turns, stretches, chars) = plan(&PathBuf::from(repo), from, to)?;
             println!("{turns} turns with prose, {stretches} stretches, {chars} characters");
         }
-        ["run", repo, from, to, out, usd, rest @ ..] => {
+        ["run", repo, from, to, out, backend, rest @ ..] => {
             let repo = PathBuf::from(repo);
-            let max_usd: f64 = usd.parse()?;
-            let max_calls: usize = match rest {
-                [] => usize::MAX,
-                [n] => n.parse()?,
-                _ => bail!("too many arguments"),
-            };
-            let out = PathBuf::from(out);
-            if out.components().any(|c| c.as_os_str() == ".ravel") {
-                bail!("{} is inside a .ravel directory; write test output elsewhere", out.display());
+            // Optional, in any order: a call cap (a number) and `minimal`.
+            let mut max_calls = usize::MAX;
+            let mut style = Prompt::Full;
+            for x in rest {
+                match *x {
+                    "minimal" => style = Prompt::Minimal,
+                    n => max_calls = n.parse()?,
+                }
             }
-            let spent = Ledger::open(f64::MAX)?.spent();
-            let ledger = Ledger::open(spent + max_usd)?;
+            let out = PathBuf::from(out);
+            std::fs::create_dir_all(&out)?;
+            let (llm, ledger): (Box<dyn Llm>, Ledger) = match backend.split_once(':') {
+                Some(("sub", spec)) => (
+                    // sub:haiku (no thinking) or sub:haiku+think
+                    Box::new(ClaudeCode::new(
+                        spec.trim_end_matches("+think"),
+                        spec.ends_with("+think"),
+                    )?),
+                    // Subscription calls are not API spend: count them beside
+                    // the output, never in the API ledger.
+                    Ledger::open_at(out.join("usage.tsv"), f64::MAX)?,
+                ),
+                Some(("api", usd)) => {
+                    let spent = Ledger::open(f64::MAX)?.spent();
+                    (Box::new(Anthropic::from_key_file()?), Ledger::open(spent + usd.parse::<f64>()?)?)
+                }
+                _ => bail!("backend is sub:<model> or api:<max-usd>"),
+            };
             let agent = repo
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -52,15 +69,12 @@ fn main() -> Result<()> {
                 .filter(|n| *n != agent && !n.starts_with('.'))
                 .collect();
             let sp = Speakers { agent: agent.clone(), peers };
-            let llm = Anthropic::from_key_file()?;
             let log = MemoryLog::at(out);
-            let r = relive(&repo, &agent, &sp, &llm, &ledger, &log, from, to, max_calls)?;
-            let usd = r.input_tokens as f64 / 1e6 + r.output_tokens as f64 * 5.0 / 1e6;
+            let r = relive(&repo, &agent, &sp, llm.as_ref(), &ledger, &log, from, to, max_calls, style)?;
             println!("{}", serde_json::to_string_pretty(&r)?);
-            println!("cost ${usd:.2}");
         }
         _ => bail!(
-            "usage:\n  ravel-relive plan <soul-repo> <from> <to>\n  ravel-relive run <soul-repo> <from> <to> <out-dir> <max-usd> [max-calls]"
+            "usage:\n  ravel-relive plan <soul-repo> <from> <to>\n  ravel-relive run <soul-repo> <from> <to> <out-dir> <sub:model or api:max-usd> [max-calls] [minimal]"
         ),
     }
     Ok(())

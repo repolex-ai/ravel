@@ -85,6 +85,133 @@ impl Anthropic {
     }
 }
 
+/// Claude through Claude Code's print mode, on the user's subscription: no
+/// API key, nothing billed per call (goodlux, 2026-10-06: the memory index
+/// must run on a subscription; the API key is only for spending credits).
+///
+/// Each call is one `claude -p` with no tools, no MCP servers, no settings
+/// (so no hooks), no skills and no saved session — a saved session would be
+/// a transcript ravel reads back in. `ANTHROPIC_API_KEY` is removed from the
+/// child's environment so it can never fall through to API billing, and it
+/// runs in an empty directory so no project's CLAUDE.md is picked up.
+pub struct ClaudeCode {
+    model: String,
+    /// Claude Code turns extended thinking on by default: sharper notes, but
+    /// about a minute and thousands of tokens per call (measured 2026-10-06).
+    think: bool,
+    dir: PathBuf,
+}
+
+impl ClaudeCode {
+    pub fn new(model: &str, think: bool) -> Result<Self> {
+        let dir = std::env::temp_dir().join("ravel-claude-code");
+        std::fs::create_dir_all(&dir)?;
+        Ok(ClaudeCode {
+            model: model.to_string(),
+            think,
+            dir,
+        })
+    }
+}
+
+impl Llm for ClaudeCode {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+        _max_tokens: u32,
+    ) -> Result<(Value, u64, u64)> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("claude");
+        if !self.think {
+            cmd.env("MAX_THINKING_TOKENS", "0");
+        }
+        let mut child = cmd
+            .current_dir(&self.dir)
+            .env_remove("ANTHROPIC_API_KEY")
+            .args(["-p", "--model", &self.model, "--system-prompt", system])
+            .args([
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+            ])
+            .args(["--disable-slash-commands", "--no-session-persistence"])
+            .args([
+                "--output-format",
+                "json",
+                "--json-schema",
+                &schema.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("run claude (Claude Code) — is it installed and logged in?")?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin for claude"))?
+            .write_all(user.as_bytes())?;
+        let out = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: Value = serde_json::from_str(&stdout).with_context(|| {
+            format!(
+                "claude -p printed no JSON (exit {}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            )
+        })?;
+        let r = match &v {
+            Value::Array(a) => a.last().cloned().unwrap_or_default(),
+            other => other.clone(),
+        };
+        if r["is_error"].as_bool().unwrap_or(true) {
+            anyhow::bail!(
+                "claude -p failed: {}",
+                r["result"]
+                    .as_str()
+                    .unwrap_or(&r.to_string())
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            );
+        }
+        // The session's opening record says which credential it used.
+        let key_source = match &v {
+            Value::Array(a) => a
+                .iter()
+                .find(|m| m["subtype"] == "init")
+                .and_then(|m| m["apiKeySource"].as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
+        if key_source != "none" {
+            anyhow::bail!("claude -p used an API key, not the subscription; stopping");
+        }
+        let so = r
+            .get("structured_output")
+            .cloned()
+            .ok_or_else(|| anyhow!("claude -p returned no structured output"))?;
+        let u = &r["usage"];
+        let input = u["input_tokens"].as_u64().unwrap_or(0)
+            + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
+            + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        Ok((so, input, u["output_tokens"].as_u64().unwrap_or(0)))
+    }
+}
+
 impl Llm for Anthropic {
     fn model(&self) -> &str {
         MODEL

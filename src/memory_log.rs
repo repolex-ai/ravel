@@ -21,7 +21,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const MEMORY_SUBDIR: &str = ".ravel/_ignore/memory";
+/// Where a soul's memory lives: written by the relive backfill and, going
+/// forward, by the soul's own notes. (`.ravel/_ignore/memory/` holds the
+/// first, outside-extractor backfill of 2026-10-04, kept until goodlux
+/// decides its fate; nothing reads it.)
+pub const MEMORY_SUBDIR: &str = ".ravel/_ignore/memory-relive";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Memory {
@@ -329,6 +333,11 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
     let dt = |s: &str| format!("{}^^<http://www.w3.org/2001/XMLSchema#dateTime>", lit(s));
     let int = |n: u8| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
     let ty = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    // One link property for every edge, as everywhere in Subtexture
+    // (goodlux, 2026-10-06): a memory to the turns it rests on, a summary to
+    // the nodes it compresses. What an edge means is read off its target: a
+    // Turn is the source, a Memory one level down is a child.
+    let related = "<https://repolex.ai/ontology/git-lex/relatedToId>";
     let mut nt = String::new();
     for m in memories {
         let s = iri(&m.id);
@@ -340,7 +349,7 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
         nt += &format!("{s} {} {} .\n", p("windowEnd"), dt(&m.ts));
         nt += &format!("{s} {} {} .\n", p("memoryModel"), lit(&m.model));
         for t in &m.turns {
-            nt += &format!("{s} {} <{RAVEL_BASE}Turn/{t}> .\n", p("fromTurn"));
+            nt += &format!("{s} {related} <{RAVEL_BASE}Turn/{t}> .\n");
         }
     }
     for (wid, sm) in summaries {
@@ -371,7 +380,7 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
                 Node::Memory(id) => id,
                 Node::Window(cw) => cw.id(),
             };
-            nt += &format!("{s} {} {} .\n", p("summarizes"), iri(&cid));
+            nt += &format!("{s} {related} {} .\n", iri(&cid));
         }
     }
     let _ = by_id;
@@ -406,7 +415,13 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Vec<T>> {
     if !p.exists() {
         return Ok(Vec::new());
     }
-    let s = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+    let mut s = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+    // A writer appends whole lines; a last line with no newline yet is one
+    // being written right now (the relive backfill writes while raveld
+    // reads). Leave it for the next read.
+    if !s.ends_with('\n') {
+        s.truncate(s.rfind('\n').map_or(0, |i| i + 1));
+    }
     let mut out = Vec::new();
     for (i, line) in s.lines().enumerate() {
         if line.trim().is_empty() {
@@ -562,8 +577,8 @@ mod tests {
             },
         );
         let nt = project_nt(&ms, &sums);
-        assert!(nt.contains("<https://repolex.ai/ravel/Memory/a> <https://repolex.ai/ontology/ravel/fromTurn> <https://repolex.ai/ravel/Turn/t-a> ."));
-        assert!(nt.contains(&format!("<https://repolex.ai/ravel/Memory/{}> <https://repolex.ai/ontology/ravel/summarizes> <https://repolex.ai/ravel/Memory/b> .", w.id())));
+        assert!(nt.contains("<https://repolex.ai/ravel/Memory/a> <https://repolex.ai/ontology/git-lex/relatedToId> <https://repolex.ai/ravel/Turn/t-a> ."));
+        assert!(nt.contains(&format!("<https://repolex.ai/ravel/Memory/{}> <https://repolex.ai/ontology/git-lex/relatedToId> <https://repolex.ai/ravel/Memory/b> .", w.id())));
         // It loads.
         let store = oxigraph::store::Store::new().unwrap();
         store

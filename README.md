@@ -131,8 +131,8 @@ ravel memory run 50           # the same, at most 50 model calls
 
 ### How it works
 
-1. **Turn extraction**: Every ten minutes, `raveld` inspects new turns in the soul's transcripts. It extracts only authored prose from the human and the agent (skipping tool output and scratchpads), taking each turn once. A model writes concise, one-line past-tense facts (decisions, commands, errors, versions, results), each referencing the turn IDs it rests on (`ravel:fromTurn`).
-2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours counted from 2020-01-01T00:00:00Z. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`ravel:summarizes`).
+1. **Turn extraction**: Every ten minutes, `raveld` inspects new turns in the soul's transcripts. It extracts only authored prose from the human and the agent (skipping tool output and scratchpads), taking each turn once. A model writes concise, one-line past-tense facts (decisions, commands, errors, versions, results), each referencing the turn IDs it rests on (`git-lex:relatedToId`).
+2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours counted from 2020-01-01T00:00:00Z. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`git-lex:relatedToId`).
 Because windows align to absolute time boundaries, backfilling historical transcripts only invalidates and re-summarizes the specific windows the imported turns land in, leaving the rest of the tree untouched.
 
 ### Cost controls and setup
@@ -223,7 +223,7 @@ properties the kit checker would otherwise call errors.
 
 The store partitions data into named graphs under `https://repolex.ai/ravel/NamedGraph/`:
 - **Transcripts**: Each transcript has its own named graph (`<…/NamedGraph/<transcript_id>>`) containing `ravel:Turn` nodes linked by `ravel:parentTurn`.
-- **Memory index**: The memory index projects into `<https://repolex.ai/ravel/NamedGraph/memory-v1>`. Memory nodes are `ravel:Memory`, carrying `ravel:memoryId`, `ravel:memoryLevel`, `ravel:memoryText`, `ravel:windowStart`, and `ravel:windowEnd`. Level-0 memories link to their source turns with `ravel:fromTurn`; window summaries link to child nodes with `ravel:summarizes`.
+- **Memory index**: The memory index projects into `<https://repolex.ai/ravel/NamedGraph/memory-v1>`. Memory nodes are `ravel:Memory`, carrying `ravel:memoryId`, `ravel:memoryLevel`, `ravel:memoryText`, `ravel:windowStart`, and `ravel:windowEnd`. Every link is `git-lex:relatedToId`: a level-0 memory to each source turn, a window summary to each child node. What a link means is read off its target (a `ravel:Turn` is the source; a `ravel:Memory` one level down is a child).
 
 ## Health
 

@@ -28,12 +28,42 @@ use std::path::Path;
 /// OptMem's size for one memory or one merged line.
 pub const NOTE_BYTES: usize = 280;
 /// Prose shown per step. Small enough that "now" stays close to every turn.
-const STRETCH_CHARS: usize = 12_000;
+const STRETCH_CHARS: usize = 24_000;
 /// The wake view shown each step: the same limits `ravel memory` prints with.
 const WAKE_LINES: usize = 96;
 const WAKE_CHARS: usize = 24_000;
 /// How much of SOUL.md is shown as "who you are".
 const SOUL_CHARS: usize = 6_000;
+
+/// Which instructions the reader gets. `Minimal` is OptMem's words plus only
+/// what reliving needs (who you are, which turns are yours, turn numbers for
+/// the graph links); `Full` adds the patches written for Haiku's round-1
+/// mistakes. goodlux, 2026-10-06: keep it simple — the test decides whether
+/// the patches earn their place.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Prompt {
+    Full,
+    Minimal,
+}
+
+fn minimal_note_system(agent: &str) -> String {
+    format!(
+        "You are {agent}. You are reliving your own past in order, one stretch at a time, as if it were happening now. Each time you are shown who you are, your memory as it stood at that moment, and what happens next. Turns marked 'you' are yours. Turns marked 'human' are your human's, except text marked as a message from another agent or as pasted, which is someone else's words. Turns from before you had your name are still your past.
+
+Note something whenever you learn something new, or something worth keeping happens. That covers a task worth real effort, a fact or insight the user teaches you, anything you learn about their life (even indirectly), any event of lasting effect.
+
+Do not register redundant memories.
+
+Each note is 1 line, max {NOTE_BYTES} bytes. For each note give the numbers of the turns it rests on."
+    )
+}
+
+/// OptMem's `nap_prompt`, word for word, without its block ids.
+fn minimal_merge_system() -> String {
+    format!(
+        "Compress memories into one line of at most {NOTE_BYTES} bytes.\nKeep what has lasting effect, drop what does not. Invent nothing."
+    )
+}
 
 fn note_system(agent: &str) -> String {
     format!(
@@ -41,9 +71,9 @@ fn note_system(agent: &str) -> String {
 
 Your memory works like this. Note something whenever you learn something new, or something worth keeping happens. That covers a task worth real effort, a fact or insight the user teaches you, anything you learn about their life (even indirectly), any event of lasting effect. Do not register redundant memories: if your memory already holds it, do not note it again.
 
-Each note is one line of at most {NOTE_BYTES} bytes. Write as yourself: 'I' is you, {agent}; name everyone else. Turns marked 'you' are yours. Turns marked 'human' are your human's, except text marked as a message from another agent or as pasted, which is someone else's words. Credit what happened to whoever did it. A guess or a plan stays one. Copy names, paths and numbers exactly; invent nothing. Turns from before you had your name, such as old Claude desktop chats, are still your past: note them the same way. Most stretches need no note or one; none is a fine answer.
+Each note is one line of at most {NOTE_BYTES} bytes. Write as yourself: 'I' is you, {agent}; name everyone else. Turns marked 'you' are yours. Turns marked 'human' are your human's, except text marked as a message from another agent or as pasted, which is someone else's words. Credit what happened to whoever did it. A guess or a plan stays one. Copy names, paths and numbers exactly; invent nothing. Turns from before you had your name, such as old Claude desktop chats, are still your past: note them the same way. Do not note general knowledge someone only explained, unless it changed what you did. Never mention turn numbers in a note. Most stretches need no note or one; none is a fine answer.
 
-For each note give the numbers of the turns it rests on."
+For each note, first check your memory above: set already_in_memory to true if it already holds this, even in other words or inside a summary. Notes your memory already holds are thrown away. Then give the numbers of the turns the note rests on."
     )
 }
 
@@ -53,7 +83,47 @@ fn merge_system(agent: &str) -> String {
     )
 }
 
-fn note_schema() -> Value {
+/// OptMem refuses a line over the limit and asks again ("Too long: N bytes,
+/// limit 280. Compress it further."). Two asks; then the line is refused.
+/// Returns the line that fits, or `None`, with the tokens spent.
+fn fit(llm: &dyn Llm, merge: &str, text: String) -> Result<(Option<String>, u64, u64)> {
+    let (mut cur, mut i, mut o) = (text, 0, 0);
+    for _ in 0..2 {
+        if cur.len() <= NOTE_BYTES {
+            return Ok((Some(cur), i, o));
+        }
+        let ask = format!(
+            "Too long: {} bytes, limit {NOTE_BYTES}. Compress it further.\n\n{cur}",
+            cur.len()
+        );
+        let (v, a, b) = llm.json(merge, &ask, &summary_schema(), 1024)?;
+        i += a;
+        o += b;
+        cur = v["text"].as_str().unwrap_or("").trim().to_string();
+    }
+    Ok(((cur.len() <= NOTE_BYTES).then_some(cur), i, o))
+}
+
+/// One model call, tried up to four times with a growing pause: a rate limit
+/// or a dropped connection should wait, not end a soul's run. An account
+/// refusal ends it at once.
+fn call(llm: &dyn Llm, system: &str, user: &str, schema: &Value) -> Result<(Value, u64, u64)> {
+    let mut wait = 30;
+    for attempt in 1.. {
+        match llm.json(system, user, schema, 4096) {
+            Ok(x) => return Ok(x),
+            Err(e) if is_account_limit(&e) => anyhow::bail!(account_limit_note(&e)),
+            Err(e) if attempt >= 4 => return Err(e),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                wait *= 2;
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn minimal_note_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -66,6 +136,29 @@ fn note_schema() -> Value {
                         "turns": {"type": "array", "items": {"type": "integer"}}
                     },
                     "required": ["text", "turns"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["notes"],
+        "additionalProperties": false
+    })
+}
+
+fn note_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "notes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "already_in_memory": {"type": "boolean"},
+                        "turns": {"type": "array", "items": {"type": "integer"}}
+                    },
+                    "required": ["text", "already_in_memory", "turns"],
                     "additionalProperties": false
                 }
             }
@@ -207,6 +300,8 @@ pub struct ReliveReport {
     pub notes: usize,
     pub dropped: usize,
     pub merges: usize,
+    /// Lines sent back once or twice for being over the byte limit.
+    pub shortened: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub failed: Vec<String>,
@@ -240,7 +335,20 @@ pub fn relive(
     from: &str,
     to: &str,
     max_calls: usize,
+    style: Prompt,
 ) -> Result<ReliveReport> {
+    let (note_sys, merge_sys, schema) = match style {
+        Prompt::Full => (
+            note_system(&sp.agent),
+            merge_system(&sp.agent),
+            note_schema(),
+        ),
+        Prompt::Minimal => (
+            minimal_note_system(&sp.agent),
+            minimal_merge_system(),
+            minimal_note_schema(),
+        ),
+    };
     let mut r = ReliveReport::default();
     let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
         .unwrap_or_default()
@@ -279,16 +387,13 @@ pub fn relive(
         if !take_call(&mut r) {
             return Ok(r);
         }
-        let (v, i, o) = match llm.json(&note_system(&sp.agent), &prompt, &note_schema(), 2048) {
+        // A stretch is never skipped: memory is built in order, so a gap
+        // read later would land behind memories that came after it.
+        let (v, i, o) = match call(llm, &note_sys, &prompt, &schema) {
             Ok(x) => x,
-            Err(e) if is_account_limit(&e) => {
-                r.stopped = Some(account_limit_note(&e));
-                return Ok(r);
-            }
             Err(e) => {
-                r.failed
-                    .push(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
-                continue;
+                r.stopped = Some(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
+                return Ok(r);
             }
         };
         ledger.record(soul, i, o)?;
@@ -301,10 +406,29 @@ pub fn relive(
             if text.is_empty() {
                 continue;
             }
-            if let Some(num) = unseen_number(&text, &prompt) {
+            if n["already_in_memory"].as_bool().unwrap_or(false) {
+                dropped.push(format!("already in memory: {text}"));
+                continue;
+            }
+            if let Some(num) = (style == Prompt::Full)
+                .then(|| unseen_number(&text, &prompt))
+                .flatten()
+            {
                 dropped.push(format!("{num}: {text}"));
                 continue;
             }
+            let long = text.clone();
+            let (fitted, a, b) = fit(llm, &merge_sys, text)?;
+            if a + b > 0 {
+                ledger.record(soul, a, b)?;
+                r.input_tokens += a;
+                r.output_tokens += b;
+                r.shortened += 1;
+            }
+            let Some(text) = fitted else {
+                dropped.push(format!("too long after two asks: {long}"));
+                continue;
+            };
             let mut cited: Vec<&ProseTurn> = n["turns"]
                 .as_array()
                 .cloned()
@@ -354,29 +478,38 @@ pub fn relive(
             if !take_call(&mut r) {
                 return Ok(r);
             }
-            let (v, i, o) = match llm.json(
-                &merge_system(&sp.agent),
-                &lines.join("\n"),
-                &summary_schema(),
-                1024,
-            ) {
+            let (v, i, o) = match call(llm, &merge_sys, &lines.join("\n"), &summary_schema()) {
                 Ok(x) => x,
-                Err(e) if is_account_limit(&e) => {
-                    r.stopped = Some(account_limit_note(&e));
-                    return Ok(r);
-                }
                 Err(e) => {
-                    r.failed.push(format!("{}: {e:#}", w.id()));
-                    continue;
+                    r.stopped = Some(format!("{}: {e:#}", w.id()));
+                    return Ok(r);
                 }
             };
             ledger.record(soul, i, o)?;
             r.input_tokens += i;
             r.output_tokens += o;
+            let (fitted, a, b) = fit(
+                llm,
+                &merge_sys,
+                v["text"].as_str().unwrap_or("").trim().to_string(),
+            )?;
+            if a + b > 0 {
+                ledger.record(soul, a, b)?;
+                r.input_tokens += a;
+                r.output_tokens += b;
+                r.shortened += 1;
+            }
+            let Some(text) = fitted else {
+                r.failed.push(format!(
+                    "{}: merge still over {NOTE_BYTES} bytes after two asks",
+                    w.id()
+                ));
+                continue;
+            };
             let sm = Summary {
                 window: w.id(),
                 digest: d,
-                text: v["text"].as_str().unwrap_or("").trim().to_string(),
+                text,
                 model: llm.model().to_string(),
                 written: chrono::Utc::now().to_rfc3339(),
             };
@@ -456,7 +589,7 @@ mod tests {
             "fake"
         }
         fn json(&self, system: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
-            if system.contains("compressing") {
+            if system.contains("ompress") {
                 return Ok((
                     json!({"text": format!("merged {} lines", user.lines().count())}),
                     1,
@@ -469,7 +602,7 @@ mod tests {
                 .filter(|l| l.starts_with('[') && l.contains("] 20"))
                 .count();
             let notes: Vec<Value> = (1..=n)
-                .map(|k| json!({"text": format!("I noted turn {k}"), "turns": [k]}))
+                .map(|k| json!({"text": format!("I noted turn {k}"), "already_in_memory": false, "turns": [k]}))
                 .collect();
             Ok((json!({ "notes": notes }), 1, 1))
         }
@@ -482,10 +615,9 @@ mod tests {
         let repo = base.join("soul");
         let mirror = repo.join(crate::sync::TRANSCRIPTS_SUBDIR).join("p");
         std::fs::create_dir_all(&mirror).unwrap();
-        // Turns clipped to about 4,000 characters, so the first two (hour 10)
-        // share a stretch and the third (hour 11) gets its own. Hour 10's two
-        // notes make it a node; it is still open after the first stretch and
-        // must be merged once the 11:30 turn has been read.
+        // Turns clipped to about 4,000 characters, so all three fit one
+        // stretch. Hour 10's two notes make it a node, and it has closed by
+        // the time the 11:30 turn is read: it is merged before reading on.
         let big = "z".repeat(10_000);
         let rec = |uuid: &str, parent: &str, ts: &str| {
             json!({"type":"user","uuid":uuid,"parentUuid":parent,"timestamp":ts,"sessionId":"s",
@@ -508,8 +640,20 @@ mod tests {
             agent: "soul".into(),
             peers: vec![],
         };
-        let r = relive(&repo, "s", &sp, &Fake, &ledger, &log, "2026", "2027", 100).unwrap();
-        assert_eq!(r.stretches, 2, "{r:?}");
+        let r = relive(
+            &repo,
+            "s",
+            &sp,
+            &Fake,
+            &ledger,
+            &log,
+            "2026",
+            "2027",
+            100,
+            Prompt::Full,
+        )
+        .unwrap();
+        assert_eq!(r.stretches, 1, "{r:?}");
         assert_eq!(r.notes, 3);
         // Hour 10 holds two notes, so it is a node, and it closed once the
         // 11:30 turn was read.
