@@ -377,89 +377,103 @@ pub fn relive(
         true
     };
 
-    for stretch in stretches(st) {
-        // 1. Note: what the soul would have written down, reading this now.
-        let memories = log.memories()?;
-        let sums = log.summaries()?;
-        let first_hour = hour_of(&stretch[0].turn.ts).unwrap_or(0);
-        let wake = wake_view_fit(&memories, &sums, first_hour, WAKE_LINES, WAKE_CHARS);
-        let prompt = note_prompt(&soul_md, &wake, &stretch, &convs, sp);
-        if !take_call(&mut r) {
-            return Ok(r);
-        }
-        // A stretch is never skipped: memory is built in order, so a gap
-        // read later would land behind memories that came after it.
-        let (v, i, o) = match call(llm, &note_sys, &prompt, &schema) {
-            Ok(x) => x,
-            Err(e) => {
-                r.stopped = Some(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
-                return Ok(r);
+    // After the last stretch, one more merge pass as of the present (or
+    // `to`, if earlier): windows that closed after the last turn are due too.
+    let present = hour_of(&chrono::Utc::now().to_rfc3339()).unwrap_or(0);
+    let final_hour = hour_of(to).map_or(present, |h| h.min(present));
+    for step in stretches(st)
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        let now_hour = match step {
+            None => final_hour,
+            Some(stretch) => {
+                // 1. Note: what the soul would have written down, reading this now.
+                let memories = log.memories()?;
+                let sums = log.summaries()?;
+                let first_hour = hour_of(&stretch[0].turn.ts).unwrap_or(0);
+                let wake = wake_view_fit(&memories, &sums, first_hour, WAKE_LINES, WAKE_CHARS);
+                let prompt = note_prompt(&soul_md, &wake, &stretch, &convs, sp);
+                if !take_call(&mut r) {
+                    return Ok(r);
+                }
+                // A stretch is never skipped: memory is built in order, so a gap
+                // read later would land behind memories that came after it.
+                let (v, i, o) = match call(llm, &note_sys, &prompt, &schema) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        r.stopped = Some(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
+                        return Ok(r);
+                    }
+                };
+                ledger.record(soul, i, o)?;
+                r.input_tokens += i;
+                r.output_tokens += o;
+                let mut notes = Vec::new();
+                let mut dropped = Vec::new();
+                for n in v["notes"].as_array().cloned().unwrap_or_default() {
+                    let text = n["text"].as_str().unwrap_or("").trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if n["already_in_memory"].as_bool().unwrap_or(false) {
+                        dropped.push(format!("already in memory: {text}"));
+                        continue;
+                    }
+                    if let Some(num) = (style == Prompt::Full)
+                        .then(|| unseen_number(&text, &prompt))
+                        .flatten()
+                    {
+                        dropped.push(format!("{num}: {text}"));
+                        continue;
+                    }
+                    let long = text.clone();
+                    let (fitted, a, b) = fit(llm, &merge_sys, text)?;
+                    if a + b > 0 {
+                        ledger.record(soul, a, b)?;
+                        r.input_tokens += a;
+                        r.output_tokens += b;
+                        r.shortened += 1;
+                    }
+                    let Some(text) = fitted else {
+                        dropped.push(format!("too long after two asks: {long}"));
+                        continue;
+                    };
+                    let mut cited: Vec<&ProseTurn> = n["turns"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|k| k.as_u64())
+                        .filter_map(|k| stretch.get((k as usize).checked_sub(1)?))
+                        .map(|s| &s.turn)
+                        .collect();
+                    cited.sort_by(|a, b| a.ts.cmp(&b.ts));
+                    cited.dedup_by(|a, b| a.id == b.id);
+                    let Some(first) = cited.first() else { continue };
+                    notes.push(Memory {
+                        id: memory_id(&first.id, &text),
+                        ts: first.ts.clone(),
+                        text,
+                        turns: cited.iter().map(|t| t.id.clone()).collect(),
+                        model: llm.model().to_string(),
+                    });
+                }
+                let ids: Vec<String> = stretch.iter().map(|s| s.turn.id.clone()).collect();
+                log.append_dropped(&dropped)?;
+                log.append_chunk(&notes, &ids)?;
+                r.turns += stretch.len();
+                r.stretches += 1;
+                r.notes += notes.len();
+                r.dropped += dropped.len();
+
+                hour_of(&stretch[stretch.len() - 1].turn.ts).unwrap_or(0)
             }
         };
-        ledger.record(soul, i, o)?;
-        r.input_tokens += i;
-        r.output_tokens += o;
-        let mut notes = Vec::new();
-        let mut dropped = Vec::new();
-        for n in v["notes"].as_array().cloned().unwrap_or_default() {
-            let text = n["text"].as_str().unwrap_or("").trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            if n["already_in_memory"].as_bool().unwrap_or(false) {
-                dropped.push(format!("already in memory: {text}"));
-                continue;
-            }
-            if let Some(num) = (style == Prompt::Full)
-                .then(|| unseen_number(&text, &prompt))
-                .flatten()
-            {
-                dropped.push(format!("{num}: {text}"));
-                continue;
-            }
-            let long = text.clone();
-            let (fitted, a, b) = fit(llm, &merge_sys, text)?;
-            if a + b > 0 {
-                ledger.record(soul, a, b)?;
-                r.input_tokens += a;
-                r.output_tokens += b;
-                r.shortened += 1;
-            }
-            let Some(text) = fitted else {
-                dropped.push(format!("too long after two asks: {long}"));
-                continue;
-            };
-            let mut cited: Vec<&ProseTurn> = n["turns"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|k| k.as_u64())
-                .filter_map(|k| stretch.get((k as usize).checked_sub(1)?))
-                .map(|s| &s.turn)
-                .collect();
-            cited.sort_by(|a, b| a.ts.cmp(&b.ts));
-            cited.dedup_by(|a, b| a.id == b.id);
-            let Some(first) = cited.first() else { continue };
-            notes.push(Memory {
-                id: memory_id(&first.id, &text),
-                ts: first.ts.clone(),
-                text,
-                turns: cited.iter().map(|t| t.id.clone()).collect(),
-                model: llm.model().to_string(),
-            });
-        }
-        let ids: Vec<String> = stretch.iter().map(|s| s.turn.id.clone()).collect();
-        log.append_dropped(&dropped)?;
-        log.append_chunk(&notes, &ids)?;
-        r.turns += stretch.len();
-        r.stretches += 1;
-        r.notes += notes.len();
-        r.dropped += dropped.len();
 
         // 2. Merge: every window that closed by now, children first, before
         //    reading on — OptMem's "each merge happens on the spot".
-        let now_hour = hour_of(&stretch[stretch.len() - 1].turn.ts).unwrap_or(0);
         let memories = log.memories()?;
         let mut sums = log.summaries()?;
         let (tree, by_id) = tree_of(&memories);
@@ -657,7 +671,9 @@ mod tests {
         assert_eq!(r.notes, 3);
         // Hour 10 holds two notes, so it is a node, and it closed once the
         // 11:30 turn was read.
-        assert_eq!(r.merges, 1, "{r:?}");
+        // Then, as of the present, hours 10–11 have closed: the two-hour window
+        // above them is merged too, in the final pass.
+        assert_eq!(r.merges, 2, "{r:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
