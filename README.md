@@ -101,7 +101,7 @@ older export imported after a newer one never rolls a conversation back.
 ## The memory
 
 A soul's memory is [OptMem](https://github.com/VictorTaelin/OptMem), exactly,
-as a graph:
+as a graph. The full guide is [docs/2026_10_13_MEMORY.md](docs/2026_10_13_MEMORY.md).
 
 - **Notes.** One line each, at most 280 bytes. The soul notes something
   whenever it learns something new, or something worth keeping happens. That
