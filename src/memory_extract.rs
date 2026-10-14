@@ -1,23 +1,19 @@
-//! Writing the memory index: transcripts → one-line memories → summaries.
+//! What the memory reader reads, and the model it asks.
 //!
-//! Reads a soul's mirrors through the same adapters the graph uses (Claude
-//! Code, Antigravity, claude.ai), keeps only AUTHORED prose (no tool output,
-//! no thinking), takes each distinct turn once, and hands consecutive turns of
-//! one conversation to a model in chunks. Then writes every window summary the
-//! tree needs, bottom-up. All results go to the append-only logs in
-//! `memory_log`; the graph is projected from those.
+//! - The reader: a soul's mirrors through the same adapters the graph uses
+//!   (Claude Code, Antigravity, claude.ai), AUTHORED prose only (no tool
+//!   output, no thinking), each turn labelled with who spoke it.
+//! - The model: Claude Code on the subscription ([`ClaudeCode`]), or the API
+//!   with a key file ([`Anthropic`]), behind one [`Llm`] trait.
 //!
-//! **Money.** Every model call is priced and appended to
-//! `~/.config/ravel/memory-spend.tsv` before the next one starts, and no call
-//! is made once that ledger reaches `memory_budget_usd` from config.yml. With
-//! no budget, or no key file, nothing here calls a model.
+//! **Money.** Every API call is priced and appended to a ledger before the
+//! next one starts, and no call is made once it reaches its budget.
+//! Subscription calls are counted in the run's own `usage.tsv`.
 
-use crate::memory::{hour_of, Node, Window};
-use crate::memory_log::{children_digest, node_text, tree_of, Memory, MemoryLog, Summary};
 use crate::SourceKind;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -28,14 +24,8 @@ pub const MODEL: &str = "claude-haiku-4-5";
 pub const PRICE_IN: f64 = 1.0;
 pub const PRICE_OUT: f64 = 5.0;
 
-/// Characters of prose per chunk, and the most any one turn contributes.
-const CHUNK_CHARS: usize = 16_000;
+/// The most of one turn a reader is shown: longer turns keep head and tail.
 const TURN_CHARS: usize = 4_000;
-/// A turn younger than this is left for a later pass: its conversation may
-/// still be going, and a chunk cut mid-thought makes worse memories.
-const SETTLE_SECS: i64 = 30 * 60;
-/// Parallel model calls.
-const WORKERS: usize = 6;
 
 // ───────────────────────────── the model ─────────────────────────────
 
@@ -50,6 +40,15 @@ pub trait Llm: Sync {
         schema: &Value,
         max_tokens: u32,
     ) -> Result<(Value, u64, u64)>;
+
+    /// For a model that keeps a session across calls: the tokens its
+    /// context held at the last call. 0 for one-shot calls.
+    fn context_tokens(&self) -> u64 {
+        0
+    }
+
+    /// Start the next call in a fresh session. A no-op for one-shot calls.
+    fn reset(&self) {}
 }
 
 /// Claude over the Messages API, raw HTTP (ravel is Rust; there is no
@@ -100,6 +99,15 @@ pub struct ClaudeCode {
     /// about a minute and thousands of tokens per call (measured 2026-10-06).
     think: bool,
     dir: PathBuf,
+    /// Session mode: every call continues one Claude Code session, the way
+    /// the soul lived it, until [`Llm::reset`]. `None`: one-shot calls.
+    session: Option<std::sync::Mutex<Sess>>,
+}
+
+#[derive(Default)]
+struct Sess {
+    id: Option<String>,
+    context: u64,
 }
 
 impl ClaudeCode {
@@ -110,8 +118,35 @@ impl ClaudeCode {
             model: model.to_string(),
             think,
             dir,
+            session: None,
         })
     }
+
+    /// A reader that keeps one session across calls.
+    pub fn in_session(mut self) -> Self {
+        self.session = Some(std::sync::Mutex::new(Sess::default()));
+        self
+    }
+}
+
+/// A fresh v4-shaped UUID, from the clock and a counter (no uuid crate).
+fn new_uuid() -> String {
+    use sha2::{Digest, Sha256};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let h = format!("{:x}", Sha256::digest(format!("{t}-{n}-{}", std::process::id())));
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        &h[17..20],
+        &h[20..32]
+    )
 }
 
 impl Llm for ClaudeCode {
@@ -128,6 +163,18 @@ impl Llm for ClaudeCode {
     ) -> Result<(Value, u64, u64)> {
         use std::io::Write;
         use std::process::{Command, Stdio};
+        // Session mode: the first call opens a session, later ones resume it.
+        let session_arg = self.session.as_ref().map(|m| {
+            let mut s = m.lock().unwrap();
+            match &s.id {
+                Some(id) => ("--resume", id.clone()),
+                None => {
+                    let id = new_uuid();
+                    s.id = Some(id.clone());
+                    ("--session-id", id)
+                }
+            }
+        });
         let mut cmd = Command::new("claude");
         if !self.think {
             cmd.env("MAX_THINKING_TOKENS", "0");
@@ -143,7 +190,11 @@ impl Llm for ClaudeCode {
                 "--setting-sources",
                 "",
             ])
-            .args(["--disable-slash-commands", "--no-session-persistence"])
+            .arg("--disable-slash-commands")
+            .args(match &session_arg {
+                Some((flag, id)) => vec![flag.to_string(), id.clone()],
+                None => vec!["--no-session-persistence".to_string()],
+            })
             .args([
                 "--output-format",
                 "json",
@@ -208,7 +259,35 @@ impl Llm for ClaudeCode {
         let input = u["input_tokens"].as_u64().unwrap_or(0)
             + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
             + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        Ok((so, input, u["output_tokens"].as_u64().unwrap_or(0)))
+        let output = u["output_tokens"].as_u64().unwrap_or(0);
+        if let Some(m) = &self.session {
+            m.lock().unwrap().context = input + output;
+        }
+        Ok((so, input, output))
+    }
+
+    fn context_tokens(&self) -> u64 {
+        self.session.as_ref().map_or(0, |m| m.lock().unwrap().context)
+    }
+
+    /// Close the session: the next call opens a new one. The closed
+    /// session's file is deleted — it is a reading aid, not a transcript of
+    /// anyone's life, and must never be mirrored back in.
+    fn reset(&self) {
+        let Some(m) = &self.session else { return };
+        let mut s = m.lock().unwrap();
+        if let Some(id) = s.id.take() {
+            if let Some(home) = std::env::var_os("HOME") {
+                let projects = PathBuf::from(home).join(".claude/projects");
+                for e in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+                    let f = e.path().join(format!("{id}.jsonl"));
+                    if f.is_file() && e.file_name().to_string_lossy().contains("ravel-claude-code") {
+                        let _ = std::fs::remove_file(f);
+                    }
+                }
+            }
+        }
+        s.context = 0;
     }
 }
 
@@ -340,8 +419,13 @@ impl Ledger {
 pub struct ProseTurn {
     pub id: String,
     pub ts: String,
+    /// "user" (the human's side of the session) or "assistant" (the soul),
+    /// whatever the harness calls them.
     pub role: String,
     pub text: String,
+    /// The peer soul that sent this user turn, when the sender's own
+    /// transcript shows the send (see `peers`).
+    pub peer: Option<crate::peers::Sent>,
 }
 
 /// A conversation's turns in order, from one source.
@@ -376,22 +460,113 @@ fn authored(e: &crate::Event) -> String {
 /// 2026-10-05).
 const COMPACTION_OPENING: &str = "This session is being continued from a previous conversation";
 
-fn to_turns(events: &[crate::Event]) -> Vec<ProseTurn> {
+/// Harness records that arrive as user turns but are no one's words: slash
+/// commands and their output, background-task and system notices, skill
+/// bodies, fork and workflow prompts, interruption markers. Matched on how
+/// the turn starts (counted over W4R3Z, spaceGOAT and lUX, 2026-10-13).
+const HARNESS_OPENINGS: &[&str] = &[
+    "<task-notification",
+    "<command-name",
+    "<command-message",
+    "<command-args",
+    "<local-command-stdout",
+    "<local-command-stderr",
+    "<local-command-caveat",
+    "Caveat: The messages below were generated by the user while running local commands",
+    "<system-reminder",
+    "<bash-stdout",
+    "<bash-stderr",
+    "<fork-boilerplate",
+    "[Workflow harness",
+    "[SYSTEM NOTIFICATION",
+    "[Request interrupted by user",
+    "Base directory for this skill",
+    "[earlier conversation truncated",
+    "[Usage limit approaching",
+];
+
+/// A user turn's own words, or empty when it is harness noise. `<bash-input>`
+/// is the human running a shell command: kept, said plainly. A slash command
+/// alone on its line (`/compact`) is the harness's.
+fn human_words(t: &str) -> String {
+    let t = strip_reminders(t);
+    let s = t.trim_start();
+    if HARNESS_OPENINGS.iter().any(|o| s.starts_with(o)) {
+        return String::new();
+    }
+    if let Some(cmd) = s
+        .strip_prefix("<bash-input>")
+        .and_then(|r| r.split("</bash-input>").next())
+    {
+        return format!("(ran in the shell) {}", cmd.trim());
+    }
+    if s.starts_with('/') && !s.contains(char::is_whitespace) {
+        return String::new();
+    }
+    t
+}
+
+/// Text with every `<system-reminder>…</system-reminder>` block removed:
+/// the harness's notes riding inside a human turn.
+fn strip_reminders(t: &str) -> String {
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(i) = rest.find("<system-reminder>") {
+        out += &rest[..i];
+        match rest[i..].find("</system-reminder>") {
+            Some(j) => rest = &rest[i + j + "</system-reminder>".len()..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    out += rest;
+    out
+}
+
+/// An Antigravity USER_INPUT's own words: the `<USER_REQUEST>` body. The
+/// `<ADDITIONAL_METADATA>` (local time) and `<USER_SETTINGS_CHANGE>` (model
+/// switch) blocks around it are the harness's.
+fn agy_request(t: &str) -> String {
+    match t.split_once("<USER_REQUEST>") {
+        Some((_, rest)) => rest
+            .split("</USER_REQUEST>")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        None => t.trim().to_string(),
+    }
+}
+
+fn to_turns(events: &[crate::Event], source: &str) -> Vec<ProseTurn> {
     events
         .iter()
         .filter_map(|e| {
+            // One vocabulary for both harnesses. Antigravity says
+            // USER_EXPLICIT / MODEL / SYSTEM; its SYSTEM records are task
+            // results, scheduled-task firings and compaction checkpoints,
+            // never anyone's words (4RX, 2026-10-13: read as the soul's own
+            // turns, they made its Gemini session look like a stranger).
+            let role = match (source, e.role.as_str()) {
+                ("agy", "USER_EXPLICIT") => "user",
+                ("agy", "MODEL") => "assistant",
+                ("agy", _) => return None,
+                (_, r) => r,
+            };
+            let mut t = authored(e);
+            if t.trim_start().starts_with(COMPACTION_OPENING) {
+                t.clear();
+            }
+            if role == "user" {
+                t = if source == "agy" { agy_request(&t) } else { human_words(&t) };
+            }
             Some(ProseTurn {
                 id: e.event_id.clone(),
                 ts: e.timestamp.clone()?,
-                role: e.role.clone(),
-                text: {
-                    let t = authored(e);
-                    if t.trim_start().starts_with(COMPACTION_OPENING) {
-                        String::new()
-                    } else {
-                        t
-                    }
-                },
+                role: role.to_string(),
+                text: t,
+                peer: None,
             })
         })
         .collect()
@@ -403,6 +578,12 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
     let cc = repo.join(crate::sync::TRANSCRIPTS_SUBDIR);
     if cc.is_dir() {
         for p in crate::sync::walk_jsonl(&cc) {
+            // A subagent's or workflow's transcript is not the soul's own
+            // life. OptMem: a subagent must never write memory — its notes
+            // would arrive duplicated and wrong.
+            if p.components().any(|c| c.as_os_str() == "subagents") {
+                continue;
+            }
             let Ok(s) = std::fs::read_to_string(&p) else {
                 continue;
             };
@@ -421,7 +602,7 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
                 source: "claude-code",
                 id,
                 place,
-                turns: to_turns(&ev),
+                turns: to_turns(&ev, "claude-code"),
             });
         }
     }
@@ -447,7 +628,7 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
                 source: "agy",
                 id,
                 place: String::new(),
-                turns: to_turns(&parsed.events),
+                turns: to_turns(&parsed.events, "agy"),
             });
         }
     }
@@ -478,20 +659,11 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
                 source: "claude.ai",
                 id,
                 place,
-                turns: to_turns(&crate::claude_ai::conversation_events(&c)),
+                turns: to_turns(&crate::claude_ai::conversation_events(&c), "claude.ai"),
             });
         }
     }
     Ok(out)
-}
-
-/// A run of consecutive turns from one conversation, to be read in one call.
-#[derive(Debug, Clone)]
-pub struct Chunk {
-    pub source: &'static str,
-    pub conversation: String,
-    pub place: String,
-    pub turns: Vec<ProseTurn>,
 }
 
 /// Who can speak in a soul's conversation besides the human: the soul
@@ -499,6 +671,8 @@ pub struct Chunk {
 pub struct Speakers {
     pub agent: String,
     pub peers: Vec<String>,
+    /// The human, by name ("Rob"), or "human" when the config names none.
+    pub human: String,
 }
 
 fn name_key(s: &str) -> String {
@@ -570,58 +744,6 @@ impl Speakers {
         }
         None
     }
-}
-
-/// The first number in `memory` that `source` never shows, if any.
-///
-/// Checked: every run of digits joined by `.,:-/` with at least two digits
-/// (versions, dates, times, amounts), and any number written as a multiple or
-/// a percentage ("4x", "2.5×", "30%"), single digits included. Commas are
-/// ignored on both sides so "1,200" matches "1200". Not checked: lone single
-/// digits, which are everywhere.
-pub fn unseen_number(memory: &str, source: &str) -> Option<String> {
-    let src: String = source.replace(',', "").to_lowercase();
-    let chars: Vec<char> = memory.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if !chars[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < chars.len()
-            && (chars[i].is_ascii_digit()
-                || (".,:-/".contains(chars[i])
-                    && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())))
-        {
-            i += 1;
-        }
-        let token: String = chars[start..i].iter().collect();
-        let digits = token.chars().filter(|c| c.is_ascii_digit()).count();
-        let suffix = chars.get(i).copied();
-        let multiple = matches!(suffix, Some('x' | '×' | 'X'))
-            && !chars.get(i + 1).is_some_and(|c| c.is_alphanumeric());
-        let percent = suffix == Some('%');
-        let bare = token.replace(',', "");
-        if multiple {
-            let forms = [
-                format!("{bare}x"),
-                format!("{bare}×"),
-                format!("{bare} x"),
-                format!("{bare} times"),
-            ];
-            if !forms.iter().any(|f| src.contains(f.as_str())) {
-                return Some(format!("{token}x"));
-            }
-        } else if percent {
-            if !src.contains(&format!("{bare}%")) && !src.contains(&format!("{bare} percent")) {
-                return Some(format!("{token}%"));
-            }
-        } else if digits >= 2 && !src.contains(&bare) {
-            return Some(token);
-        }
-    }
-    None
 }
 
 /// The human's habit of quoting earlier words and answering on the same line
@@ -739,101 +861,6 @@ pub(crate) fn clip(s: &str) -> String {
     format!("{} […] {}", &s[..head], &s[tail..])
 }
 
-/// Chunks of turns not yet read. Each distinct turn id appears once across
-/// all chunks (transcript files repeat history; #17). Turns younger than
-/// [`SETTLE_SECS`] are held back.
-pub fn pending_chunks(
-    convs: &[Conversation],
-    done: &HashSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Vec<Chunk> {
-    let mut claimed: HashSet<&str> = HashSet::new();
-    let mut chunks = Vec::new();
-    let mut ordered: Vec<&Conversation> = convs.iter().collect();
-    ordered.sort_by(|a, b| {
-        (a.turns.first().map(|t| t.ts.as_str()), &a.id)
-            .cmp(&(b.turns.first().map(|t| t.ts.as_str()), &b.id))
-    });
-    for c in ordered {
-        let mut cur: Vec<ProseTurn> = Vec::new();
-        let mut chars = 0usize;
-        for t in &c.turns {
-            if done.contains(&t.id) || !claimed.insert(t.id.as_str()) {
-                continue;
-            }
-            let settled = chrono::DateTime::parse_from_rfc3339(&t.ts)
-                .map(|ts| (now - ts.with_timezone(&chrono::Utc)).num_seconds() >= SETTLE_SECS)
-                .unwrap_or(false);
-            if !settled {
-                claimed.remove(t.id.as_str());
-                break; // nothing after an unsettled turn is settled either
-            }
-            let mut t = t.clone();
-            t.text = clip(t.text.trim());
-            if chars + t.text.len() > CHUNK_CHARS && !cur.is_empty() {
-                chunks.push(Chunk {
-                    source: c.source,
-                    conversation: c.id.clone(),
-                    place: c.place.clone(),
-                    turns: std::mem::take(&mut cur),
-                });
-                chars = 0;
-            }
-            chars += t.text.len();
-            cur.push(t);
-        }
-        if !cur.is_empty() {
-            chunks.push(Chunk {
-                source: c.source,
-                conversation: c.id.clone(),
-                place: c.place.clone(),
-                turns: cur,
-            });
-        }
-    }
-    chunks
-}
-
-// ───────────────────────────── prompts ─────────────────────────────
-
-const EXTRACT_SYSTEM: &str = "You read a stretch of a conversation and write down what is worth remembering about the people and agents in it and their work — the way a colleague's notebook would, not an encyclopedia.
-
-Who is who: 'agent' turns are the AI agent named in the header. 'human' turns are usually the human the agent works for, but a human turn that starts with [message from another agent, NAME:] is a message from that other agent, text inside [pasted by the human …] … [end of paste] is someone else's words that the human passed along, and a human turn whose text says who sent it ('w3bl0rd here', 'from spaceGOAT') is from that sender. Credit every action, finding and decision to whoever actually did it. Reading or being told something is not doing it. When someone reports what another person said or decided ('Rob ruled …', 'goodlux said …'), credit the original speaker and name who relayed it; never turn a relay into that person speaking, and keep the ruling's exact direction. Words the human puts in quotation marks, above all a quote followed by '<-' and a comment, are someone else's words (usually the agent's, quoted back); only the comment is the human's. Asking for something is not doing it: if the human asks and the agent does it, the agent did it at the human's request. A question is not a decision; keep who asked whom. No answer is not a refusal. Reading, reviewing or quoting someone else's work (a file, another agent's session) is not authoring it: credit the author.
-
-Keep: what was done, built, changed, shipped or broken; decisions and who made them; results and measurements; problems hit and how they were solved; preferences, rules and corrections given; plans and open questions; people, projects and places.
-
-Keep each claim's status: a guess, hypothesis or proposal stays one ('suspected', 'proposed', 'planned'); only what was tested, shipped or agreed is a fact. If a later turn reverses an earlier decision, keep the final one and say it replaced the earlier.
-
-Do not keep general knowledge an agent explained (what a library is, how a technique works, a list of options) unless someone acted on it — then keep the action and its outcome. Do not keep someone merely asking a question.
-
-Each memory is one line, at most 200 characters, plain past tense. It names who acted and which project, repository or thing it concerns (use the working directory or chat title in the header when the text does not say). Copy names, paths, commands, versions, dates and numbers exactly as written. Never compute a number: no ratios, totals, speedups or conversions that the text does not state itself. If a detail is not in the text, leave it out — never fill a gap. Fold small steps toward one result into one memory. Most stretches yield zero to four memories; zero is a fine answer.
-
-For each memory give the numbers of the turns it rests on.";
-
-const SUMMARY_SYSTEM: &str = "You merge lines from a memory log, oldest first, into ONE line of at most 200 characters that keeps what matters most: the decisions, results and things made, who did them, and the projects they belong to, with their real names and numbers. Keep each actor's own actions; never move an action or ruling from one actor to another, and never chain separate things into a sequence the lines do not state. If a later line reverses an earlier one, keep the later and say it replaced the earlier. A hypothesis or plan stays one. Never add a number or detail the lines do not contain. If lines repeat each other, say it once.";
-
-fn extract_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "memories": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "turns": {"type": "array", "items": {"type": "integer"}}
-                    },
-                    "required": ["text", "turns"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "required": ["memories"],
-        "additionalProperties": false
-    })
-}
-
 pub(crate) fn summary_schema() -> Value {
     json!({
         "type": "object",
@@ -841,103 +868,6 @@ pub(crate) fn summary_schema() -> Value {
         "required": ["text"],
         "additionalProperties": false
     })
-}
-
-fn chunk_prompt(c: &Chunk, sp: &Speakers) -> String {
-    let agent = &sp.agent;
-    let place = if c.place.is_empty() {
-        String::new()
-    } else {
-        format!(" It took place in {}.", c.place)
-    };
-    // A soul can sit in more than one seat; say which this one was.
-    let seat = match c.source {
-        "agy" => " The agent was running on Gemini, through Antigravity.",
-        "claude-code" => " The agent was running on Claude, in Claude Code.",
-        "claude.ai" => " The agent was Claude, in the Claude desktop app.",
-        _ => "",
-    };
-    let mut s = format!(
-        "The agent in this conversation is {agent}.{seat}{place} Source: {} conversation {}. Turns {} to {}.\n\n",
-        c.source,
-        c.conversation,
-        c.turns.first().map(|t| t.ts.as_str()).unwrap_or("?"),
-        c.turns.last().map(|t| t.ts.as_str()).unwrap_or("?")
-    );
-    for (i, t) in c.turns.iter().enumerate() {
-        if t.text.is_empty() {
-            continue;
-        }
-        let who = if t.role == "user" { "human" } else { "agent" };
-        s += &format!(
-            "[{}] {who} ({}):\n{}\n\n",
-            i + 1,
-            t.ts,
-            if t.role == "user" {
-                sp.relabel_human(&t.text)
-            } else {
-                relabel_channels(&t.text)
-            }
-        );
-    }
-    s
-}
-
-fn memory_id(first_turn: &str, text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let h = Sha256::digest(format!("{first_turn}\u{0}{text}").as_bytes());
-    format!("m{}", &format!("{h:x}")[..15])
-}
-
-/// Read one chunk into memories. A chunk with no prose costs nothing.
-/// Returns the memories kept, the lines dropped by the number check (with
-/// the unseen number), and the token counts.
-pub fn extract_chunk(
-    llm: &dyn Llm,
-    c: &Chunk,
-    sp: &Speakers,
-) -> Result<(Vec<Memory>, Vec<String>, u64, u64)> {
-    if c.turns.iter().all(|t| t.text.is_empty()) {
-        return Ok((Vec::new(), Vec::new(), 0, 0));
-    }
-    let prompt = chunk_prompt(c, sp);
-    let (v, i, o) = llm.json(EXTRACT_SYSTEM, &prompt, &extract_schema(), 4096)?;
-    let mut out = Vec::new();
-    let mut dropped: Vec<String> = Vec::new();
-    for m in v["memories"].as_array().cloned().unwrap_or_default() {
-        let text = m["text"].as_str().unwrap_or("").trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        // A number the model was never shown is a number it made up
-        // (M3RCUR14L's "4x" from 54.8 vs 3.3; w3bl0rd's "1978"). Drop the
-        // memory rather than keep a confident wrong figure.
-        if let Some(n) = unseen_number(&text, &prompt) {
-            dropped.push(format!("{n}: {text}"));
-            continue;
-        }
-        let mut turns: Vec<&ProseTurn> = m["turns"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|n| n.as_u64())
-            .filter_map(|n| c.turns.get((n as usize).checked_sub(1)?))
-            .collect();
-        turns.sort_by(|a, b| a.ts.cmp(&b.ts));
-        turns.dedup_by(|a, b| a.id == b.id);
-        // A memory that cites no real turn cannot be followed back; drop it
-        // rather than pin it on a guess.
-        let Some(first) = turns.first() else { continue };
-        out.push(Memory {
-            id: memory_id(&first.id, &text),
-            ts: first.ts.clone(),
-            text,
-            turns: turns.iter().map(|t| t.id.clone()).collect(),
-            model: llm.model().to_string(),
-        });
-    }
-    Ok((out, dropped, i, o))
 }
 
 /// The API refusing because the ACCOUNT is out of allowance (a Console spend
@@ -960,220 +890,9 @@ pub(crate) fn account_limit_note(e: &anyhow::Error) -> String {
     format!("the Anthropic account refused: {detail}")
 }
 
-// ───────────────────────────── the run ─────────────────────────────
-
-#[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct RunReport {
-    pub chunks: usize,
-    pub memories: usize,
-    /// Memories thrown away by the number check (see `dropped.tsv`).
-    pub dropped: usize,
-    pub summaries: usize,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub failed: Vec<String>,
-    /// Set when the run stopped early (budget, or `max_calls`).
-    pub stopped: Option<String>,
-}
-
-/// Bring one soul's memory index up to date: read pending turns, then write
-/// every summary that is missing or stale. `max_calls` bounds one run so a
-/// backfill proceeds in steps instead of one unbounded job.
-pub fn run_soul(
-    repo: &Path,
-    soul: &str,
-    peers: &[String],
-    llm: &dyn Llm,
-    ledger: &Ledger,
-    max_calls: usize,
-) -> Result<RunReport> {
-    let log = MemoryLog::for_soul(repo);
-    // The soul's name, as its repo directory spells it: who "agent" is.
-    let agent = Speakers {
-        agent: repo
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| soul.to_string()),
-        peers: peers.to_vec(),
-    };
-    let report = Mutex::new(RunReport::default());
-    let calls = std::sync::atomic::AtomicUsize::new(0);
-    let take_call = || -> Result<()> {
-        ledger.check()?;
-        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= max_calls {
-            anyhow::bail!("call limit for this run ({max_calls}) reached");
-        }
-        Ok(())
-    };
-
-    // 1. Memories.
-    let done = log.extracted()?;
-    let chunks = pending_chunks(&conversations(repo)?, &done, chrono::Utc::now());
-    let queue = Mutex::new(chunks.into_iter());
-    let write = Mutex::new(());
-    std::thread::scope(|s| {
-        for _ in 0..WORKERS {
-            s.spawn(|| loop {
-                let Some(c) = queue.lock().unwrap().next() else {
-                    break;
-                };
-                let needs_call = c.turns.iter().any(|t| !t.text.is_empty());
-                if needs_call {
-                    if let Err(e) = take_call() {
-                        report.lock().unwrap().stopped.get_or_insert(e.to_string());
-                        break;
-                    }
-                }
-                match extract_chunk(llm, &c, &agent) {
-                    Ok((ms, gone, i, o)) => {
-                        let _g = write.lock().unwrap();
-                        let ids: Vec<String> = c.turns.iter().map(|t| t.id.clone()).collect();
-                        let rec = (|| -> Result<()> {
-                            if i + o > 0 {
-                                ledger.record(soul, i, o)?;
-                            }
-                            log.append_dropped(&gone)?;
-                            log.append_chunk(&ms, &ids)
-                        })();
-                        let mut r = report.lock().unwrap();
-                        match rec {
-                            Ok(()) => {
-                                r.chunks += 1;
-                                r.memories += ms.len();
-                                r.dropped += gone.len();
-                                r.input_tokens += i;
-                                r.output_tokens += o;
-                            }
-                            Err(e) => r.failed.push(format!("{}: {e:#}", c.conversation)),
-                        }
-                    }
-                    Err(e) => {
-                        let mut r = report.lock().unwrap();
-                        if is_account_limit(&e) {
-                            r.stopped.get_or_insert(account_limit_note(&e));
-                            break;
-                        }
-                        r.failed
-                            .push(format!("{} {}: {e:#}", c.source, c.conversation));
-                    }
-                }
-            });
-        }
-    });
-    if report.lock().unwrap().stopped.is_some() {
-        return Ok(report.into_inner().unwrap());
-    }
-
-    // 2. Summaries, one level at a time so every child is current before its
-    //    parent is written.
-    let memories = log.memories()?;
-    let now_hour = hour_of(&chrono::Utc::now().to_rfc3339()).unwrap_or(i64::MAX);
-    let (tree, by_id) = tree_of(&memories);
-    let all = tree.summary_windows(now_hour);
-    let mut sums = log.summaries()?;
-    for level in 0..=crate::memory::MAX_LEVEL {
-        let todo: Vec<(Window, String, String)> = all
-            .iter()
-            .filter(|w| w.level == level)
-            .filter_map(|&w| {
-                let d = children_digest(&tree, w, &by_id, &sums)?;
-                if sums.get(&w.id()).is_some_and(|s| s.digest == d) {
-                    return None;
-                }
-                let lines: Vec<String> = tree
-                    .children(w)
-                    .iter()
-                    .filter_map(|c: &Node| node_text(c, &by_id, &sums))
-                    .collect();
-                Some((w, d, lines.join("\n")))
-            })
-            .collect();
-        let queue = Mutex::new(todo.into_iter());
-        let written = Mutex::new(Vec::new());
-        std::thread::scope(|s| {
-            for _ in 0..WORKERS {
-                s.spawn(|| loop {
-                    let Some((w, d, text)) = queue.lock().unwrap().next() else {
-                        break;
-                    };
-                    if let Err(e) = take_call() {
-                        report.lock().unwrap().stopped.get_or_insert(e.to_string());
-                        break;
-                    }
-                    match llm.json(SUMMARY_SYSTEM, &text, &summary_schema(), 2048) {
-                        Ok((v, i, o)) => {
-                            let sm = Summary {
-                                window: w.id(),
-                                digest: d,
-                                text: v["text"].as_str().unwrap_or("").trim().to_string(),
-                                model: llm.model().to_string(),
-                                written: chrono::Utc::now().to_rfc3339(),
-                            };
-                            let _g = write.lock().unwrap();
-                            let rec = ledger
-                                .record(soul, i, o)
-                                .and_then(|_| log.append_summary(&sm));
-                            let mut r = report.lock().unwrap();
-                            match rec {
-                                Ok(()) => {
-                                    r.summaries += 1;
-                                    r.input_tokens += i;
-                                    r.output_tokens += o;
-                                    written.lock().unwrap().push(sm);
-                                }
-                                Err(e) => r.failed.push(format!("{}: {e:#}", w.id())),
-                            }
-                        }
-                        Err(e) => {
-                            let mut r = report.lock().unwrap();
-                            if is_account_limit(&e) {
-                                r.stopped.get_or_insert(account_limit_note(&e));
-                                break;
-                            }
-                            r.failed.push(format!("{}: {e:#}", w.id()));
-                        }
-                    }
-                });
-            }
-        });
-        for sm in written.into_inner().unwrap() {
-            sums.insert(sm.window.clone(), sm);
-        }
-        if report.lock().unwrap().stopped.is_some() {
-            break;
-        }
-    }
-    Ok(report.into_inner().unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Writes one memory per chunk citing its first turn, and summaries that
-    /// join their lines with " + ".
-    struct Fake;
-    impl Llm for Fake {
-        fn model(&self) -> &str {
-            "fake"
-        }
-        fn json(&self, system: &str, user: &str, _s: &Value, _m: u32) -> Result<(Value, u64, u64)> {
-            if system == EXTRACT_SYSTEM {
-                let first = user.lines().find(|l| l.starts_with("[1]")).unwrap_or("");
-                Ok((
-                    json!({"memories": [{"text": format!("saw {first}"), "turns": [1]}, {"text": "cites nothing real", "turns": [99]}]}),
-                    100,
-                    10,
-                ))
-            } else {
-                Ok((
-                    json!({"text": user.lines().collect::<Vec<_>>().join(" + ")}),
-                    50,
-                    5,
-                ))
-            }
-        }
-    }
 
     fn turn(id: &str, ts: &str, text: &str) -> ProseTurn {
         ProseTurn {
@@ -1181,41 +900,8 @@ mod tests {
             ts: ts.into(),
             role: "user".into(),
             text: text.into(),
+            peer: None,
         }
-    }
-
-    #[test]
-    fn a_turn_repeated_across_files_is_read_once_and_unsettled_turns_wait() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let a = Conversation {
-            source: "claude-code",
-            id: "a".into(),
-            place: String::new(),
-            turns: vec![
-                turn("t1", "2026-01-01T10:00:00Z", "x"),
-                turn("t2", "2026-01-01T10:01:00Z", "y"),
-            ],
-        };
-        // a resumed session repeats t1 and t2, then goes on; t4 is too fresh
-        let b = Conversation {
-            source: "claude-code",
-            id: "b".into(),
-            place: String::new(),
-            turns: vec![
-                turn("t1", "2026-01-01T10:00:00Z", "x"),
-                turn("t2", "2026-01-01T10:01:00Z", "y"),
-                turn("t3", "2026-01-01T11:00:00Z", "z"),
-                turn("t4", "2026-01-01T11:50:00Z", "w"),
-            ],
-        };
-        let chunks = pending_chunks(&[a, b], &HashSet::new(), now);
-        let ids: Vec<&str> = chunks
-            .iter()
-            .flat_map(|c| c.turns.iter().map(|t| t.id.as_str()))
-            .collect();
-        assert_eq!(ids, vec!["t1", "t2", "t3"]);
     }
 
     #[test]
@@ -1223,79 +909,6 @@ mod tests {
         let s = "é".repeat(5000);
         let c = clip(&s);
         assert!(c.len() < s.len() && c.contains("[…]"));
-    }
-
-    #[test]
-    fn a_run_writes_memories_then_summaries_and_charges_the_ledger() {
-        let base = std::env::temp_dir().join("ravel-memory-run-test");
-        let _ = std::fs::remove_dir_all(&base);
-        let repo = base.join("soul");
-        let shelf = repo.join(crate::sync::CLAUDE_AI_SUBDIR).join("export-1");
-        crate::claude_ai::tests::write_fixture(&shelf, true);
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 10.0).unwrap();
-        let r = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
-        assert!(r.failed.is_empty(), "{:?}", r.failed);
-        assert_eq!(r.chunks, 2, "two conversations with prose");
-        assert_eq!(r.memories, 2, "the memory citing turn 99 is dropped");
-        assert!(ledger.spent() > 0.0);
-        // A second run finds nothing to do and spends nothing.
-        let before = ledger.spent();
-        let r2 = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
-        assert_eq!((r2.chunks, r2.memories, r2.summaries), (0, 0, 0));
-        assert_eq!(ledger.spent(), before);
-        // The log reads back.
-        let ms = MemoryLog::for_soul(&repo).memories().unwrap();
-        assert_eq!(ms.len(), 2);
-        assert!(ms.iter().all(|m| !m.turns.is_empty()));
-    }
-
-    #[test]
-    fn no_call_is_made_past_the_budget() {
-        let base = std::env::temp_dir().join("ravel-memory-budget-test");
-        let _ = std::fs::remove_dir_all(&base);
-        let repo = base.join("soul");
-        crate::claude_ai::tests::write_fixture(
-            &repo.join(crate::sync::CLAUDE_AI_SUBDIR).join("e"),
-            true,
-        );
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 0.0).unwrap();
-        let r = run_soul(&repo, "test", &[], &Fake, &ledger, 100).unwrap();
-        assert!(r.stopped.as_deref().unwrap_or("").contains("budget"));
-        assert_eq!((r.chunks, r.memories), (0, 0));
-        assert!(!base.join("spend.tsv").exists(), "nothing was charged");
-    }
-
-    struct Refused;
-    impl Llm for Refused {
-        fn model(&self) -> &str {
-            "refused"
-        }
-        fn json(&self, _: &str, _: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
-            anyhow::bail!("Messages API 400 Bad Request: {{\"error\":{{\"message\":\"You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.\",\"type\":\"invalid_request_error\"}}}}")
-        }
-    }
-
-    #[test]
-    fn an_account_refusal_stops_the_run_instead_of_failing_every_chunk() {
-        let base = std::env::temp_dir().join("ravel-memory-refused-test");
-        let _ = std::fs::remove_dir_all(&base);
-        let repo = base.join("soul");
-        crate::claude_ai::tests::write_fixture(
-            &repo.join(crate::sync::CLAUDE_AI_SUBDIR).join("e"),
-            true,
-        );
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 10.0).unwrap();
-        let r = run_soul(&repo, "test", &[], &Refused, &ledger, 100).unwrap();
-        assert!(r.failed.is_empty(), "{:?}", r.failed);
-        let stop = r.stopped.unwrap_or_default();
-        assert!(
-            stop.starts_with(
-                "the Anthropic account refused: You have reached your specified API usage limits"
-            ),
-            "{stop}"
-        );
-        // Nothing read is recorded as read: the turns wait for the next pass.
-        assert!(MemoryLog::for_soul(&repo).extracted().unwrap().is_empty());
     }
 
     #[test]
@@ -1311,28 +924,6 @@ mod tests {
         assert_eq!(relabel_channels("plain text"), "plain text");
     }
 
-    #[test]
-    fn the_header_names_the_agent_and_the_place() {
-        let c = Chunk {
-            source: "claude-code",
-            conversation: "x".into(),
-            place: "working directory /repos/W3BL0RD".into(),
-            turns: vec![turn("t1", "2026-01-01T00:00:00Z", "hi")],
-        };
-        let p = chunk_prompt(
-            &c,
-            &Speakers {
-                agent: "W3BL0RD".into(),
-                peers: vec![],
-            },
-        );
-        assert!(p.starts_with("The agent in this conversation is W3BL0RD. The agent was running on Claude, in Claude Code. It took place in working directory /repos/W3BL0RD."), "{p}");
-        assert_eq!(
-            first_cwd(r#"{"x":1,"cwd":"/a/b","y":2}"#).as_deref(),
-            Some("/a/b")
-        );
-    }
-
     fn squad() -> Speakers {
         Speakers {
             agent: "W3BL0RD".into(),
@@ -1340,6 +931,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            human: "Rob".into(),
         }
     }
 
@@ -1390,40 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn a_number_the_model_was_never_shown_is_caught() {
-        let src = "[1] agent: 54.8 vs 3.3 images per running hour; samples 22:40-23:55Z on 2026-09-08. Cost 1,200 USD.";
-        // M3RCUR14L's case: a ratio nobody stated
-        assert_eq!(
-            unseen_number("Low priority gave 4x throughput", src).as_deref(),
-            Some("4x")
-        );
-        // w3bl0rd's case: a year nobody said
-        assert_eq!(
-            unseen_number("like the original 1978 prop", src).as_deref(),
-            Some("1978")
-        );
-        // what was said passes, in any comma form
-        assert_eq!(
-            unseen_number(
-                "54.8 vs 3.3 images/hour at 22:40 on 2026-09-08, cost 1200 USD",
-                src
-            ),
-            None
-        );
-        assert_eq!(unseen_number("cost $1,200", src), None);
-        // a lone digit is not checked; a stated multiple passes
-        assert_eq!(unseen_number("ran 3 workers", src), None);
-        assert_eq!(
-            unseen_number("about 16x faster", "[1] it was 16x faster"),
-            None
-        );
-        assert_eq!(
-            unseen_number("cut 30% of cost", src).as_deref(),
-            Some("30%")
-        );
-    }
-
-    #[test]
     fn a_quote_back_is_marked_as_not_the_humans_words() {
         let w = squad();
         let r = w.relabel_human(
@@ -1450,8 +1008,61 @@ mod tests {
             text_provenance: vec![],
             thinking: None,
         };
-        let t = to_turns(&[e]);
+        let t = to_turns(&[e], "claude-code");
         assert_eq!(t.len(), 1, "still marked read");
         assert!(t[0].text.is_empty(), "but never given to the model");
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    #[test]
+    fn harness_records_are_no_ones_words() {
+        for t in [
+            "<task-notification><task-id>x</task-id></task-notification>",
+            "<command-name>/compact</command-name>",
+            "<local-command-stdout>done</local-command-stdout>",
+            "Caveat: The messages below were generated by the user while running local commands. DO NOT respond",
+            "[Request interrupted by user for tool use]",
+            "Base directory for this skill: /x",
+            "<fork-boilerplate>you are a fork</fork-boilerplate>",
+            "/compact",
+            "<system-reminder>only a reminder</system-reminder>",
+        ] {
+            assert_eq!(human_words(t).trim(), "", "{t}");
+        }
+        assert_eq!(
+            human_words("fix it please<system-reminder>noise</system-reminder> now"),
+            "fix it please now"
+        );
+        assert_eq!(
+            human_words("<bash-input>git status</bash-input>"),
+            "(ran in the shell) git status"
+        );
+        assert_eq!(human_words("/compact keep the plan"), "/compact keep the plan");
+    }
+
+    #[test]
+    fn an_antigravity_request_is_its_body_and_system_records_are_dropped() {
+        let raw = "<USER_REQUEST>\nsure fire the engines!\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: x\n</ADDITIONAL_METADATA>";
+        assert_eq!(agy_request(raw), "sure fire the engines!");
+        let ev = |role: &str, text: &str| crate::Event {
+            event_id: format!("e-{role}"),
+            parent_id: None,
+            role: role.into(),
+            timestamp: Some("2026-09-24T08:28:36Z".into()),
+            text: Some(text.into()),
+            text_provenance: vec![],
+            thinking: None,
+        };
+        let t = to_turns(
+            &[ev("USER_EXPLICIT", raw), ev("MODEL", "On it."), ev("SYSTEM", "task finished")],
+            "agy",
+        );
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].role.as_str(), t[0].text.as_str()), ("user", "sure fire the engines!"));
+        assert_eq!(t[1].role, "assistant");
     }
 }

@@ -267,140 +267,45 @@ pub async fn run_sync_loop(d: Arc<Daemon>) {
     }
 }
 
-/// How often the memory loop looks for new turns to read.
+/// How often the memory loop re-projects each soul's memory into its graph.
 const MEMORY_INTERVAL: Duration = Duration::from_secs(10 * 60);
-/// Model calls per soul per memory pass: a backfill proceeds in steps.
-const MEMORY_CALLS_PER_PASS: usize = 3000;
 
 impl Daemon {
-    /// Whether the memory index may call a model, and if not, why — said by
-    /// name on /health, never a silent off.
+    /// What the memory is doing, said by name on /health. raveld never
+    /// calls a model: a soul's memory is written by `ravel-relive` (the
+    /// backfill) and by the soul's own notes; raveld projects it.
     pub fn memory_status(&self) -> String {
-        if self.cfg.memory_budget_usd <= 0.0 {
-            return "off — no memory_budget_usd in config.yml, so no model is ever called".into();
-        }
-        if !crate::memory_extract::key_path().is_file() {
-            return format!(
-                "off — no key at {}",
-                crate::memory_extract::key_path().display()
-            );
-        }
-        let spent = crate::memory_extract::Ledger::open(self.cfg.memory_budget_usd)
-            .map(|l| l.spent())
-            .unwrap_or(0.0);
-        let paused = self
-            .memory_refused
-            .lock()
-            .ok()
-            .and_then(|r| r.clone())
-            .map(|r| format!("; PAUSED — {r}"))
-            .unwrap_or_default();
-        format!(
-            "on — ${:.2} of ${:.2} spent{paused}",
-            spent.max(0.0),
-            self.cfg.memory_budget_usd
-        )
+        "projected — written by ravel-relive and the soul's own notes; raveld never calls a model".into()
     }
 
-    /// The memory index's state as one word for a UI: "off", "on" or
-    /// "paused" (an account refusal is standing). No money in it.
+    /// The memory's state as one word for a UI.
     pub fn memory_state(&self) -> &'static str {
-        if self.cfg.memory_budget_usd <= 0.0 || !crate::memory_extract::key_path().is_file() {
-            "off"
-        } else if self
-            .memory_refused
-            .lock()
-            .map(|r| r.is_some())
-            .unwrap_or(false)
-        {
-            "paused"
-        } else {
-            "on"
-        }
+        "projected"
     }
 
-    /// One memory pass over one soul: read new turns and write summaries
-    /// (outside the gate — it touches only the soul's memory logs), then
-    /// project the logs into the soul's `memory-v1` graph under the gate.
-    pub async fn memory_one(
-        self: &Arc<Self>,
-        id: &str,
-        max_calls: usize,
-    ) -> Result<crate::memory_extract::RunReport> {
+    /// Project one soul's memory logs into its `memory-v1` graph, under the
+    /// gate.
+    pub async fn memory_one(self: &Arc<Self>, id: &str) -> Result<()> {
         let soul = self.soul(id)?.clone();
-        let budget = self.cfg.memory_budget_usd;
-        let path = soul.path.clone();
-        let sid = soul.id.clone();
-        // Every soul this daemon serves, by repo name: who a peer can be.
-        let peers: Vec<String> = self
-            .souls
-            .iter()
-            .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
-        let report = if budget > 0.0 && crate::memory_extract::key_path().is_file() {
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let llm = crate::memory_extract::Anthropic::from_key_file()?;
-                let ledger = crate::memory_extract::Ledger::open(budget)?;
-                crate::memory_extract::run_soul(&path, &sid, &peers, &llm, &ledger, max_calls)
-            })
-            .await
-            .map_err(|e| anyhow!("memory task panicked: {e}"))??
-        } else {
-            crate::memory_extract::RunReport {
-                stopped: Some(self.memory_status()),
-                ..Default::default()
-            }
-        };
         let _g = self.gate.lock().await;
         let path = soul.path.clone();
         tokio::task::spawn_blocking(move || crate::memory_log::project_into_store(&path))
             .await
             .map_err(|e| anyhow!("memory projection panicked: {e}"))??;
-        Ok(report)
+        Ok(())
     }
 }
 
 /// The memory schedule: every soul, every ten minutes, after a first wait so
-/// the transcript passes catch up first. Silent when the index is off; the
-/// reason is on /health.
+/// the transcript passes catch up first. Projection only.
 pub async fn run_memory_loop(d: Arc<Daemon>) {
     tokio::time::sleep(Duration::from_secs(60)).await;
-    log(format!("memory index {}", d.memory_status()));
+    log(format!("memory {}", d.memory_status()));
     loop {
-        if d.cfg.memory_budget_usd > 0.0 && crate::memory_extract::key_path().is_file() {
-            let ids: Vec<String> = d.souls.iter().map(|s| s.id.clone()).collect();
-            for id in ids {
-                let res = d.memory_one(&id, MEMORY_CALLS_PER_PASS).await;
-                let refused = res
-                    .as_ref()
-                    .ok()
-                    .and_then(|r| r.stopped.clone())
-                    .filter(|s| s.starts_with("the Anthropic account refused"));
-                match res {
-                    Ok(r) if r.chunks + r.summaries > 0 || !r.failed.is_empty() || r.stopped.is_some() => log(format!(
-                        "{id}: memory read {} chunk(s) → {} memories, {} summaries, {} in / {} out tokens{}{}",
-                        r.chunks,
-                        r.memories,
-                        r.summaries,
-                        r.input_tokens,
-                        r.output_tokens,
-                        if r.failed.is_empty() { String::new() } else { format!("; {} FAILED: {}", r.failed.len(), r.failed.join(" | ")) },
-                        r.stopped.map(|s| format!("; stopped: {s}")).unwrap_or_default()
-                    )),
-                    Ok(_) => {}
-                    Err(e) => log(format!("{id}: memory pass FAILED — {e:#}")),
-                }
-                // An account-level refusal applies to every soul: stop this
-                // round instead of asking twenty times.
-                if let Some(note) = refused {
-                    *d.memory_refused.lock().unwrap() = Some(format!(
-                        "{} ({})",
-                        note,
-                        Local::now().format("%Y-%m-%d %H:%M")
-                    ));
-                    break;
-                }
-                *d.memory_refused.lock().unwrap() = None;
+        let ids: Vec<String> = d.souls.iter().map(|s| s.id.clone()).collect();
+        for id in ids {
+            if let Err(e) = d.memory_one(&id).await {
+                log(format!("{id}: memory projection FAILED — {e:#}"));
             }
         }
         tokio::time::sleep(MEMORY_INTERVAL).await;

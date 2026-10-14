@@ -7,10 +7,11 @@ agent's own repository, and projects the copy into an RDF 1.2 graph beside it.
 The bytes are canonical; the graph is a projection of them and can always be
 rebuilt.
 
-On top of the transcripts sits a memory index: one-line memories read out of
-every conversation, summarized up a tree of time windows, so an agent can see
-its whole history in about 96 lines and open any line down to the turns it
-came from.
+On top of the transcripts sits the agent's memory: [OptMem](https://github.com/VictorTaelin/OptMem)'s
+algorithm, exactly, kept as a graph. One-line notes of what the agent learned,
+in the order it learned them, merged pairwise up OptMem's binary tree, so the
+agent wakes with its whole history in at most 96 lines and can open any line
+down to the conversation turns it rests on.
 
 Two programs, one crate:
 
@@ -45,7 +46,7 @@ Commands default to the soul repository you are currently in. To query or inspec
 # 1. Any command starts the daemon if it is not running, then answers.
 ravel
 # raveld is RUNNING — pid 52756, up 0h 00m 10s, version 0.5.0, 20 on http://127.0.0.1:7881
-#   memory index: on — $99.47 of $150.00 spent
+#   memory index: projected — written by ravel-relive and the soul's own notes; raveld never calls a model
 #   9bdf2a  /Volumes/f00/repos/7R1PL3F0RC3/spaceGOAT
 #       last pass 2026-10-04T16:11:50-07:00  mirrored 1 (unchanged 589), ingested 1 session(s) ...
 
@@ -97,65 +98,101 @@ When you download an updated export later, ravel ingests the conversations that
 are new or have grown and skips the rest (the count in `(N already current)`). An
 older export imported after a newer one never rolls a conversation back.
 
-## The memory index
+## The memory
 
-The memory index gives an agent its full conversational history in about 96
-lines: recent memories word for word, older ones rolled up into hierarchical
-summaries.
+A soul's memory is [OptMem](https://github.com/VictorTaelin/OptMem), exactly,
+as a graph:
+
+- **Notes.** One line each, at most 280 bytes. The soul notes something
+  whenever it learns something new, or something worth keeping happens. That
+  covers a task worth real effort, a fact or insight its human teaches it,
+  anything it learns about their life, and any event of lasting effect. It
+  does not note what it already holds. Each note's position in the log is its
+  identity: `#0, #1, …`.
+- **Merges.** OptMem's binary tree over the log, by position: `#0-1`, `#2-3`,
+  then `#0-3`, and so on. Neighbours are merged, never grouped by topic or
+  time. A block of up to 16 notes is merged from the notes themselves; a bigger
+  one from its two halves. Every merge is done the moment it comes due, with
+  OptMem's prompt word for word: "Keep what has lasting effect, drop what does
+  not. Invent nothing."
+- **Wake.** OptMem's cover: the whole log in at most 96 lines. Recent notes are
+  shown word for word, older ones through their merges.
+- **The graph.** Every note and every merge is a `ravel:Memory`. A note links
+  to each conversation turn it rests on, and a merge links to its two halves,
+  all with `git-lex:relatedToId`.
 
 ```sh
-ravel memory                  # the whole history in about 96 lines
-ravel memory open w0-33830    # a window summary opened into the lines under it
-ravel memory open mec170751e01cedc   # a memory, with the turns it came from
-ravel memory run              # read new turns and write summaries now
-ravel memory run 50           # the same, at most 50 model calls
+ravel memory                 # wake: the whole memory in at most 96 lines
+ravel memory open 16-31      # a merged block, opened into its two halves
+ravel memory open '#12'      # a note, with the turns it rests on
 ```
 
 ```
-[ravel memory] 9bdf2a: 20075 memories, 4289 summaries — `ravel memory open <id>` opens any line
-2023-11-10 → 2023-11-10  Agent corrected: LoRA is Low Rank Adaptation, not Long Range Arena. ...  [w0-33830]
-2024-03-11 → 2024-03-11  Ran tag_images_by_wd14_tagger.py on /mnt/sda2/lora_source/...; cuDNN version mismatch ...  [w2-9187]
-...
-2026-10-04 14:33         Fixed ravel bug where 75 one-hour summaries failed due to 512-token output cap. ...  [m...]
+[ravel memory] d5af17: 42 notes, 39 blocks — `ravel memory open <#i or lo-hi>` opens a line
+#0-31 Kira: parser; me: forx+storage. IRI repolex.ai/r/{org}/{repo}/{phase}/{sha}. Repolex core never public-runner; …
+#32-39 …
+#40 2026-09-07 actix-web -> bytes 1,138 call edges, actix-web -> http 426, rlex -> actix-web 16, …
+#41 2026-09-07 My repo and release counts drifted across reports (19, 29, 24, 26). Quote quad totals, …
 ```
 
-### Reading and drilling down
+The lines are OptMem's own format: `#i date text` for a note and `#lo-hi
+text` for a merge. `tests/optmem_conformance.rs` runs OptMem's `memo` beside
+ravel and requires the same bytes for every merge prompt and every wake view.
 
-- **Line tags**: Each line ends with an identifier in brackets:
-  - `[m<hash>]` — an atomic level-0 memory extracted directly from conversation turns.
-  - `[w<k>-<index>]` — a summary covering an aligned time window of $2^k$ hours (e.g. `w0` covers 1 hour, `w1` covers 2 hours, `w2` covers 4 hours).
-- **Drill-down with `ravel memory open <id>`**:
-  - Opening a window summary (`w0-33830`) expands it into the child memories or smaller window summaries under it.
-  - Opening an atomic memory (`mec170751e01cedc`) prints the memory text followed by the exact transcript turns (speaker role, timestamp, turn ID, and dialogue excerpt) that produced it.
-- **Status markers**: A bracketed prefix at the start of a line (`[not summarized yet — N memories]` or `[stale — N memories under it now]`) indicates that the window is waiting for a summarization pass. The view strictly adheres to its ~96 line budget rather than dumping unsummarized memories into the terminal.
+### Building a memory from the past: `ravel-relive`
 
-### How it works
+A soul's past was not noted as it happened, so `ravel-relive` relives it. It
+reads every turn the soul has, from every harness, in one stream ordered by
+time, a stretch at a time. Before each stretch the reader wakes as OptMem
+wakes. It then notes what the soul would have noted, and does every merge that
+came due before reading on. The reader is the soul: it is given its name and
+SOUL.md, and it merges its own memory, as OptMem's agent does.
 
-1. **Turn extraction**: Every ten minutes, `raveld` inspects new turns in the soul's transcripts. It extracts only authored prose from the human and the agent (skipping tool output and scratchpads), taking each turn once. A model writes concise, one-line past-tense facts (decisions, commands, errors, versions, results), each referencing the turn IDs it rests on (`git-lex:relatedToId`).
-2. **Hierarchical rollup**: Memories are grouped into aligned time windows of $2^k$ hours counted from 2020-01-01T00:00:00Z. Level-0 windows (`w0`) summarize an hour's memories; higher levels summarize their two child windows (`git-lex:relatedToId`).
-Because windows align to absolute time boundaries, backfilling historical transcripts only invalidates and re-summarizes the specific windows the imported turns land in, leaving the rest of the tree untouched.
+```sh
+ravel-relive plan   <soul-repo> 2000 2100        # how much there is to read; no model calls
+ravel-relive dump   <soul-repo> <from> <to>      # exactly what the reader is shown; no model calls
+ravel-relive run    <soul-repo> 2000 2100 <soul-repo>/.ravel/_ignore/optmem sub:claude-haiku-5-5+session
+ravel-relive verify <soul-repo> <soul-repo>/.ravel/_ignore/optmem   # check the result end to end
+```
 
-### Cost controls and setup
+- **The model runs on your Claude subscription**, through Claude Code (`claude
+  -p`), one call at a time. The API key is removed from the call's
+  environment, and a call that used one is refused.
+- `+session` keeps one Claude Code session open across stretches, the way the
+  soul lived them. A new session, and a fresh wake, starts once the context
+  passes 90,000 tokens.
+- The run resumes exactly where it stopped. It never skips a stretch or a
+  merge.
+- `api:<max-usd>` uses an API key from `~/.config/ravel/anthropic-api-key`
+  instead, priced into `~/.config/ravel/memory-spend.tsv`.
 
-The memory index is **completely disabled by default**; it calls no models and spends nothing until configured.
+**What the reader is shown** (`ravel-relive dump` prints it):
 
-To enable it:
+- Only the soul's own life: what the soul said, what its human said
+  (labelled by name, from `human:` in config.yml), and messages from other
+  agents (labelled by sender).
+- Tool output, thinking, and compaction summaries are left out.
+- Claude Code subagent and workflow transcripts are left out, and so are
+  Antigravity subagents. In OptMem, a subagent never writes memory.
+- Harness records that arrive as user input are left out: notifications,
+  slash commands, system reminders and the like.
+- A message another agent typed in through herdr is recognised from the
+  sender's side: the sender's own transcript holds the `herdr agent prompt`
+  that sent it.
 
-1. **Save your Anthropic API key** in `~/.config/ravel/anthropic-api-key` and restrict permissions:
-   ```sh
-   chmod 600 ~/.config/ravel/anthropic-api-key
-   ```
-   Ravel reads the key directly from disk; it is never read from environment variables to prevent accidental leaks to child processes.
-2. **Set a dollar budget** in `~/.config/ravel/config.yml`:
-   ```yaml
-   memory_budget_usd: 50
-   ```
-3. **Restart the daemon**:
-   ```sh
-   raveld restart
-   ```
+**`verify` checks:**
 
-Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Every call logs its token counts and price to `~/.config/ravel/memory-spend.tsv`. When the total spent reaches `memory_budget_usd`, `raveld` makes no new calls (calls already in flight finish, so the total can pass the budget by a few cents). For one squad of 20 souls, the first full read was $99 and still running on 2026-10-04, heading for about $120–130; once caught up, passes read only new turns.
+- every line passes OptMem's limits;
+- every merge that is due is built;
+- every note cites turns of the soul's own stream;
+- the wake is OptMem's cover;
+- the graph projection loads;
+- every cited turn is a Turn in the soul's store.
+
+It exits 1 on any failure.
+
+`raveld` never calls a model. It projects each soul's memory into the
+`memory-v1` graph on its passes.
 
 ## What lives where
 
@@ -167,17 +204,18 @@ Ravel uses Claude Haiku 4.5 ($1.00 input / $5.00 output per million tokens). Eve
 ├── ingest-manifest.tsv                   what has been ingested, by size (claude-code)
 ├── ingest-manifest-agy.tsv               what has been ingested, by content hash (agy)
 ├── ingest-manifest-claude-ai.tsv         each conversation's ingested version (claude.ai)
-├── memory/                               the memory index logs: append-only, canonical
-│   ├── memories.jsonl                    level-0 memories extracted from turns
-│   ├── summaries.jsonl                   hierarchical window summaries
-│   └── extracted.tsv                     ids of turns already read, one per line
+├── optmem/                               the memory: append-only, canonical
+│   ├── memories.jsonl                    OptMem's log: one note per line, in order noted
+│   ├── summaries.jsonl                   OptMem's tree: one merged block per line (`16-31`)
+│   ├── extracted.tsv                     ids of turns already read, one per line
+│   └── usage.tsv                         tokens per model call
 └── oxigraph/                             the graph: one named graph per transcript,
                                           plus memory-v1 for the memory index
 
-~/.config/ravel/config.yml                daemon config: port, interval, souls, memory budget
+~/.config/ravel/config.yml                daemon config: port, interval, souls, the human's name
 ~/.config/ravel/raveld.log                log output from detached daemon
-~/.config/ravel/anthropic-api-key         Anthropic API key for memory index (chmod 600)
-~/.config/ravel/memory-spend.tsv          audit ledger: timestamp, soul, tokens, USD per call
+~/.config/ravel/anthropic-api-key         optional: an API key for `ravel-relive api:` (chmod 600)
+~/.config/ravel/memory-spend.tsv          audit ledger for API calls: timestamp, soul, tokens, USD
 ```
 
 A soul's id is the first six characters of its repository's genesis commit —
@@ -223,7 +261,14 @@ properties the kit checker would otherwise call errors.
 
 The store partitions data into named graphs under `https://repolex.ai/ravel/NamedGraph/`:
 - **Transcripts**: Each transcript has its own named graph (`<…/NamedGraph/<transcript_id>>`) containing `ravel:Turn` nodes linked by `ravel:parentTurn`.
-- **Memory index**: The memory index projects into `<https://repolex.ai/ravel/NamedGraph/memory-v1>`. Memory nodes are `ravel:Memory`, carrying `ravel:memoryId`, `ravel:memoryLevel`, `ravel:memoryText`, `ravel:windowStart`, and `ravel:windowEnd`. Every link is `git-lex:relatedToId`: a level-0 memory to each source turn, a window summary to each child node. What a link means is read off its target (a `ravel:Turn` is the source; a `ravel:Memory` one level down is a child).
+- **Memory**: projected into `<https://repolex.ai/ravel/NamedGraph/memory-v1>`.
+  - Every node is a `ravel:Memory`, carrying `ravel:memoryId`,
+    `ravel:memoryLevel` (0 for a note, k for a block of 2^k notes),
+    `ravel:logStart` and `ravel:logEnd` (its positions in OptMem's log),
+    `ravel:memoryText`, `ravel:windowStart` and `ravel:windowEnd` (the times of
+    its first and last note), and `ravel:memoryModel`.
+  - Every link is `git-lex:relatedToId`: a note to each turn it rests on, a
+    block to its two halves.
 
 ## Health
 

@@ -50,7 +50,7 @@
     a owl:Ontology ;
     rdfs:label "Ravel ontology" ;
     rdfs:comment "Transcript-graph vocabulary: conversational turns and the reader-annotation layer over them. Graph-only — no authored documents." ;
-    owl:versionInfo "0.4.0" .
+    owl:versionInfo "0.5.0" .
 
 # ─── The spine ───────────────────────────────────────────────────────────────
 
@@ -135,58 +135,75 @@ ravel:exhibits a owl:DatatypeProperty ;
 
 # ─── The memory index (repolex-ai/ravel#15) ──────────────────────────────────
 
-# Memory is DERIVED, like Turn: written the way OptMem writes memory — a
-# soul's notes on what it learned, merged in pairs as time windows close —
-# by a model reliving the soul's turns in order (recorded in memoryModel),
-# projected from the soul's `.ravel/_ignore/memory-relive/` logs into the
-# `memory-v1` named graph. One class for both kinds of node (goodlux,
-# 2026-10-04): a level-0 Memory is one note; a higher one compresses the
-# nodes under a time window. Text has its own property because ravel:text
-# has domain Turn.
+# Memory is DERIVED, like Turn: OptMem's memory (github.com/VictorTaelin/OptMem),
+# exactly, as a graph. A soul's notes, in the order noted, form OptMem's log;
+# a note's OptMem identity is its position (logStart = logEnd = i). OptMem's
+# binary merge tree over the log gives the higher nodes: a block of 2^k notes
+# at an aligned position [logStart, logEnd] is one line merging its two
+# halves (memoryLevel k). Neighbours by position, never by topic or time.
+# Written by a model reliving the soul's turns in order, or by the soul as it
+# works (recorded in memoryModel); projected from the soul's
+# `.ravel/_ignore/optmem/` logs into the `memory-v1` named graph.
 #
-# v0.4.0 (goodlux, 2026-10-06): edges are git-lex:relatedToId, the one link
-# property Subtexture uses everywhere — a note to each Turn it rests on, a
-# summary to each node it compresses. What an edge means is read off its
-# target (a Turn is the source; a Memory one level down is a child).
-# ravel:summarizes and ravel:fromTurn are retired: nothing emits them.
+# Edges are git-lex:relatedToId, the one link property Subtexture uses
+# (goodlux, 2026-10-06): a note to each Turn it rests on, a block to its two
+# halves. What an edge means is read off its target: a Turn is a source, a
+# Memory is a half.
+#
+# v0.5.0 (goodlux, 2026-10-13: OptMem's algorithm exactly, not something
+# similar): the tree is by log position, no longer by clock-hour windows;
+# logStart and logEnd added; windowStart/windowEnd now give the times of the
+# first and last note under a node.
 ravel:Memory a owl:Class ;
     rdfs:subClassOf git-lex:Thing ;
     rdfs:label "Memory" ;
-    rdfs:comment "One line of a soul's memory index: either a memory extracted from transcript turns (level 0) or a summary of the nodes under an aligned time window (level 1 and up)." .
+    rdfs:comment "One line of a soul's OptMem memory: a note (level 0), or the merge of an aligned block of 2^k notes (level k), linked to its two halves." .
 
 ravel:memoryId a owl:DatatypeProperty ;
     rdfs:label "memoryId" ;
-    rdfs:comment "Unique identifier for this memory: 'm' plus a content hash for a level-0 memory, 'w<level>-<index>' for a window summary. Unique within the class." ;
+    rdfs:comment "Unique identifier for this memory: 'm' plus a content hash for a note, OptMem's block id 'lo-hi' (inclusive positions, e.g. '16-31') for a block. Unique within the class." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:string .
 
 ravel:memoryText a owl:DatatypeProperty ;
     rdfs:label "memoryText" ;
-    rdfs:comment "The memory's one line of text." ;
+    rdfs:comment "The memory's one line of text, at most 280 bytes (OptMem's ENTRY_CHARS)." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:string .
 
 ravel:memoryLevel a owl:DatatypeProperty ;
     rdfs:label "memoryLevel" ;
-    rdfs:comment "0 for a memory extracted from turns; k+1 for the summary of a window of 2^k hours." ;
+    rdfs:comment "0 for a note; k for the merge of a block of 2^k notes." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:integer .
+
+ravel:logStart a owl:DatatypeProperty ;
+    rdfs:label "logStart" ;
+    rdfs:comment "Position in the soul's OptMem log of the first note under this memory (its own position, for a note)." ;
+    rdfs:domain ravel:Memory ;
+    rdfs:range xsd:integer .
+
+ravel:logEnd a owl:DatatypeProperty ;
+    rdfs:label "logEnd" ;
+    rdfs:comment "Position in the soul's OptMem log of the last note under this memory, inclusive (its own position, for a note)." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:integer .
 
 ravel:windowStart a owl:DatatypeProperty ;
     rdfs:label "windowStart" ;
-    rdfs:comment "Start of the time this memory covers: a level-0 memory's earliest source turn, or the window's first hour." ;
+    rdfs:comment "Time of the first note under this memory: a note's earliest source turn." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:dateTime .
 
 ravel:windowEnd a owl:DatatypeProperty ;
     rdfs:label "windowEnd" ;
-    rdfs:comment "End of the time this memory covers (exclusive for a window; equal to windowStart for a level-0 memory)." ;
+    rdfs:comment "Time of the last note under this memory (equal to windowStart for a note)." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:dateTime .
 
 ravel:memoryModel a owl:DatatypeProperty ;
     rdfs:label "memoryModel" ;
-    rdfs:comment "The model id that wrote this line (e.g. 'claude-haiku-4-5')." ;
+    rdfs:comment "The model id that wrote this line (e.g. 'claude-haiku-5-5')." ;
     rdfs:domain ravel:Memory ;
     rdfs:range xsd:string .
 

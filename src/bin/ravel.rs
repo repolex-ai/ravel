@@ -10,12 +10,10 @@
 //!   ravel import [<soul>] <export-dir>  copy a claude.ai data export into the soul
 //!                                    and ingest it; safe to repeat, and a newer
 //!                                    export later adds to it
-//!   ravel memory [<soul>]            the whole history in about 96 lines: recent
-//!                                    memories word for word, older ones summarized
-//!   ravel memory open [<soul>] <id>  one line opened: a summary's two halves, or a
-//!                                    memory's source turns
-//!   ravel memory run [<soul>] [<calls>]  read new turns and write summaries now,
-//!                                    at most <calls> model calls when given
+//!   ravel memory [<soul>]            OptMem's wake: the whole memory in at most 96
+//!                                    lines, recent notes word for word, older ones merged
+//!   ravel memory open [<soul>] <id>  one line opened, as OptMem's zoom: a block's two
+//!                                    halves (`16-31`), or a note's source turns (`#12`)
 //!   ravel health [<soul>]            the read-only diagnostic; exit 1 = attention
 //!   ravel stats  [<soul>]            counts: quads, graphs, turns, claims, top predicates
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
@@ -38,7 +36,7 @@ fn usage() -> ! {
            ravel souls\n  \
            ravel sync   [<soul> [<sessions-dir>]]\n  \
            ravel import [<soul>] <export-dir>\n  \
-           ravel memory [<soul>] | memory open [<soul>] <id> | memory run [<soul>]\n  \
+           ravel memory [<soul>] | memory open [<soul>] <id>\n  \
            ravel health [<soul>]\n  \
            ravel stats  [<soul>]\n  \
            ravel query  [<soul>] \"<sparql>\"\n  \
@@ -76,14 +74,6 @@ fn main() -> Result<()> {
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
         ["memory"] => memory(&client, &resolve(&client, None)?),
-        ["memory", "run"] => memory_run(&client, &resolve(&client, None)?, None),
-        ["memory", "run", n] if n.parse::<usize>().is_ok() => {
-            memory_run(&client, &resolve(&client, None)?, n.parse().ok())
-        }
-        ["memory", "run", s] => memory_run(&client, &resolve(&client, Some(s))?, None),
-        ["memory", "run", s, n] => {
-            memory_run(&client, &resolve(&client, Some(s))?, Some(n.parse()?))
-        }
         ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
         ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
         ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
@@ -225,28 +215,16 @@ fn short(ts: &str) -> String {
         .unwrap_or_else(|_| ts.get(..16).unwrap_or(ts).replace('T', " "))
 }
 
-/// The local date of an RFC 3339 instant.
-fn day(ts: &str) -> String {
-    short(ts).get(..10).unwrap_or("").to_string()
-}
-
+/// Wake lines as OptMem prints them: `#i date text` and `#lo-hi text`.
 fn print_lines(lines: &[Value]) {
     for l in lines {
-        let level = l["level"].as_u64().unwrap_or(0);
-        let when = if level == 0 {
-            short(l["from"].as_str().unwrap_or(""))
+        let label = l["label"].as_str().unwrap_or("");
+        let text = l["text"].as_str().unwrap_or("");
+        if l["level"].as_u64().unwrap_or(0) == 0 {
+            println!("{label} {} {text}", l["date"].as_str().unwrap_or(""));
         } else {
-            format!(
-                "{} → {}",
-                day(l["from"].as_str().unwrap_or("")),
-                day(l["to"].as_str().unwrap_or(""))
-            )
-        };
-        println!(
-            "{when:<23}  {}  [{}]",
-            l["text"].as_str().unwrap_or(""),
-            l["id"].as_str().unwrap_or("")
-        );
+            println!("{label} {text}");
+        }
     }
 }
 
@@ -255,12 +233,12 @@ fn memory(client: &Client, id: &str) -> Result<()> {
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
     if lines.is_empty() {
         println!(
-            "[ravel memory] {id}: no memories yet. `ravel` shows whether the memory index is on."
+            "[ravel memory] {id}: no memories yet."
         );
         return Ok(());
     }
     println!(
-        "[ravel memory] {id}: {} memories, {} summaries — `ravel memory open <id>` opens any line",
+        "[ravel memory] {id}: {} notes, {} blocks — `ravel memory open <#i or lo-hi>` opens a line",
         v["memories"], v["summaries"]
     );
     print_lines(&lines);
@@ -269,13 +247,14 @@ fn memory(client: &Client, id: &str) -> Result<()> {
 
 fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory/{node}"))?;
-    if v["kind"] == "window" {
+    if v["kind"] == "block" {
         print_lines(v["children"].as_array().map(Vec::as_slice).unwrap_or(&[]));
         return Ok(());
     }
     let m = &v["memory"];
     println!(
-        "{}  {}",
+        "#{} {}  {}",
+        v["position"],
         short(m["ts"].as_str().unwrap_or("")),
         m["text"].as_str().unwrap_or("")
     );
@@ -294,27 +273,6 @@ fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
                 ""
             }
         );
-    }
-    Ok(())
-}
-
-fn memory_run(client: &Client, id: &str, calls: Option<usize>) -> Result<()> {
-    let body = calls.map(|n| serde_json::json!({ "calls": n }));
-    let v = client.post(&format!("/souls/{id}/memory/run"), body)?;
-    let r = &v["report"];
-    println!(
-        "[ravel memory run] {id}: read {} chunk(s) → {} memories, {} summaries; {} in / {} out tokens",
-        r["chunks"], r["memories"], r["summaries"], r["input_tokens"], r["output_tokens"]
-    );
-    if let Some(s) = r["stopped"].as_str() {
-        println!("[ravel memory run] stopped: {s}");
-    }
-    let failed = r["failed"].as_array().cloned().unwrap_or_default();
-    for f in &failed {
-        eprintln!("[ravel memory run] FAILED {}", f.as_str().unwrap_or("?"));
-    }
-    if !failed.is_empty() {
-        std::process::exit(1);
     }
     Ok(())
 }

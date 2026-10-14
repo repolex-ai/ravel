@@ -7,6 +7,7 @@
 //!   - ~/repos/7R1PL3F0RC3/spaceGOAT
 //!   - ~/repos/7R1PL3F0RC3/W4R3Z
 //! memory_budget_usd: 100   # optional; the memory index spends nothing without it
+//! human: Rob                # optional; the human the souls work with, by name
 //! ```
 //!
 //! A missing file is not an error: the daemon starts with no souls and says
@@ -31,6 +32,7 @@ struct Raw {
     #[serde(default)]
     souls: Vec<String>,
     memory_budget_usd: Option<f64>,
+    human: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,9 @@ pub struct DaemonConfig {
     /// index never calls a model: nothing billed unless a human wrote a number
     /// here (goodlux, 2026-10-04).
     pub memory_budget_usd: f64,
+    /// The human these souls work with, by name: how a memory reader labels
+    /// the human's turns. `None`: "human".
+    pub human: Option<String>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -100,6 +105,7 @@ impl DaemonConfig {
             interval_secs: raw.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
             souls: raw.souls.iter().map(|s| expand_tilde(s)).collect(),
             memory_budget_usd: raw.memory_budget_usd.unwrap_or(0.0),
+            human: raw.human.filter(|h| !h.trim().is_empty()),
         })
     }
 
