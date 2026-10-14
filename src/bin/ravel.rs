@@ -244,6 +244,9 @@ fn memory(client: &Client, id: &str) -> Result<()> {
 }
 
 fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
+    // `#12` is how a note is written, but `#` would end the URL path, so the
+    // daemon would only ever see `/memory/` and answer 404.
+    let node = node.trim_start_matches('#');
     let v = client.get(&format!("/souls/{id}/memory/{node}"))?;
     if v["kind"] == "block" {
         print_lines(v["children"].as_array().map(Vec::as_slice).unwrap_or(&[]));
