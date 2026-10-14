@@ -275,7 +275,8 @@ impl Daemon {
     /// calls a model: a soul's memory is written by `ravel-relive` (the
     /// backfill) and by the soul's own notes; raveld projects it.
     pub fn memory_status(&self) -> String {
-        "projected — written by ravel-relive and the soul's own notes; raveld never calls a model".into()
+        "projected — written by ravel-relive and the soul's own notes; raveld never calls a model"
+            .into()
     }
 
     /// The memory's state as one word for a UI.

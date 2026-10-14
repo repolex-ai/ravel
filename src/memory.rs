@@ -127,7 +127,7 @@ pub fn parse_block(s: &str) -> Option<Block> {
     let lo: usize = a.parse().ok()?;
     let hi = b.parse::<usize>().ok()? + 1;
     let n = hi.checked_sub(lo)?;
-    (n >= 2 && n.is_power_of_two() && lo % n == 0).then_some((lo, hi))
+    (n >= 2 && n.is_power_of_two() && lo.is_multiple_of(n)).then_some((lo, hi))
 }
 
 /// `check`: one line, not empty, at most [`ENTRY_CHARS`] bytes. The error is

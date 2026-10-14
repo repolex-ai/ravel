@@ -155,7 +155,10 @@ fn note_schema() -> Value {
 /// prompt the soul opened them with). OptMem: a subagent never writes memory.
 pub fn label_peers(convs: &mut Vec<Conversation>, me: &str, idx: &PeerIndex) {
     convs.retain(|c| {
-        let first = c.turns.iter().find(|t| t.role == "user" && !t.text.trim().is_empty());
+        let first = c
+            .turns
+            .iter()
+            .find(|t| t.role == "user" && !t.text.trim().is_empty());
         !first.is_some_and(|t| idx.spawned(me, &t.ts, &t.text))
     });
     for c in convs.iter_mut() {
@@ -268,7 +271,10 @@ pub fn dump(repo: &Path, sp: &Speakers, peers: &PeerIndex, from: &str, to: &str)
         .collect();
     let mut out = String::new();
     for (k, stretch) in stretches(st).into_iter().enumerate() {
-        out += &format!("==================== stretch {} ====================\n", k + 1);
+        out += &format!(
+            "==================== stretch {} ====================\n",
+            k + 1
+        );
         out += &note_prompt(Some("(wake)"), &stretch, &convs, sp);
         out += "\n";
     }
@@ -330,7 +336,12 @@ fn ask_line(
             }
             Err(why) => {
                 refused.push(format!("{why} — {line}"));
-                log.append_dropped(&refused.iter().map(|x| format!("refused: {x}")).collect::<Vec<_>>())?;
+                log.append_dropped(
+                    &refused
+                        .iter()
+                        .map(|x| format!("refused: {x}"))
+                        .collect::<Vec<_>>(),
+                )?;
                 return Ok(None);
             }
         }
@@ -456,7 +467,12 @@ pub fn relive(
         let wake = (llm.context_tokens() == 0).then(|| -> Result<String> {
             let memories = log.memories()?;
             let sums = log.summaries()?;
-            Ok(wake_text(&wake_view(&memories, &sums, memories.len(), WAKE_LINES)))
+            Ok(wake_text(&wake_view(
+                &memories,
+                &sums,
+                memories.len(),
+                WAKE_LINES,
+            )))
         });
         let wake = wake.transpose()?;
         // 2. Note. A stretch is never skipped: memory is built in order, so a
@@ -560,10 +576,13 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     }
     for (id, s) in &sums {
         match memory::parse_block(id) {
-            None => v.failures.push(format!("block {id:?} is not an OptMem block")),
-            Some((_, hi)) if hi > ms.len() => {
-                v.failures.push(format!("block {id} reaches past the log ({} notes)", ms.len()))
-            }
+            None => v
+                .failures
+                .push(format!("block {id:?} is not an OptMem block")),
+            Some((_, hi)) if hi > ms.len() => v.failures.push(format!(
+                "block {id} reaches past the log ({} notes)",
+                ms.len()
+            )),
             _ => {}
         }
         if let Err(e) = memory::check(&s.text) {
@@ -571,7 +590,10 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
         }
     }
     for b in memory_log::pending(&sums, ms.len()) {
-        v.failures.push(format!("block #{} is due and not built", memory::block_id(b)));
+        v.failures.push(format!(
+            "block #{} is due and not built",
+            memory::block_id(b)
+        ));
     }
     // Cited turns are turns of the soul's own stream.
     let convs = conversations(repo)?;
@@ -585,7 +607,8 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
             v.turn_links += 1;
             cited.push(t);
             if !ids.contains(t.as_str()) {
-                v.failures.push(format!("note #{i} cites {t}, not a turn of this soul"));
+                v.failures
+                    .push(format!("note #{i} cites {t}, not a turn of this soul"));
             }
         }
     }
@@ -594,10 +617,15 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     v.wake_lines = wake.len();
     let want = memory::cover(ms.len(), WAKE_LINES);
     if wake.len() != want.len() {
-        v.failures.push(format!("wake has {} lines, cover {}", wake.len(), want.len()));
+        v.failures.push(format!(
+            "wake has {} lines, cover {}",
+            wake.len(),
+            want.len()
+        ));
     }
     for l in wake.iter().filter(|l| l.pending) {
-        v.failures.push(format!("wake line {} has no merge", l.label));
+        v.failures
+            .push(format!("wake line {} has no merge", l.label));
     }
     // The projection loads, and its edges land on real nodes.
     let nt = memory_log::project_nt(&ms, &sums);
@@ -614,7 +642,8 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     if n > 0 {
-        v.failures.push(format!("{n} block edges point at no Memory node"));
+        v.failures
+            .push(format!("{n} block edges point at no Memory node"));
     }
     // Every cited turn is a Turn node in the soul's own store.
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
@@ -646,7 +675,8 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
             ));
         }
     } else {
-        v.failures.push("the soul has no store to check cited turns against".into());
+        v.failures
+            .push("the soul has no store to check cited turns against".into());
     }
     Ok(v)
 }
@@ -726,7 +756,11 @@ mod tests {
                 let id = rest.split_whitespace().next().unwrap().to_string();
                 let mut n = self.0.lock().unwrap();
                 *n += 1;
-                let text = if *n == 1 { "x".repeat(300) } else { format!("S{id}") };
+                let text = if *n == 1 {
+                    "x".repeat(300)
+                } else {
+                    format!("S{id}")
+                };
                 return Ok((json!({ "text": text }), 1, 1));
             }
             let n = user
@@ -769,7 +803,20 @@ mod tests {
             human: "human".into(),
         };
         let fake = Fake(std::sync::Mutex::new(0));
-        let r = relive(&repo, "s", &sp, &fake, &ledger, &log, &PeerIndex::default(), "2026", "2027", 100, 0).unwrap();
+        let r = relive(
+            &repo,
+            "s",
+            &sp,
+            &fake,
+            &ledger,
+            &log,
+            &PeerIndex::default(),
+            "2026",
+            "2027",
+            100,
+            0,
+        )
+        .unwrap();
         assert!(r.stopped.is_none(), "{r:?}");
         assert_eq!(r.notes, 6, "{r:?}");
         // 6 notes: blocks 0-1, 2-3, 4-5, 0-3 — exactly OptMem's pending set.

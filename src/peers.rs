@@ -73,10 +73,11 @@ fn heredocs(cmd: &str) -> Vec<(String, String)> {
             .unwrap_or("")
             .trim_matches(|c| c == '"' || c == '\'')
             .to_string();
-        let marker = head
-            .split("<<")
-            .nth(1)
-            .map(|m| m.trim().trim_matches(|c| c == '\'' || c == '"' || c == '-').to_string());
+        let marker = head.split("<<").nth(1).map(|m| {
+            m.trim()
+                .trim_matches(|c| c == '\'' || c == '"' || c == '-')
+                .to_string()
+        });
         let body = &after[nl + 1..];
         match marker {
             Some(m) if !m.is_empty() => {
@@ -143,7 +144,10 @@ pub fn sends(repo: &Path, sender: &str) -> Vec<Send> {
                             if let (Some(f), Some(c)) =
                                 (inp["file_path"].as_str(), inp["content"].as_str())
                             {
-                                written.entry(f.to_string()).or_default().push((ts, c.to_string()));
+                                written
+                                    .entry(f.to_string())
+                                    .or_default()
+                                    .push((ts, c.to_string()));
                             }
                         }
                         _ => {}
@@ -167,11 +171,13 @@ pub fn sends(repo: &Path, sender: &str) -> Vec<Send> {
                     if let Some(cl) = a["CommandLine"].as_str() {
                         cmds.push((ts, cl.to_string()));
                     }
-                    if let (Some(f), Some(body)) = (
-                        a["TargetFile"].as_str(),
-                        a["CodeContent"].as_str(),
-                    ) {
-                        written.entry(f.to_string()).or_default().push((ts, body.to_string()));
+                    if let (Some(f), Some(body)) =
+                        (a["TargetFile"].as_str(), a["CodeContent"].as_str())
+                    {
+                        written
+                            .entry(f.to_string())
+                            .or_default()
+                            .push((ts, body.to_string()));
                     }
                 }
             }
@@ -342,7 +348,13 @@ mod tests {
         let cmd = "cat > /tmp/m.txt <<'EOF'\nHey 4rx! Wave 1 \"done\".\nEOF\nherdr agent prompt forx \"$(cat /tmp/m.txt)\"";
         assert_eq!(cat_path(cmd).as_deref(), Some("/tmp/m.txt"));
         let h = heredocs(cmd);
-        assert_eq!(h, vec![("/tmp/m.txt".to_string(), "Hey 4rx! Wave 1 \"done\".".to_string())]);
+        assert_eq!(
+            h,
+            vec![(
+                "/tmp/m.txt".to_string(),
+                "Hey 4rx! Wave 1 \"done\".".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -353,7 +365,10 @@ mod tests {
                 ts: unix("2026-09-19T15:01:14Z").unwrap(),
                 sender: "kira".into(),
                 spawn: false,
-                flat: flat(body_of(&format!("herdr agent prompt forx \"{}\"", msg.replace('"', "\\\"")))),
+                flat: flat(body_of(&format!(
+                    "herdr agent prompt forx \"{}\"",
+                    msg.replace('"', "\\\"")
+                ))),
             }],
         };
         assert_eq!(

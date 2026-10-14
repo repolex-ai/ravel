@@ -138,7 +138,10 @@ fn new_uuid() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let h = format!("{:x}", Sha256::digest(format!("{t}-{n}-{}", std::process::id())));
+    let h = format!(
+        "{:x}",
+        Sha256::digest(format!("{t}-{n}-{}", std::process::id()))
+    );
     format!(
         "{}-{}-4{}-a{}-{}",
         &h[0..8],
@@ -267,7 +270,9 @@ impl Llm for ClaudeCode {
     }
 
     fn context_tokens(&self) -> u64 {
-        self.session.as_ref().map_or(0, |m| m.lock().unwrap().context)
+        self.session
+            .as_ref()
+            .map_or(0, |m| m.lock().unwrap().context)
     }
 
     /// Close the session: the next call opens a new one. The closed
@@ -281,7 +286,11 @@ impl Llm for ClaudeCode {
                 let projects = PathBuf::from(home).join(".claude/projects");
                 for e in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
                     let f = e.path().join(format!("{id}.jsonl"));
-                    if f.is_file() && e.file_name().to_string_lossy().contains("ravel-claude-code") {
+                    if f.is_file()
+                        && e.file_name()
+                            .to_string_lossy()
+                            .contains("ravel-claude-code")
+                    {
                         let _ = std::fs::remove_file(f);
                     }
                 }
@@ -559,7 +568,11 @@ fn to_turns(events: &[crate::Event], source: &str) -> Vec<ProseTurn> {
                 t.clear();
             }
             if role == "user" {
-                t = if source == "agy" { agy_request(&t) } else { human_words(&t) };
+                t = if source == "agy" {
+                    agy_request(&t)
+                } else {
+                    human_words(&t)
+                };
             }
             Some(ProseTurn {
                 id: e.event_id.clone(),
@@ -894,16 +907,6 @@ pub(crate) fn account_limit_note(e: &anyhow::Error) -> String {
 mod tests {
     use super::*;
 
-    fn turn(id: &str, ts: &str, text: &str) -> ProseTurn {
-        ProseTurn {
-            id: id.into(),
-            ts: ts.into(),
-            role: "user".into(),
-            text: text.into(),
-            peer: None,
-        }
-    }
-
     #[test]
     fn a_long_turn_is_clipped_on_a_character_boundary() {
         let s = "é".repeat(5000);
@@ -1041,7 +1044,10 @@ mod reader_tests {
             human_words("<bash-input>git status</bash-input>"),
             "(ran in the shell) git status"
         );
-        assert_eq!(human_words("/compact keep the plan"), "/compact keep the plan");
+        assert_eq!(
+            human_words("/compact keep the plan"),
+            "/compact keep the plan"
+        );
     }
 
     #[test]
@@ -1058,11 +1064,18 @@ mod reader_tests {
             thinking: None,
         };
         let t = to_turns(
-            &[ev("USER_EXPLICIT", raw), ev("MODEL", "On it."), ev("SYSTEM", "task finished")],
+            &[
+                ev("USER_EXPLICIT", raw),
+                ev("MODEL", "On it."),
+                ev("SYSTEM", "task finished"),
+            ],
             "agy",
         );
         assert_eq!(t.len(), 2);
-        assert_eq!((t[0].role.as_str(), t[0].text.as_str()), ("user", "sure fire the engines!"));
+        assert_eq!(
+            (t[0].role.as_str(), t[0].text.as_str()),
+            ("user", "sure fire the engines!")
+        );
         assert_eq!(t[1].role, "assistant");
     }
 }

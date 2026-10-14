@@ -101,18 +101,19 @@ fn ravel_matches_optmem_byte_for_byte() {
                 assert_eq!(out.trim(), "Nothing left to compress.", "after note {i}");
                 break;
             };
-            let body = memory::nap_body(
-                b,
-                |k| notes[k].clone(),
-                |c| tree.get(&c).cloned(),
-            )
-            .unwrap();
+            let body =
+                memory::nap_body(b, |k| notes[k].clone(), |c| tree.get(&c).cloned()).unwrap();
             let ours = memory::nap_prompt(b, &body, todo.len() - 1);
             let theirs = out
                 .rsplit_once("Run: ")
                 .map(|(head, _)| head)
                 .unwrap_or_else(|| panic!("memo nap printed no Run line: {out}"));
-            assert_eq!(ours, theirs, "merge prompt for #{} after note {i}", memory::block_id(b));
+            assert_eq!(
+                ours,
+                theirs,
+                "merge prompt for #{} after note {i}",
+                memory::block_id(b)
+            );
             prompts += 1;
             let line = format!("S{} {}", memory::block_id(b), "ü".repeat(b.0 % 7));
             memo.run(&["nap", &memory::block_id(b), &line]);
@@ -126,7 +127,11 @@ fn ravel_matches_optmem_byte_for_byte() {
         for part in 1.. {
             let out = memo.run(&["wake", &part.to_string(), &t.to_string()]);
             let done = out.contains("You are awake.");
-            theirs.extend(out.lines().filter(|l| l.starts_with('#')).map(str::to_string));
+            theirs.extend(
+                out.lines()
+                    .filter(|l| l.starts_with('#'))
+                    .map(str::to_string),
+            );
             if done {
                 break;
             }
@@ -154,9 +159,7 @@ fn ravel_matches_optmem_byte_for_byte() {
 fn cover_matches_optmem_for_long_logs() {
     let script = std::env::var("OPTMEM_MEMO")
         .expect("set OPTMEM_MEMO to OptMem's `memo` script (commit 1fb164c)");
-    let ts: Vec<usize> = (1..=5000)
-        .chain((5001..1_000_000).step_by(7919))
-        .collect();
+    let ts: Vec<usize> = (1..=5000).chain((5001..1_000_000).step_by(7919)).collect();
     let py = format!(
         "import runpy,sys\ng=runpy.run_path({script:?})\nfor t in map(int,sys.stdin.read().split()):\n print(t,' '.join('%d-%d'%b for b in g['cover'](t,96)))\n"
     );
@@ -168,7 +171,12 @@ fn cover_matches_optmem_for_long_logs() {
         .spawn()
         .expect("python3 runs");
     use std::io::Write;
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     let theirs = String::from_utf8(out.stdout).unwrap();

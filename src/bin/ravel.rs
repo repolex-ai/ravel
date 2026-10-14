@@ -232,9 +232,7 @@ fn memory(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory"))?;
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
     if lines.is_empty() {
-        println!(
-            "[ravel memory] {id}: no memories yet."
-        );
+        println!("[ravel memory] {id}: no memories yet.");
         return Ok(());
     }
     println!(

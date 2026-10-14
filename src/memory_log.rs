@@ -466,7 +466,10 @@ mod tests {
         let ms: Vec<Memory> = (0..200).map(mem).collect();
         let mut s = HashMap::new();
         for b in pending(&HashMap::new(), 200) {
-            s.insert(memory::block_id(b), sum(b, &format!("S{}", memory::block_id(b))));
+            s.insert(
+                memory::block_id(b),
+                sum(b, &format!("S{}", memory::block_id(b))),
+            );
         }
         let v = wake_view(&ms, &s, 200, 96);
         assert!(v.len() <= 96);
@@ -484,7 +487,8 @@ mod tests {
         let dir = std::env::temp_dir().join("ravel-optmem-log-test");
         let _ = std::fs::remove_dir_all(&dir);
         let log = MemoryLog::at(dir.clone());
-        log.append_chunk(&[mem(0)], &["t1".into(), "t2".into()]).unwrap();
+        log.append_chunk(&[mem(0)], &["t1".into(), "t2".into()])
+            .unwrap();
         assert_eq!(log.memories().unwrap().len(), 1);
         assert!(log.extracted().unwrap().contains("t2"));
         log.append_summary(&sum((0, 2), "first")).unwrap();
@@ -503,7 +507,10 @@ mod tests {
         let nt = project_nt(&ms, &s);
         let rel = "<https://repolex.ai/ontology/git-lex/relatedToId>";
         let m = |id: &str| format!("<https://repolex.ai/ravel/Memory/{id}>");
-        assert!(nt.contains(&format!("{} {rel} <https://repolex.ai/ravel/Turn/t0> .", m("m0"))));
+        assert!(nt.contains(&format!(
+            "{} {rel} <https://repolex.ai/ravel/Turn/t0> .",
+            m("m0")
+        )));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-1"), m("m0"))));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-1"), m("m1"))));
         assert!(nt.contains(&format!("{} {rel} {} .", m("0-3"), m("0-1"))));

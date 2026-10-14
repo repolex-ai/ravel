@@ -40,7 +40,11 @@ fn speakers(repo: &std::path::Path) -> Speakers {
         .ok()
         .and_then(|c| c.human)
         .unwrap_or_else(|| "human".to_string());
-    Speakers { agent, peers, human }
+    Speakers {
+        agent,
+        peers,
+        human,
+    }
 }
 
 /// Every soul's sends, for telling a peer's message from the human's: the
@@ -61,12 +65,19 @@ fn peer_index(repo: &std::path::Path) -> ravel::peers::PeerIndex {
     let souls: Vec<(std::path::PathBuf, String)> = dirs
         .into_iter()
         .map(|d| {
-            let n = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let n = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             (d, n)
         })
         .collect();
     let idx = ravel::peers::PeerIndex::build(&souls);
-    eprintln!("[ravel-relive] {} peer sends indexed across {} souls", idx.len(), souls.len());
+    eprintln!(
+        "[ravel-relive] {} peer sends indexed across {} souls",
+        idx.len(),
+        souls.len()
+    );
     idx
 }
 
