@@ -309,25 +309,15 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
 const INGEST_MANIFEST: &str = ".ravel/_ignore/ingest-manifest.tsv";
 
 fn read_manifest(repo: &Path) -> std::collections::HashMap<String, u64> {
-    std::fs::read_to_string(repo.join(INGEST_MANIFEST))
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| {
-                    let (name, len) = l.split_once('\t')?;
-                    Some((name.to_string(), len.parse().ok()?))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    read_tsv(&repo.join(INGEST_MANIFEST))
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v.parse().ok()?)))
+        .collect()
 }
 
 fn write_manifest(repo: &Path, m: &std::collections::HashMap<String, u64>) -> Result<()> {
-    let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
-    lines.sort();
-    let tmp = repo.join(INGEST_MANIFEST).with_extension("tsv.tmp");
-    std::fs::write(&tmp, lines.join("\n") + "\n")?;
-    std::fs::rename(&tmp, repo.join(INGEST_MANIFEST))?;
-    Ok(())
+    let m = m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
+    write_tsv(&repo.join(INGEST_MANIFEST), &m)
 }
 
 // ─────────────────────────── Gemini / Antigravity ───────────────────────────
@@ -513,25 +503,11 @@ fn file_sha256(path: &Path) -> Result<String> {
 const AGY_MANIFEST: &str = ".ravel/_ignore/ingest-manifest-agy.tsv";
 
 fn read_agy_manifest(repo: &Path) -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string(repo.join(AGY_MANIFEST))
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| {
-                    let (name, hash) = l.split_once('\t')?;
-                    Some((name.to_string(), hash.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    read_tsv(&repo.join(AGY_MANIFEST))
 }
 
 fn write_agy_manifest(repo: &Path, m: &std::collections::HashMap<String, String>) -> Result<()> {
-    let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
-    lines.sort();
-    let tmp = repo.join(AGY_MANIFEST).with_extension("tsv.tmp");
-    std::fs::write(&tmp, lines.join("\n") + "\n")?;
-    std::fs::rename(&tmp, repo.join(AGY_MANIFEST))?;
-    Ok(())
+    write_tsv(&repo.join(AGY_MANIFEST), m)
 }
 
 /// Mirror and ingest this soul's Gemini/Antigravity conversations.
@@ -837,8 +813,20 @@ pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
     })
 }
 
+/// What a projected Turn carries. Bump it whenever `project::project_nt`
+/// changes, and every ingest manifest reads as empty once, so every soul's
+/// whole history is projected again with the new terms. Without it, a turn
+/// ingested before the change keeps the old shape forever, because an
+/// unchanged file is never read twice. 2: `ravel:model`, `ravel:modelSetting`.
+const TURN_PROJECTION: &str = "2";
+/// The manifest line that records [`TURN_PROJECTION`]. `#` cannot begin a
+/// transcript file name, a conversation id or an export key.
+const PROJECTION_KEY: &str = "#turn-projection";
+
+/// An ingest manifest: `<key>\t<value>` per line. A manifest written under an
+/// older [`TURN_PROJECTION`] reads as empty.
 fn read_tsv(path: &Path) -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string(path)
+    let mut m: std::collections::HashMap<String, String> = std::fs::read_to_string(path)
         .map(|s| {
             s.lines()
                 .filter_map(|l| {
@@ -847,11 +835,16 @@ fn read_tsv(path: &Path) -> std::collections::HashMap<String, String> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if m.remove(PROJECTION_KEY).as_deref() != Some(TURN_PROJECTION) {
+        m.clear();
+    }
+    m
 }
 
 fn write_tsv(path: &Path, m: &std::collections::HashMap<String, String>) -> Result<()> {
     let mut lines: Vec<String> = m.iter().map(|(k, v)| format!("{k}\t{v}")).collect();
+    lines.push(format!("{PROJECTION_KEY}\t{TURN_PROJECTION}"));
     lines.sort();
     let tmp = path.with_extension("tsv.tmp");
     std::fs::write(&tmp, lines.join("\n") + "\n")?;
@@ -1557,6 +1550,10 @@ mod tests {
             read_manifest(&std::env::temp_dir().join("no-such-repo")).len(),
             0
         );
+        // A manifest from before the current turn projection reads as empty,
+        // so every file is projected again with the new terms.
+        fs::write(repo.join(INGEST_MANIFEST), "a.jsonl\t42\nb.jsonl\t7\n").unwrap();
+        assert!(read_manifest(&repo).is_empty());
         fs::remove_dir_all(&repo).ok();
     }
 

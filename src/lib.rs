@@ -61,6 +61,19 @@ pub struct Event {
     /// adapters are already lossless and the ruling costs one line in
     /// `project.rs` when it lands — absence as roadmap, not as ignorance.
     pub thinking: Option<String>,
+    /// The model that answered this turn, as the record itself reports it.
+    /// Claude Code writes the API's own `message.model` on every reply, so this
+    /// is the model that ran, not the one that was chosen. None when the record
+    /// does not say: a harness-written `<synthetic>` reply, a human turn, the
+    /// Claude desktop export (which names no model anywhere).
+    pub model: Option<String>,
+    /// The model setting in force for this turn, as the harness last announced
+    /// it in this conversation. Antigravity writes no model on its replies; it
+    /// announces each change of its `Model Selection` setting inside the next
+    /// user input, and almost always on a conversation's first input. A change
+    /// made outside the conversation is not seen, so this is the setting, never
+    /// a report of what ran.
+    pub model_setting: Option<String>,
 }
 
 /// Where a slice of an event's concatenated `text` came from.

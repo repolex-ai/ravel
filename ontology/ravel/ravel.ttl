@@ -50,7 +50,7 @@
     a owl:Ontology ;
     rdfs:label "Ravel ontology" ;
     rdfs:comment "Transcript-graph vocabulary: conversational turns and the reader-annotation layer over them. Graph-only — no authored documents." ;
-    owl:versionInfo "0.5.0" .
+    owl:versionInfo "0.6.0" .
 
 # ─── The spine ───────────────────────────────────────────────────────────────
 
@@ -95,6 +95,18 @@ ravel:timestamp a owl:DatatypeProperty ;
 ravel:text a owl:DatatypeProperty ;
     rdfs:label "text" ;
     rdfs:comment "The turn's concatenated text content, when any." ;
+    rdfs:domain ravel:Turn ;
+    rdfs:range xsd:string .
+
+ravel:model a owl:DatatypeProperty ;
+    rdfs:label "model" ;
+    rdfs:comment "The model that answered this turn, as the record itself reports it (Claude Code: the API's own message.model, e.g. 'claude-opus-5-5'). Absent when the record names none: human turns, harness-written replies, the Claude desktop export." ;
+    rdfs:domain ravel:Turn ;
+    rdfs:range xsd:string .
+
+ravel:modelSetting a owl:DatatypeProperty ;
+    rdfs:label "modelSetting" ;
+    rdfs:comment "The model setting in force for this turn, as the harness last announced it in this conversation (Antigravity's Model Selection notices, e.g. 'Gemini 4 Argon (Medium)'). A setting, not a report of what ran: a change made outside the conversation is not seen." ;
     rdfs:domain ravel:Turn ;
     rdfs:range xsd:string .
 

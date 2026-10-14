@@ -149,6 +149,7 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
     }
 
     let mut prev_idx: Option<u64> = None;
+    let mut setting: Option<String> = None;
     for (idx, o) in &rows {
         let step_type = o.get("type").and_then(Value::as_str).unwrap_or("");
         let event_id = turn_id(conversation_id, *idx);
@@ -180,6 +181,14 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
             None => Vec::new(),
         };
 
+        // Only the human's own input announces a setting change; the same
+        // words inside tool output are quoted, not announced.
+        if step_type == "USER_INPUT" {
+            if let Some(m) = text.as_deref().and_then(announced_model) {
+                setting = Some(m);
+            }
+        }
+
         out.events.push(Event {
             event_id,
             parent_id,
@@ -206,10 +215,32 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            model: None,
+            model_setting: setting.clone(),
         });
     }
 
     Ok(out)
+}
+
+/// The model a `Model Selection` notice changes to, as Antigravity words it:
+/// "The user changed setting `Model Selection` from X to Y. No need …". The
+/// last notice in one input wins.
+fn announced_model(text: &str) -> Option<String> {
+    const OPEN: &str = "The user changed setting `Model Selection` from ";
+    let mut found = None;
+    let mut rest = text;
+    while let Some(i) = rest.find(OPEN) {
+        rest = &rest[i + OPEN.len()..];
+        let Some(end) = rest.find(". No need") else {
+            break;
+        };
+        if let Some((_, to)) = rest[..end].rsplit_once(" to ") {
+            found = Some(to.trim().to_string());
+        }
+        rest = &rest[end..];
+    }
+    found.filter(|m| !m.is_empty() && m != "None")
 }
 
 /// The idempotency key: `<conversation-uuid>:<step_index>`.
@@ -468,5 +499,56 @@ mod tests {
     #[test]
     fn turn_id_passes_the_iri_gate() {
         crate::project::validate_event_id(&turn_id(CONV, 42)).unwrap();
+    }
+
+    #[test]
+    fn the_model_setting_carries_forward_from_the_humans_own_notices() {
+        let notice = |from: &str, to: &str| {
+            format!("<USER_REQUEST>\nhi\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from {from} to {to}. No need to comment on this change if the user doesn't ask about it.\n</USER_SETTINGS_CHANGE>")
+        };
+        let row = |i: u64, source: &str, ty: &str, content: &str| {
+            serde_json::json!({"step_index": i, "source": source, "type": ty, "status": "DONE",
+                "created_at": "2026-10-14T12:00:00Z", "content": content})
+            .to_string()
+        };
+        let jsonl = [
+            row(
+                0,
+                "USER_EXPLICIT",
+                "USER_INPUT",
+                &notice("None", "Gemini 3.8 Flash (High)"),
+            ),
+            row(1, "MODEL", "PLANNER_RESPONSE", "hello"),
+            // quoted in tool output: not an announcement
+            row(
+                2,
+                "MODEL",
+                "VIEW_FILE",
+                &notice("Gemini 3.8 Flash (High)", "Quoted Model"),
+            ),
+            row(
+                3,
+                "USER_EXPLICIT",
+                "USER_INPUT",
+                &notice("Gemini 3.8 Flash (High)", "Gemini 4 Argon (Medium)"),
+            ),
+            row(4, "MODEL", "PLANNER_RESPONSE", "hi again"),
+        ]
+        .join("\n");
+        let p = parse_transcript(&jsonl, CONV).unwrap();
+        let got: Vec<Option<&str>> = p
+            .events
+            .iter()
+            .map(|e| e.model_setting.as_deref())
+            .collect();
+        let f = Some("Gemini 3.8 Flash (High)");
+        let a = Some("Gemini 4 Argon (Medium)");
+        assert_eq!(got, vec![f, f, f, a, a]);
+        assert!(
+            p.events.iter().all(|e| e.model.is_none()),
+            "AGY never reports a model per reply"
+        );
+        assert_eq!(announced_model("nothing here"), None);
+        assert_eq!(announced_model(&notice("X", "None")), None);
     }
 }

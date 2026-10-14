@@ -259,6 +259,8 @@ mod tests {
             text: Some(text.into()),
             text_provenance: vec![span],
             thinking: None,
+            model: None,
+            model_setting: None,
         }
     }
 

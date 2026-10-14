@@ -1010,6 +1010,8 @@ mod tests {
             text: Some("This session is being continued from a previous conversation that ran out of context. Summary: ...".into()),
             text_provenance: vec![],
             thinking: None,
+            model: None,
+            model_setting: None,
         };
         let t = to_turns(&[e], "claude-code");
         assert_eq!(t.len(), 1, "still marked read");
@@ -1062,6 +1064,8 @@ mod reader_tests {
             text: Some(text.into()),
             text_provenance: vec![],
             thinking: None,
+            model: None,
+            model_setting: None,
         };
         let t = to_turns(
             &[

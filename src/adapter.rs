@@ -51,6 +51,8 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
             text,
             text_provenance,
             thinking: extract_thinking(o.get("message")),
+            model: reported_model(o.get("message")),
+            model_setting: None,
         });
     }
     Ok(events)
@@ -127,6 +129,17 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
     }
 }
 
+/// The model a reply reports it ran on: `message.model`, as the API wrote it.
+/// Claude Code writes `<synthetic>` on replies it made itself without calling
+/// a model (error notices, interruptions); those ran on no model.
+fn reported_model(message: Option<&Value>) -> Option<String> {
+    message
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty() && *m != "<synthetic>")
+        .map(str::to_string)
+}
+
 /// Pull `thinking` blocks out of a `message`, joined by a blank line when a
 /// record carries several. Separate from [`extract_text`] on purpose: these
 /// share a record with spoken prose but are not part of it.
@@ -169,4 +182,23 @@ fn extract_tool_result_text(block: &Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_carries_the_model_the_api_reported_and_synthetic_carries_none() {
+        let jsonl = [
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-10-14T12:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-10-14T12:00:01Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","timestamp":"2026-10-14T12:00:02Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error"}]}}"#,
+        ]
+        .join("\n");
+        let e = parse_transcript(&jsonl).unwrap();
+        let got: Vec<Option<&str>> = e.iter().map(|e| e.model.as_deref()).collect();
+        assert_eq!(got, vec![None, Some("claude-opus-5-5"), None]);
+        assert!(e.iter().all(|e| e.model_setting.is_none()));
+    }
 }

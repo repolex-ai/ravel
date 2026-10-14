@@ -71,6 +71,8 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
     let p_ts = format!("{RAVEL_NS}timestamp");
     let p_text = format!("{RAVEL_NS}text");
     let p_role = format!("{RAVEL_NS}role");
+    let p_model = format!("{RAVEL_NS}model");
+    let p_setting = format!("{RAVEL_NS}modelSetting");
     let xsd_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
 
     for e in events {
@@ -100,6 +102,12 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
         if let Some(tx) = &e.text {
             nt.push_str(&format!("<{s}> <{p_text}> {} .\n", lit(tx)));
         }
+        if let Some(m) = &e.model {
+            nt.push_str(&format!("<{s}> <{p_model}> {} .\n", lit(m)));
+        }
+        if let Some(m) = &e.model_setting {
+            nt.push_str(&format!("<{s}> <{p_setting}> {} .\n", lit(m)));
+        }
     }
 
     Ok(nt)
@@ -116,4 +124,53 @@ fn escape(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ontology_declares_every_turn_term_the_projection_emits() {
+        let ttl = include_str!("../ontology/ravel/ravel.ttl");
+        let store = Store::new().unwrap();
+        store
+            .load_from_reader(oxigraph::io::RdfFormat::Turtle, ttl.as_bytes())
+            .expect("ravel.ttl parses");
+        let e = Event {
+            event_id: "e1".into(),
+            parent_id: Some("e0".into()),
+            role: "assistant".into(),
+            timestamp: Some("2026-10-14T12:00:00Z".into()),
+            text: Some("hello".into()),
+            text_provenance: vec![],
+            thinking: None,
+            model: Some("claude-opus-5-5".into()),
+            model_setting: Some("Gemini 4 Argon (Medium)".into()),
+        };
+        let nt = project_nt(&[e], "urn:test:").unwrap();
+        let mut terms: Vec<String> = nt
+            .split_whitespace()
+            .filter_map(|w| w.strip_prefix(&format!("<{RAVEL_NS}")))
+            .map(|w| w.trim_end_matches('>').to_string())
+            .collect();
+        terms.sort();
+        terms.dedup();
+        assert!(
+            terms.contains(&"model".to_string()) && terms.contains(&"modelSetting".to_string())
+        );
+        for t in terms {
+            let q = format!("ASK {{ <{RAVEL_NS}{t}> a ?k }}");
+            let ok = matches!(
+                oxigraph::sparql::SparqlEvaluator::new()
+                    .parse_query(&q)
+                    .unwrap()
+                    .on_store(&store)
+                    .execute()
+                    .unwrap(),
+                oxigraph::sparql::QueryResults::Boolean(true)
+            );
+            assert!(ok, "ravel:{t} is emitted but not declared in ravel.ttl");
+        }
+    }
 }
