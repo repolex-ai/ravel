@@ -155,6 +155,11 @@ fn main() -> Result<()> {
             let session_tokens = if backend.contains("+session") { SESSION_TOKENS } else { 0 };
             let r = relive(&repo, &agent, &sp, llm.as_ref(), &ledger, &log, &idx, from, to, max_calls, session_tokens)?;
             println!("{}", serde_json::to_string_pretty(&r)?);
+            // A stopped run is unfinished: say so in the exit status, so a
+            // script cannot mistake it for a finished one.
+            if r.stopped.is_some() {
+                std::process::exit(2);
+            }
         }
         _ => bail!(
             "usage:\n  ravel-relive plan <soul-repo> <from> <to>\n  ravel-relive run <soul-repo> <from> <to> <out-dir> <sub:model or api:max-usd> [max-calls]"
