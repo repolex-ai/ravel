@@ -36,7 +36,7 @@ fn usage() -> ! {
            ravel souls\n  \
            ravel sync   [<soul> [<sessions-dir>]]\n  \
            ravel import [<soul>] <export-dir>\n  \
-           ravel memory [<soul>] | memory open [<soul>] <id>\n  \
+           ravel memory [<soul>] | memory open [<soul>] <id> | memory recall <words>\n  \
            ravel health [<soul>]\n  \
            ravel stats  [<soul>]\n  \
            ravel query  [<soul>] \"<sparql>\"\n  \
@@ -74,6 +74,9 @@ fn main() -> Result<()> {
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
         ["memory"] => memory(&client, &resolve(&client, None)?),
+        ["memory", "recall", words @ ..] if !words.is_empty() => {
+            memory_recall(&client, &resolve(&client, None)?, &words.join(" "))
+        }
         ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
         ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
         ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
@@ -276,6 +279,99 @@ fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `ravel memory recall <words>`: a compact picture of one term across a
+/// soul's whole history, for the notes the wake has compressed away. How often
+/// it was said and when, how often it was noted and in which months, the
+/// highest merge that still names it, and the latest notes, with the ids
+/// `memory open` takes. Matched as a whole word or phrase, ignoring case.
+fn memory_recall(client: &Client, id: &str, term: &str) -> Result<()> {
+    const MEM: &str = "<https://repolex.ai/ravel/NamedGraph/memory-v1>";
+    let ns = ravel::RAVEL_NS;
+    let lower = term.to_lowercase();
+    let lit = serde_json::to_string(&lower)?;
+    let word = "[^A-Za-z0-9_]";
+    let re = serde_json::to_string(&format!("(^|{word}){}($|{word})", regex_escape(&lower)))?;
+    let hit =
+        |var: &str| format!("FILTER(CONTAINS(LCASE({var}), {lit}) && REGEX({var}, {re}, \"i\"))");
+    let q = |sparql: String| -> Result<Vec<Value>> {
+        let v = client.post(
+            &format!("/souls/{id}/query"),
+            Some(serde_json::json!({ "query": format!("PREFIX ravel: <{ns}>\n{sparql}") })),
+        )?;
+        Ok(v["results"]["bindings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    };
+    let val = |b: &Value, k: &str| b[k]["value"].as_str().unwrap_or("").to_string();
+    let notes = q(format!(
+        "SELECT ?i ?ts ?x WHERE {{ GRAPH {MEM} {{ ?m ravel:memoryLevel 0 ; ravel:logStart ?i ; ravel:windowStart ?ts ; ravel:memoryText ?x . {} }} }} ORDER BY ?i",
+        hit("?x")
+    ))?;
+    let top = q(format!(
+        "SELECT ?a ?b ?x WHERE {{ GRAPH {MEM} {{ ?m ravel:memoryLevel ?l ; ravel:logStart ?a ; ravel:logEnd ?b ; ravel:memoryText ?x . FILTER(?l > 0) {} }} }} ORDER BY DESC(?l) ?a LIMIT 1",
+        hit("?x")
+    ))?;
+    let turns = q(format!(
+        "SELECT (COUNT(?u) AS ?n) (MIN(STR(?ts)) AS ?first) (MAX(STR(?ts)) AS ?last) WHERE {{ GRAPH ?g {{ ?u a ravel:Turn ; ravel:text ?x ; ravel:timestamp ?ts . {} }} }}",
+        hit("?x")
+    ))?;
+    let t = turns.first().cloned().unwrap_or_default();
+    let said = val(&t, "n");
+    if said.is_empty() || said == "0" {
+        println!("«{term}»: never said in this soul's turns.");
+    } else {
+        println!(
+            "«{term}»: said in {said} turns, {} to {}",
+            &val(&t, "first")[..10.min(val(&t, "first").len())],
+            &val(&t, "last")[..10.min(val(&t, "last").len())]
+        );
+    }
+    if notes.is_empty() {
+        println!("  never noted.");
+        return Ok(());
+    }
+    let mut months: std::collections::BTreeMap<String, usize> = Default::default();
+    for n in &notes {
+        *months
+            .entry(val(n, "ts").chars().take(7).collect())
+            .or_default() += 1;
+    }
+    let by: Vec<String> = months.iter().map(|(m, c)| format!("{m} {c}")).collect();
+    println!("  noted {} times: {}", notes.len(), by.join(" · "));
+    if let Some(b) = top.first() {
+        // logEnd is inclusive, as OptMem writes a block id.
+        println!(
+            "  highest merge naming it: #{}-{} {}",
+            val(b, "a"),
+            val(b, "b"),
+            val(b, "x")
+        );
+    }
+    for n in notes.iter().rev().take(5).rev() {
+        println!(
+            "  #{} {} {}",
+            val(n, "i"),
+            short(&val(n, "ts")),
+            val(n, "x")
+        );
+    }
+    Ok(())
+}
+
+/// Escape a literal for an XPath regex (SPARQL REGEX).
+fn regex_escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if "\\.^$|?*+()[]{}-".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 fn import(client: &Client, id: &str, dir: &str) -> Result<()> {
