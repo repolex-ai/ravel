@@ -111,13 +111,16 @@ fn local_time(ts: &str) -> String {
 
 /// One model call, tried up to four times with a growing pause: a rate limit
 /// or a dropped connection should wait, not end a soul's run. An account
-/// refusal ends it at once.
+/// limit or a usage-policy refusal returns at once.
 fn call(llm: &dyn Llm, system: &str, user: &str, schema: &Value) -> Result<(Value, u64, u64)> {
     let mut wait = 30;
     for attempt in 1.. {
         match llm.json(system, user, schema, 4096) {
             Ok(x) => return Ok(x),
             Err(e) if is_account_limit(&e) => anyhow::bail!(account_limit_note(&e)),
+            // The same words get the same refusal: waiting does not help, and
+            // the caller decides what a refused stretch becomes.
+            Err(e) if is_policy_refusal(&e) => return Err(e),
             Err(e) if attempt >= 4 => return Err(e),
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_secs(wait));
@@ -258,6 +261,9 @@ pub struct ReliveReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub stopped: Option<String>,
+    /// Stretches the model's usage policy refused twice, left blank and
+    /// logged in `dropped.tsv`.
+    pub refused: usize,
 }
 
 /// The stretches over `[from, to)` exactly as the reader is shown them,
@@ -347,6 +353,14 @@ fn ask_line(
         }
     }
     Ok(None)
+}
+
+/// A refusal under the model's usage policy, as `claude -p` reports it. Not an
+/// outage: the same text will be refused again, so it is never retried
+/// more than once.
+fn is_policy_refusal(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    m.contains("anthropic.com/legal/aup") || m.contains("can't help with this")
 }
 
 /// A line that is itself JSON is a writer answering in the shape it was asked
@@ -480,7 +494,7 @@ pub fn relive(
             llm.reset();
             r.sessions += 1;
         }
-        let wake = (llm.context_tokens() == 0).then(|| -> Result<String> {
+        let wake_now = || -> Result<String> {
             let memories = log.memories()?;
             let sums = log.summaries()?;
             Ok(wake_text(&wake_view(
@@ -489,21 +503,53 @@ pub fn relive(
                 memories.len(),
                 WAKE_LINES,
             )))
-        });
-        let wake = wake.transpose()?;
-        // 2. Note. A stretch is never skipped: memory is built in order, so a
-        //    gap read later would land behind notes that came after it.
-        let prompt = note_prompt(wake.as_deref(), &stretch, &convs, sp);
-        if !take_call(&mut r) {
-            return Ok(r);
-        }
-        let (v, i, o) = match call(llm, &sys, &prompt, &note_schema()) {
-            Ok(x) => x,
-            Err(e) => {
-                r.stopped = Some(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
+        };
+        // 2. Note. A stretch is never put off to read later: memory is built
+        //    in order, so a gap read later would land behind notes that came
+        //    after it. The one exception is a stretch the model's usage
+        //    policy refuses twice, once in a fresh session: it is marked read
+        //    with no notes, and the gap is logged (goodlux, 2026-10-15: leave
+        //    blanks, don't fight the classifier).
+        let mut refusals = 0;
+        let answer = loop {
+            let wake = if llm.context_tokens() == 0 {
+                Some(wake_now()?)
+            } else {
+                None
+            };
+            let prompt = note_prompt(wake.as_deref(), &stretch, &convs, sp);
+            if !take_call(&mut r) {
                 return Ok(r);
             }
+            match call(llm, &sys, &prompt, &note_schema()) {
+                Ok(x) => break Some(x),
+                Err(e) if is_policy_refusal(&e) && refusals == 0 => {
+                    refusals += 1;
+                    llm.reset();
+                }
+                Err(e) if is_policy_refusal(&e) => {
+                    llm.reset();
+                    let ids: Vec<String> = stretch.iter().map(|s| s.turn.id.clone()).collect();
+                    log.append_dropped(&[format!(
+                        "refused by the model's usage policy twice, so left blank: the stretch of {} turns from {} to {}: {}",
+                        stretch.len(),
+                        stretch[0].turn.ts,
+                        stretch[stretch.len() - 1].turn.ts,
+                        format!("{e:#}").lines().next().unwrap_or("")
+                    )])?;
+                    log.append_chunk(&[], &ids)?;
+                    r.turns += stretch.len();
+                    r.stretches += 1;
+                    r.refused += 1;
+                    break None;
+                }
+                Err(e) => {
+                    r.stopped = Some(format!("stretch at {}: {e:#}", stretch[0].turn.ts));
+                    return Ok(r);
+                }
+            }
         };
+        let Some((v, i, o)) = answer else { continue };
         ledger.record(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
@@ -843,6 +889,100 @@ mod tests {
         assert_eq!(r.merges, 4);
         assert_eq!(r.reasked, 1, "the too-long first merge was asked again");
         assert!(memory_log::pending(&sums, 6).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Refuses, as the usage policy does, any note prompt that shows a turn
+    /// marked FORBIDDEN; otherwise notes one line per turn and merges plainly.
+    struct Refuser(std::sync::Mutex<usize>);
+    impl Llm for Refuser {
+        fn model(&self) -> &str {
+            "fake"
+        }
+        fn json(&self, _: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+            if let Some(rest) = user.strip_prefix("Compress memories #") {
+                let id = rest.split_whitespace().next().unwrap().to_string();
+                return Ok((json!({ "text": format!("S{id}") }), 1, 1));
+            }
+            if user.contains("FORBIDDEN") {
+                *self.0.lock().unwrap() += 1;
+                anyhow::bail!("claude -p failed: API Error: Haiku 5.5 can't help with this. Start a new session to continue.\n\nLearn more: https://www.anthropic.com/legal/aup");
+            }
+            let n = user
+                .lines()
+                .filter(|l| l.starts_with('[') && l.contains("] 20"))
+                .count();
+            let notes: Vec<Value> = (1..=n)
+                .map(|k| json!({"text": format!("I noted turn {k}"), "turns": [k]}))
+                .collect();
+            Ok((json!({ "notes": notes }), 1, 1))
+        }
+    }
+
+    #[test]
+    fn a_stretch_refused_twice_is_left_blank_logged_and_read_past() {
+        let base = std::env::temp_dir().join(format!("ravel-relive-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("soul");
+        let mirror = repo.join(crate::sync::TRANSCRIPTS_SUBDIR).join("p");
+        std::fs::create_dir_all(&mirror).unwrap();
+        // 12 turns clipped to ~4,000 characters: the first stretch carries the
+        // refused turn, the ones after it do not.
+        let rec = |k: usize| {
+            let body = if k == 0 {
+                format!("FORBIDDEN {}", "z".repeat(9_000))
+            } else {
+                "z".repeat(9_000)
+            };
+            json!({"type":"user","uuid":format!("u{k}"),"parentUuid":if k==0 {String::new()} else {format!("u{}",k-1)},
+                   "timestamp":format!("2026-06-01T10:{k:02}:00Z"),"sessionId":"s",
+                   "message":{"role":"user","content":body}})
+            .to_string()
+        };
+        std::fs::write(
+            mirror.join("s1.jsonl"),
+            (0..12).map(rec).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+        let log = MemoryLog::at(base.join("out"));
+        let ledger = Ledger::open_at(base.join("spend.tsv"), 1.0).unwrap();
+        let sp = Speakers {
+            agent: "soul".into(),
+            peers: vec![],
+            human: "human".into(),
+        };
+        let llm = Refuser(std::sync::Mutex::new(0));
+        let r = relive(
+            &repo,
+            "s",
+            &sp,
+            &llm,
+            &ledger,
+            &log,
+            &PeerIndex::default(),
+            "2026",
+            "2027",
+            100,
+            0,
+        )
+        .unwrap();
+        assert!(r.stopped.is_none(), "{r:?}");
+        assert_eq!(r.refused, 1, "{r:?}");
+        assert_eq!(
+            *llm.0.lock().unwrap(),
+            2,
+            "asked once more in a fresh session, then left blank"
+        );
+        assert_eq!(
+            r.turns, 12,
+            "every turn is marked read, the refused ones included"
+        );
+        assert!(r.notes > 0 && r.notes < 12, "{r:?}");
+        let dropped = std::fs::read_to_string(base.join("out").join("dropped.tsv")).unwrap();
+        assert!(
+            dropped.contains("refused by the model's usage policy twice"),
+            "{dropped}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
