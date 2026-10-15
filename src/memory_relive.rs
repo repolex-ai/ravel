@@ -21,7 +21,7 @@ use crate::memory_extract::{
 };
 use crate::memory_log::{self, wake_text, wake_view, Memory, MemoryLog, Summary};
 use crate::peers::{PeerIndex, Sent};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
@@ -333,7 +333,8 @@ fn ask_line(
                     Some(_) if llm.context_tokens() > 0 => why.clone(),
                     Some(prompt) => format!("{prompt}\n\nYou answered:\n{line}\n\n{why}"),
                 };
-                let (v, i, o) = call(llm, sys, &again, &summary_schema())?;
+                let (v, i, o) = call(llm, sys, &again, &summary_schema())
+                    .with_context(|| format!("asking again for a line refused by check: {line}"))?;
                 ledger.record(soul, i, o)?;
                 r.input_tokens += i;
                 r.output_tokens += o;

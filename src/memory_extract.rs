@@ -254,10 +254,16 @@ impl Llm for ClaudeCode {
         if key_source != "none" {
             anyhow::bail!("claude -p used an API key, not the subscription; stopping");
         }
-        let so = r
-            .get("structured_output")
-            .cloned()
-            .ok_or_else(|| anyhow!("claude -p returned no structured output"))?;
+        let so = r.get("structured_output").cloned().ok_or_else(|| {
+            // Say what came back instead, so a stopped run can be read.
+            let said: String = r["result"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect();
+            anyhow!("claude -p returned no structured output; it said: {said:?}")
+        })?;
         let u = &r["usage"];
         let input = u["input_tokens"].as_u64().unwrap_or(0)
             + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
