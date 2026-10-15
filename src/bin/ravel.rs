@@ -223,11 +223,42 @@ fn print_lines(lines: &[Value]) {
     for l in lines {
         let label = l["label"].as_str().unwrap_or("");
         let text = l["text"].as_str().unwrap_or("");
+        let date = l["date"].as_str().unwrap_or("");
         if l["level"].as_u64().unwrap_or(0) == 0 {
-            println!("{label} {} {text}", l["date"].as_str().unwrap_or(""));
+            println!("{label} {date} {text}");
         } else {
-            println!("{label} {text}");
+            println!(
+                "{label} {} {text}",
+                span(date, l["date_to"].as_str().unwrap_or(""))
+            );
         }
+    }
+}
+
+/// A block's date span as the wake shows it: `2026-04-03..04-08`, with the
+/// end's year left off when it repeats the start's.
+fn span(from: &str, to: &str) -> String {
+    if from.is_empty() || to.is_empty() || from == to {
+        return from.to_string();
+    }
+    let end = if from.get(..4) == to.get(..4) {
+        to.get(5..).unwrap_or(to)
+    } else {
+        to
+    };
+    format!("{from}..{end}")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_span_drops_only_a_repeated_year() {
+        assert_eq!(super::span("2026-04-03", "2026-04-08"), "2026-04-03..04-08");
+        assert_eq!(
+            super::span("2025-12-30", "2026-01-02"),
+            "2025-12-30..2026-01-02"
+        );
+        assert_eq!(super::span("2026-04-03", "2026-04-03"), "2026-04-03");
     }
 }
 

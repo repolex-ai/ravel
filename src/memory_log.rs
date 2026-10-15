@@ -192,8 +192,14 @@ pub struct Line {
     pub from: String,
     pub to: String,
     pub text: String,
-    /// The note's date (OptMem prints it on note lines only).
+    /// The note's date (OptMem prints it on note lines only). For a block,
+    /// the date of its first note.
     pub date: String,
+    /// The date of the last note under it: a block's date span is
+    /// `date..date_to`. Ravel's wake display prints the span on block lines
+    /// (goodlux, 2026-10-15) so a superseded fact does not read as current
+    /// beside its replacement; OptMem's own wake, and the reader's, print none.
+    pub date_to: String,
     /// True for a block not built yet: OptMem's wake would stop and ask for
     /// the merge; a reader shows that it is missing instead of its text.
     pub pending: bool,
@@ -213,6 +219,7 @@ pub fn node_line(memories: &[Memory], summaries: &HashMap<String, Summary>, b: B
             to: first.ts.clone(),
             text: first.text.clone(),
             date: first.date(),
+            date_to: first.date(),
             pending: false,
         };
     }
@@ -229,6 +236,7 @@ pub fn node_line(memories: &[Memory], summaries: &HashMap<String, Summary>, b: B
         to: last.ts.clone(),
         text,
         date: first.date(),
+        date_to: last.date(),
         pending,
     }
 }
