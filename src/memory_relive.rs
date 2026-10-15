@@ -316,7 +316,7 @@ fn ask_line(
     let mut line = first;
     let mut refused: Vec<String> = Vec::new();
     for n in 0..ASKS {
-        match memory::check(&line) {
+        match memory::check(&line).and_then(not_wrapped) {
             Ok(ok) => return Ok(Some(ok)),
             Err(why) if n + 1 < ASKS => {
                 refused.push(format!("{why} — {line}"));
@@ -347,6 +347,22 @@ fn ask_line(
         }
     }
     Ok(None)
+}
+
+/// A line that is itself JSON is a writer answering in the shape it was asked
+/// for once, not with the line: Sonnet 5.5, re-asked to shorten a note, gave
+/// `[{"text": "…", "turns": [5]}]` as the line 14 times on nug3. OptMem's
+/// `check` cannot see it (one line, short enough), so it is refused here and
+/// asked again like any other refusal, never unwrapped by guesswork.
+fn not_wrapped(line: String) -> Result<String, String> {
+    let t = line.trim_start();
+    let json = (t.starts_with('{') || t.starts_with('['))
+        && serde_json::from_str::<Value>(&line).is_ok_and(|v| v.is_object() || v.is_array());
+    if json {
+        Err("That is JSON. Give the memory itself: one plain line of text.".into())
+    } else {
+        Ok(line)
+    }
 }
 
 /// Answer every merge due over the log, in OptMem's order. `false` when the
@@ -567,7 +583,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     v.notes = ms.len();
     v.blocks = sums.len();
     for (i, m) in ms.iter().enumerate() {
-        if let Err(e) = memory::check(&m.text) {
+        if let Err(e) = memory::check(&m.text).and_then(not_wrapped) {
             v.failures.push(format!("note #{i}: {e}"));
         }
         if m.turns.is_empty() {
@@ -585,7 +601,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
             )),
             _ => {}
         }
-        if let Err(e) = memory::check(&s.text) {
+        if let Err(e) = memory::check(&s.text).and_then(not_wrapped) {
             v.failures.push(format!("block {id}: {e}"));
         }
     }
@@ -828,5 +844,16 @@ mod tests {
         assert_eq!(r.reasked, 1, "the too-long first merge was asked again");
         assert!(memory_log::pending(&sums, 6).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_line_wrapped_in_json_is_refused_and_plain_lines_pass() {
+        assert!(
+            not_wrapped(r#"[{"text": "2026-07-11 Rescued docs", "turns": [5]}]"#.into()).is_err()
+        );
+        assert!(not_wrapped(r#"{"text": "x"}"#.into()).is_err());
+        // RDF 1.2 annotation syntax and bracketed prose are not JSON
+        assert!(not_wrapped("{| |} annotation syntax asserts the base triple".into()).is_ok());
+        assert!(not_wrapped("[draft] the spec is unruled".into()).is_ok());
     }
 }
