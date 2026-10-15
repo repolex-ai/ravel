@@ -249,19 +249,6 @@ fn span(from: &str, to: &str) -> String {
     format!("{from}..{end}")
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_span_drops_only_a_repeated_year() {
-        assert_eq!(super::span("2026-04-03", "2026-04-08"), "2026-04-03..04-08");
-        assert_eq!(
-            super::span("2025-12-30", "2026-01-02"),
-            "2025-12-30..2026-01-02"
-        );
-        assert_eq!(super::span("2026-04-03", "2026-04-03"), "2026-04-03");
-    }
-}
-
 fn memory(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory"))?;
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
@@ -602,4 +589,17 @@ fn emojikeys(client: &Client, id: &str, origin: Option<&str>) -> Result<()> {
     }
     println!("[{} emojikey(s)]", hits.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_span_drops_only_a_repeated_year() {
+        assert_eq!(super::span("2026-04-03", "2026-04-08"), "2026-04-03..04-08");
+        assert_eq!(
+            super::span("2025-12-30", "2026-01-02"),
+            "2025-12-30..2026-01-02"
+        );
+        assert_eq!(super::span("2026-04-03", "2026-04-03"), "2026-04-03");
+    }
 }

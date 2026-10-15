@@ -278,20 +278,13 @@ async fn memory_progress(
         let sums = log.summaries()?;
         let read = log.extracted()?.len();
         let pending = crate::memory_log::pending(&sums, ms.len()).len();
-        let turns = match open_store(&soul) {
-            Ok(store) => graph::query_rows(
-                &store,
-                "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }",
-            )?
-            .first()
-            .and_then(|r| r.get("n"))
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0),
-            Err(_) => 0,
-        };
+        // The reader's own stream size, from its last run: the store's Turn
+        // count includes tool output and subagents, which are never read.
+        let (turns, counted) = log.stream_size().unwrap_or((0, String::new()));
         Ok(json!({
             "id": soul.id,
             "turns": turns,
+            "turns_counted": counted,
             "turns_read": read,
             "memories": ms.len(),
             "blocks": sums.len(),

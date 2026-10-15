@@ -322,7 +322,15 @@ fn ask_line(
     let mut line = first;
     let mut refused: Vec<String> = Vec::new();
     for n in 0..ASKS {
-        match memory::check(&line).and_then(not_wrapped) {
+        let block = merge.and_then(|p| {
+            p.strip_prefix("Compress memories #")?
+                .split_whitespace()
+                .next()
+        });
+        match memory::check(&line)
+            .and_then(not_wrapped)
+            .and_then(|l| a_memory(l, block))
+        {
             Ok(ok) => return Ok(Some(ok)),
             Err(why) if n + 1 < ASKS => {
                 refused.push(format!("{why} — {line}"));
@@ -380,6 +388,38 @@ fn not_wrapped(line: String) -> Result<String, String> {
     }
 }
 
+/// A line that talks about the merging instead of merging. On W3BL0RD, after
+/// a too-long refusal, Haiku read OptMem's "N compressions remain after this
+/// one" as a budget it had spent, and answered four merges with "I haven't
+/// compressed memories #656-659. The compression budget was used up…". It also
+/// opened 21 good merges with their own label ("#740-741 compressed: …").
+/// `check` passes both. A merge (`block` is its id) may not open with its own
+/// label; no line may talk about compressing instead of doing it.
+fn a_memory(line: String, block: Option<&str>) -> Result<String, String> {
+    let low = line.to_lowercase();
+    const META: [&str; 6] = [
+        "compression budget",
+        "haven't compressed",
+        "have not compressed",
+        "compressions remain",
+        "raise the limit",
+        "remain in memory unchanged",
+    ];
+    if META.iter().any(|m| low.contains(m)) {
+        return Err("That is about the task, not a memory. There is no budget to save: write the merged line itself.".into());
+    }
+    if let Some(id) = block {
+        let t = low.trim_start();
+        if t.starts_with(&format!("#{id}"))
+            || t.starts_with("compressed #")
+            || t.starts_with("compressed:")
+        {
+            return Err("Give the line itself, without its number or a label.".into());
+        }
+    }
+    Ok(line)
+}
+
 /// Answer every merge due over the log, in OptMem's order. `false` when the
 /// run must stop (`r.stopped` says why).
 fn nap(
@@ -433,6 +473,91 @@ fn nap(
     }
 }
 
+/// The merges `verify` refuses, with every merge built on top of them, in the
+/// order they must be rebuilt: smallest first, left to right, as OptMem builds.
+pub fn to_repair(log: &MemoryLog) -> Result<Vec<memory::Block>> {
+    let sums = log.summaries()?;
+    let mut out: std::collections::BTreeSet<(usize, usize)> = Default::default();
+    for (id, s) in &sums {
+        let Some(b) = memory::parse_block(id) else {
+            continue;
+        };
+        let ok = memory::check(&s.text)
+            .and_then(not_wrapped)
+            .and_then(|l| a_memory(l, Some(id)));
+        if ok.is_ok() {
+            continue;
+        }
+        // b and each aligned block above it that was built
+        let (mut lo, mut n) = (b.0, b.1 - b.0);
+        loop {
+            let up = (lo, lo + n);
+            if sums.contains_key(&memory::block_id(up)) {
+                out.insert((n, lo));
+            } else if up != b {
+                break;
+            }
+            n *= 2;
+            lo -= lo % n;
+        }
+    }
+    Ok(out.into_iter().map(|(n, lo)| (lo, lo + n)).collect())
+}
+
+/// Rebuild the merges [`to_repair`] lists, each from its notes or halves as
+/// they stand now, with the same prompt and checks as a run. A new line is
+/// appended and wins over the old; nothing is deleted, and no turn is read.
+pub fn repair(
+    llm: &dyn Llm,
+    repo: &Path,
+    soul: &str,
+    log: &MemoryLog,
+    ledger: &Ledger,
+) -> Result<ReliveReport> {
+    let mut r = ReliveReport::default();
+    let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
+        .unwrap_or_default()
+        .chars()
+        .take(SOUL_CHARS)
+        .collect();
+    let sys = system(soul, soul_md.trim());
+    let memories = log.memories()?;
+    let mut sums = log.summaries()?;
+    let todo = to_repair(log)?;
+    for (k, &b) in todo.iter().enumerate() {
+        let prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1 - k)?;
+        let (v, i, o) = match call(llm, &sys, &prompt, &summary_schema()) {
+            Ok(x) => x,
+            Err(e) => {
+                r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
+                return Ok(r);
+            }
+        };
+        ledger.record(soul, i, o)?;
+        r.input_tokens += i;
+        r.output_tokens += o;
+        let first = v["text"].as_str().unwrap_or("").to_string();
+        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, ledger, soul)?
+        else {
+            r.stopped = Some(format!(
+                "merge #{}: no line passing the checks after {ASKS} asks",
+                memory::block_id(b)
+            ));
+            return Ok(r);
+        };
+        let sm = Summary {
+            block: memory::block_id(b),
+            text,
+            model: llm.model().to_string(),
+            written: chrono::Utc::now().to_rfc3339(),
+        };
+        log.append_summary(&sm)?;
+        sums.insert(sm.block.clone(), sm);
+        r.merges += 1;
+    }
+    Ok(r)
+}
+
 /// Relive a soul's turns in `[from, to)` (RFC 3339 strings) into `log`,
 /// resuming after the turns `log` has already read.
 #[allow(clippy::too_many_arguments)]
@@ -459,9 +584,13 @@ pub fn relive(
     let mut convs = conversations(repo)?;
     label_peers(&mut convs, &sp.agent, peers);
     let done = log.extracted()?;
-    let st: Vec<StreamTurn> = stream(&convs)
+    let all: Vec<StreamTurn> = stream(&convs)
         .into_iter()
         .filter(|s| s.turn.ts.as_str() >= from && s.turn.ts.as_str() < to)
+        .collect();
+    log.write_stream_size(all.len())?;
+    let st: Vec<StreamTurn> = all
+        .into_iter()
         .filter(|s| !done.contains(&s.turn.id))
         .collect();
     let mut calls = 0usize;
@@ -630,7 +759,10 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     v.notes = ms.len();
     v.blocks = sums.len();
     for (i, m) in ms.iter().enumerate() {
-        if let Err(e) = memory::check(&m.text).and_then(not_wrapped) {
+        if let Err(e) = memory::check(&m.text)
+            .and_then(not_wrapped)
+            .and_then(|l| a_memory(l, None))
+        {
             v.failures.push(format!("note #{i}: {e}"));
         }
         if m.turns.is_empty() {
@@ -648,7 +780,10 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
             )),
             _ => {}
         }
-        if let Err(e) = memory::check(&s.text).and_then(not_wrapped) {
+        if let Err(e) = memory::check(&s.text)
+            .and_then(not_wrapped)
+            .and_then(|l| a_memory(l, Some(id)))
+        {
             v.failures.push(format!("block {id}: {e}"));
         }
     }
@@ -996,5 +1131,59 @@ mod tests {
         // RDF 1.2 annotation syntax and bracketed prose are not JSON
         assert!(not_wrapped("{| |} annotation syntax asserts the base triple".into()).is_ok());
         assert!(not_wrapped("[draft] the spec is unruled".into()).is_ok());
+    }
+
+    #[test]
+    fn repair_lists_a_bad_merge_and_every_built_merge_above_it_smallest_first() {
+        let dir = std::env::temp_dir().join(format!("ravel-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = MemoryLog::at(dir.clone());
+        let sm = |b: &str, t: &str| Summary {
+            block: b.into(),
+            text: t.into(),
+            model: "m".into(),
+            written: "w".into(),
+        };
+        for (b, t) in [
+            ("0-1", "a"),
+            ("2-3", "I haven't compressed memories #2-3."),
+            ("4-5", "c"),
+            ("6-7", "d"),
+            ("0-3", "ab"),
+            ("4-7", "cd"),
+            ("0-7", "abcd"),
+        ] {
+            log.append_summary(&sm(b, t)).unwrap();
+        }
+        assert_eq!(to_repair(&log).unwrap(), vec![(2, 4), (0, 4), (0, 8)]);
+        // the newer line wins: once replaced, nothing is left to repair
+        for (b, t) in [("2-3", "b"), ("0-3", "ab"), ("0-7", "abcd")] {
+            log.append_summary(&sm(b, t)).unwrap();
+        }
+        assert!(to_repair(&log).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_that_talks_about_merging_or_wears_its_label_is_refused() {
+        let w3 = "I haven't compressed memories #656-659. The compression budget was used up by the 660-661 request.";
+        assert!(a_memory(w3.into(), Some("656-659")).is_err());
+        assert!(a_memory(
+            "#740-741 compressed: Flinch-test: liveness".into(),
+            Some("740-741")
+        )
+        .is_err());
+        assert!(a_memory(
+            "Compressed #3730-3731: unread eQMARL quotes".into(),
+            Some("3730-3731")
+        )
+        .is_err());
+        // another block's or an issue's number inside the text is fine
+        assert!(a_memory(
+            "Phases (#52-55): worldview, ontology".into(),
+            Some("2952-2953")
+        )
+        .is_ok());
+        assert!(a_memory("#116 closed: openiris 9f51407".into(), None).is_ok());
     }
 }

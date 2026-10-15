@@ -98,6 +98,31 @@ impl MemoryLog {
         Ok(m)
     }
 
+    /// How many turns the reader's stream held when the last run began: the
+    /// prose turns it reads, after subagents and harness noise are dropped.
+    /// Written by `ravel-relive run`, because counting it needs every soul's
+    /// sends (about 11 s), too slow for a progress request. The store's Turn
+    /// count is a different number (tool output, subagents), so it never says
+    /// whether a soul is fully read.
+    pub fn write_stream_size(&self, turns: usize) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let v = serde_json::json!({ "turns": turns, "counted": chrono::Utc::now().to_rfc3339() });
+        let tmp = self.path("stream.json.tmp");
+        std::fs::write(&tmp, v.to_string())?;
+        std::fs::rename(&tmp, self.path("stream.json"))?;
+        Ok(())
+    }
+
+    /// `(turns, counted-at)` from the last run, if there was one.
+    pub fn stream_size(&self) -> Option<(u64, String)> {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(self.path("stream.json")).ok()?).ok()?;
+        Some((
+            v["turns"].as_u64()?,
+            v["counted"].as_str().unwrap_or("").to_string(),
+        ))
+    }
+
     pub fn extracted(&self) -> Result<HashSet<String>> {
         let p = self.path("extracted.tsv");
         if !p.exists() {

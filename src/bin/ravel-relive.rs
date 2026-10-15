@@ -116,6 +116,22 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        ["repair", repo, out, model] => {
+            // Rebuild the merges verify refuses, and every merge above them,
+            // cold on the subscription. No turn is read again.
+            let repo = PathBuf::from(repo);
+            let out = PathBuf::from(out);
+            let sp = speakers(&repo);
+            let llm = ClaudeCode::new(model.trim_start_matches("sub:"), false)?;
+            let ledger = Ledger::open_at(out.join("usage.tsv"), f64::MAX)?;
+            let log = MemoryLog::at(out);
+            eprintln!("[ravel-relive] {} merges to rebuild", ravel::memory_relive::to_repair(&log)?.len());
+            let r = ravel::memory_relive::repair(&llm, &repo, &sp.agent, &log, &ledger)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            if r.stopped.is_some() {
+                std::process::exit(2);
+            }
+        }
         ["plan", repo, from, to] => {
             let (turns, stretches, chars) = plan(&PathBuf::from(repo), from, to)?;
             println!("{turns} turns with prose, {stretches} stretches, {chars} characters");
@@ -162,7 +178,7 @@ fn main() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage:\n  ravel-relive plan <soul-repo> <from> <to>\n  ravel-relive run <soul-repo> <from> <to> <out-dir> <sub:model or api:max-usd> [max-calls]"
+            "usage:\n  ravel-relive plan <soul-repo> <from> <to>\n  ravel-relive run <soul-repo> <from> <to> <out-dir> <sub:model or api:max-usd> [max-calls]\n  ravel-relive verify <soul-repo> <out-dir>\n  ravel-relive repair <soul-repo> <out-dir> sub:<model>"
         ),
     }
     Ok(())
