@@ -201,8 +201,16 @@ pub fn nap_prompt(
         |c| summaries.get(&memory::block_id(c)).map(|s| s.text.clone()),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(memory::nap_prompt(b, &body, left))
+    Ok(format!("{}{HAND_BACK}\n", memory::nap_prompt(b, &body, left)))
 }
+
+/// What stands in for OptMem's last line, `Run: memo nap lo-hi "<your line>"`:
+/// how the writer hands the line back. Without it a writer read cold wrapped
+/// its line ("Compressed line (276 bytes, within the limit): …"), then, refused
+/// for the extra lines, decided it had no memory tool and reported "NOT DONE"
+/// 12 times over (spaceGOAT, 2026-10-16, both wordings of the story test).
+pub const HAND_BACK: &str =
+    "Answer with the line alone, as `text`: no label, no byte count, nothing before or after it. Answering is how it is saved.";
 
 /// One line of the wake view.
 #[derive(Debug, Clone, Serialize)]
