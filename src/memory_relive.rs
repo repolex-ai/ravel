@@ -121,6 +121,9 @@ fn call(llm: &dyn Llm, system: &str, user: &str, schema: &Value) -> Result<(Valu
             // The same words get the same refusal: waiting does not help, and
             // the caller decides what a refused stretch becomes.
             Err(e) if is_policy_refusal(&e) => return Err(e),
+            // A writer that declines to answer in this session declines again:
+            // the caller starts a fresh one instead of waiting.
+            Err(e) if is_balk(&e) => return Err(e),
             Err(e) if attempt >= 4 => return Err(e),
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_secs(wait));
@@ -341,7 +344,11 @@ fn ask_line(
                     Some(_) if llm.context_tokens() > 0 => why.clone(),
                     Some(prompt) => format!("{prompt}\n\nYou answered:\n{line}\n\n{why}"),
                 };
-                let (v, i, o) = call(llm, sys, &again, &summary_schema())
+                let cold = || match merge {
+                    None => format!("You noted:\n{line}\n\n{why}"),
+                    Some(prompt) => format!("{prompt}\n\nYou answered:\n{line}\n\n{why}"),
+                };
+                let (v, i, o) = call_or_fresh(llm, sys, &again, &cold, &summary_schema())
                     .with_context(|| format!("asking again for a line refused by check: {line}"))?;
                 ledger.record(soul, i, o)?;
                 r.input_tokens += i;
@@ -370,6 +377,31 @@ fn ask_line(
 fn is_policy_refusal(e: &anyhow::Error) -> bool {
     let m = format!("{e:#}");
     m.contains("anthropic.com/legal/aup") || m.contains("can't help with this")
+}
+
+/// The writer answered in words instead of the line it owed. On TR1P, deep in
+/// a session: "I won't call StructuredOutput again for this. The nine lines
+/// are already saved…". The session believes it is done; a fresh one is not.
+fn is_balk(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("returned no structured output")
+}
+
+/// [`call`], and if a session balks, once more in a fresh session with
+/// `cold`: the same ask written for a writer that has not seen it.
+fn call_or_fresh(
+    llm: &dyn Llm,
+    sys: &str,
+    user: &str,
+    cold: &dyn Fn() -> String,
+    schema: &Value,
+) -> Result<(Value, u64, u64)> {
+    match call(llm, sys, user, schema) {
+        Err(e) if is_balk(&e) && llm.context_tokens() > 0 => {
+            llm.reset();
+            call(llm, sys, &cold(), schema)
+        }
+        r => r,
+    }
 }
 
 /// A line that is itself JSON is a writer answering in the shape it was asked
@@ -443,13 +475,14 @@ fn nap(
         if !take_call(r) {
             return Ok(false);
         }
-        let (v, i, o) = match call(llm, sys, &prompt, &summary_schema()) {
-            Ok(x) => x,
-            Err(e) => {
-                r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
-                return Ok(false);
-            }
-        };
+        let (v, i, o) =
+            match call_or_fresh(llm, sys, &prompt, &|| prompt.clone(), &summary_schema()) {
+                Ok(x) => x,
+                Err(e) => {
+                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
+                    return Ok(false);
+                }
+            };
         ledger.record(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
@@ -526,13 +559,14 @@ pub fn repair(
     let todo = to_repair(log)?;
     for (k, &b) in todo.iter().enumerate() {
         let prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1 - k)?;
-        let (v, i, o) = match call(llm, &sys, &prompt, &summary_schema()) {
-            Ok(x) => x,
-            Err(e) => {
-                r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
-                return Ok(r);
-            }
-        };
+        let (v, i, o) =
+            match call_or_fresh(llm, &sys, &prompt, &|| prompt.clone(), &summary_schema()) {
+                Ok(x) => x,
+                Err(e) => {
+                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
+                    return Ok(r);
+                }
+            };
         ledger.record(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
@@ -641,6 +675,7 @@ pub fn relive(
         //    with no notes, and the gap is logged (goodlux, 2026-10-15: leave
         //    blanks, don't fight the classifier).
         let mut refusals = 0;
+        let mut balked = false;
         let answer = loop {
             let wake = if llm.context_tokens() == 0 {
                 Some(wake_now()?)
@@ -655,6 +690,11 @@ pub fn relive(
                 Ok(x) => break Some(x),
                 Err(e) if is_policy_refusal(&e) && refusals == 0 => {
                     refusals += 1;
+                    llm.reset();
+                }
+                // A balk is asked once more in a fresh session, which wakes.
+                Err(e) if is_balk(&e) && !balked => {
+                    balked = true;
                     llm.reset();
                 }
                 Err(e) if is_policy_refusal(&e) => {
@@ -1053,6 +1093,76 @@ mod tests {
                 .collect();
             Ok((json!({ "notes": notes }), 1, 1))
         }
+    }
+
+    #[test]
+    fn a_writer_that_balks_once_is_asked_again_and_the_run_reads_on() {
+        struct Balker(std::sync::Mutex<bool>);
+        impl Llm for Balker {
+            fn model(&self) -> &str {
+                "fake"
+            }
+            fn json(&self, _: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+                if let Some(rest) = user.strip_prefix("Compress memories #") {
+                    let id = rest.split_whitespace().next().unwrap().to_string();
+                    return Ok((json!({ "text": format!("S{id}") }), 1, 1));
+                }
+                let mut first = self.0.lock().unwrap();
+                if *first {
+                    *first = false;
+                    anyhow::bail!("claude -p returned no structured output; it said: \"I won't call StructuredOutput again\"");
+                }
+                let n = user
+                    .lines()
+                    .filter(|l| l.starts_with('[') && l.contains("] 20"))
+                    .count();
+                let notes: Vec<Value> = (1..=n)
+                    .map(|k| json!({"text": format!("I noted turn {k}"), "turns": [k]}))
+                    .collect();
+                Ok((json!({ "notes": notes }), 1, 1))
+            }
+        }
+        let base = std::env::temp_dir().join(format!("ravel-relive-balk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("soul");
+        let mirror = repo.join(crate::sync::TRANSCRIPTS_SUBDIR).join("p");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let rec = |k: usize| {
+            json!({"type":"user","uuid":format!("u{k}"),"parentUuid":if k==0 {String::new()} else {format!("u{}",k-1)},
+                   "timestamp":format!("2026-06-01T10:0{k}:00Z"),"sessionId":"s",
+                   "message":{"role":"user","content":"z".repeat(9_000)}})
+            .to_string()
+        };
+        std::fs::write(
+            mirror.join("s1.jsonl"),
+            (0..6).map(rec).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+        let log = MemoryLog::at(base.join("out"));
+        let ledger = Ledger::open_at(base.join("spend.tsv"), 1.0).unwrap();
+        let sp = Speakers {
+            agent: "soul".into(),
+            peers: vec![],
+            human: "human".into(),
+        };
+        let llm = Balker(std::sync::Mutex::new(true));
+        let r = relive(
+            &repo,
+            "s",
+            &sp,
+            &llm,
+            &ledger,
+            &log,
+            &PeerIndex::default(),
+            "2026",
+            "2027",
+            100,
+            0,
+        )
+        .unwrap();
+        assert!(r.stopped.is_none(), "{r:?}");
+        assert_eq!(r.notes, 6, "{r:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
