@@ -337,6 +337,12 @@ fn ask_line(
             Ok(ok) => return Ok(Some(ok)),
             Err(why) if n + 1 < ASKS => {
                 refused.push(format!("{why} — {line}"));
+                // A session refused three times in a row can dig in: on
+                // spaceGOAT one answered "5 lines" with 7, then 9, up to 27.
+                // From the fourth ask on, a fresh session gets the whole ask.
+                if n == 3 && llm.context_tokens() > 0 {
+                    llm.reset();
+                }
                 // In a session the writer has its answer in front of it, so
                 // it gets what OptMem's agent gets: the refusal alone.
                 let again = match merge {
