@@ -132,6 +132,27 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        ["rebuild", repo, out, model, rest @ ..] => {
+            // A side-by-side test of the merge wording: every merge due over
+            // the notes in <out>, cold. An optional file's text is appended
+            // to OptMem's merge prompt.
+            let repo = PathBuf::from(repo);
+            let out = PathBuf::from(out);
+            let extra = match rest {
+                [] => None,
+                [f] => Some(std::fs::read_to_string(f)?.trim().to_string()),
+                _ => bail!("one optional argument after the model: a file of text to add to the merge prompt"),
+            };
+            let sp = speakers(&repo);
+            let llm = ClaudeCode::new(model.trim_start_matches("sub:"), false)?;
+            let ledger = Ledger::open_at(out.join("usage.tsv"), f64::MAX)?;
+            let log = MemoryLog::at(out);
+            let r = ravel::memory_relive::rebuild(&llm, &repo, &sp.agent, &log, &ledger, extra.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            if r.stopped.is_some() {
+                std::process::exit(2);
+            }
+        }
         ["plan", repo, from, to] => {
             let (turns, stretches, chars) = plan(&PathBuf::from(repo), from, to)?;
             println!("{turns} turns with prose, {stretches} stretches, {chars} characters");

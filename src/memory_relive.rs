@@ -598,6 +598,66 @@ pub fn repair(
     Ok(r)
 }
 
+/// Build every merge due over `log`'s notes, cold, from nothing but the notes:
+/// a side-by-side test of the merge wording. `extra`, when given, is appended
+/// to OptMem's merge prompt, so the only difference between two rebuilds of
+/// the same notes is that text. No turn is read.
+pub fn rebuild(
+    llm: &dyn Llm,
+    repo: &Path,
+    soul: &str,
+    log: &MemoryLog,
+    ledger: &Ledger,
+    extra: Option<&str>,
+) -> Result<ReliveReport> {
+    let mut r = ReliveReport::default();
+    let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
+        .unwrap_or_default()
+        .chars()
+        .take(SOUL_CHARS)
+        .collect();
+    let sys = system(soul, soul_md.trim());
+    let memories = log.memories()?;
+    let mut sums = log.summaries()?;
+    loop {
+        let todo = memory_log::pending(&sums, memories.len());
+        let Some(&b) = todo.first() else { return Ok(r) };
+        let mut prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1)?;
+        if let Some(x) = extra {
+            prompt = format!("{prompt}\n{x}\n");
+        }
+        let (v, i, o) =
+            match call_or_fresh(llm, &sys, &prompt, &|| prompt.clone(), &summary_schema()) {
+                Ok(x) => x,
+                Err(e) => {
+                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
+                    return Ok(r);
+                }
+            };
+        ledger.record(soul, i, o)?;
+        r.input_tokens += i;
+        r.output_tokens += o;
+        let first = v["text"].as_str().unwrap_or("").to_string();
+        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, ledger, soul)?
+        else {
+            r.stopped = Some(format!(
+                "merge #{}: no line passing the checks after {ASKS} asks",
+                memory::block_id(b)
+            ));
+            return Ok(r);
+        };
+        let sm = Summary {
+            block: memory::block_id(b),
+            text,
+            model: llm.model().to_string(),
+            written: chrono::Utc::now().to_rfc3339(),
+        };
+        log.append_summary(&sm)?;
+        sums.insert(sm.block.clone(), sm);
+        r.merges += 1;
+    }
+}
+
 /// Relive a soul's turns in `[from, to)` (RFC 3339 strings) into `log`,
 /// resuming after the turns `log` has already read.
 #[allow(clippy::too_many_arguments)]
