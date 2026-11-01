@@ -305,6 +305,35 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
     Ok((copied, unchanged))
 }
 
+/// A subagent file's own turns, without the ones it repeats from its parent
+/// session. Claude Code starts a compaction (`agent-acompact-…`) or side
+/// question (`agent-aside_question-…`) file with a copy of the parent's
+/// conversation, under the same uuids; loaded as written, each of those turns
+/// sat in the store twice (spaceGOAT: 10,496 from one session). A turn is its
+/// uuid, so the copy adds nothing; what the subagent itself said is kept.
+fn drop_parent_turns(mirror: &Path, rel: &Path, events: Vec<crate::Event>) -> Vec<crate::Event> {
+    let mut parts = rel.components();
+    let (Some(session), Some(sub)) = (parts.next(), parts.next()) else {
+        return events;
+    };
+    if sub.as_os_str() != "subagents" {
+        return events;
+    }
+    let parent = mirror.join(format!("{}.jsonl", session.as_os_str().to_string_lossy()));
+    let Ok(text) = std::fs::read_to_string(&parent) else {
+        return events;
+    };
+    let ids: std::collections::HashSet<String> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("uuid")?.as_str().map(str::to_string))
+        .collect();
+    events
+        .into_iter()
+        .filter(|e| !ids.contains(&e.event_id))
+        .collect()
+}
+
 /// The current file a dated copy is an older version of, when it is one:
 /// `YYYY-MM-DD-<session>.jsonl` beside `<session>.jsonl`, and every byte of
 /// the dated copy is the start of the current file. A copy that differs
@@ -774,6 +803,7 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 manifest.insert(name, len);
                 continue;
             }
+            let events = drop_parent_turns(&mirror, rel, events);
             let anns = reader::emojikey_read(&events);
             let transcript_id = name.trim_end_matches(".jsonl");
             graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
@@ -892,8 +922,9 @@ pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
 /// whole history is projected again with the new terms. Without it, a turn
 /// ingested before the change keeps the old shape forever, because an
 /// unchanged file is never read twice. 2: `ravel:model`, `ravel:modelSetting`.
-/// 3: superseded dated copies leave the store.
-const TURN_PROJECTION: &str = "3";
+/// 3: superseded dated copies leave the store. 4: subagent files drop the
+/// turns they copy from their parent session.
+const TURN_PROJECTION: &str = "4";
 /// The manifest line that records [`TURN_PROJECTION`]. `#` cannot begin a
 /// transcript file name, a conversation id or an export key.
 const PROJECTION_KEY: &str = "#turn-projection";
@@ -1611,6 +1642,40 @@ mod tests {
     }
 
     /// Manifest round-trip: what write_manifest stores, read_manifest returns.
+    #[test]
+    fn a_subagent_file_keeps_its_own_turns_and_drops_the_parents_copy() {
+        let dir = std::env::temp_dir().join(format!("ravel-subcopy-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("s1/subagents")).unwrap();
+        fs::write(dir.join("s1.jsonl"), "{\"uuid\":\"a\"}\n{\"uuid\":\"b\"}\n").unwrap();
+        let ev = |id: &str| crate::Event {
+            event_id: id.into(),
+            parent_id: None,
+            role: "user".into(),
+            timestamp: None,
+            text: None,
+            text_provenance: vec![],
+            thinking: None,
+            model: None,
+            model_setting: None,
+        };
+        let kept = drop_parent_turns(
+            &dir,
+            Path::new("s1/subagents/agent-acompact-x.jsonl"),
+            vec![ev("a"), ev("b"), ev("c")],
+        );
+        assert_eq!(
+            kept.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+            ["c"]
+        );
+        // a top-level session is left alone
+        assert_eq!(
+            drop_parent_turns(&dir, Path::new("s1.jsonl"), vec![ev("a")]).len(),
+            1
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_dated_copy_is_superseded_only_when_the_current_file_holds_all_of_it() {
         let dir = std::env::temp_dir().join(format!("ravel-superseded-{}", std::process::id()));
