@@ -435,13 +435,17 @@ fn not_wrapped(line: String) -> Result<String, String> {
 /// label; no line may talk about compressing instead of doing it.
 fn a_memory(line: String, block: Option<&str>) -> Result<String, String> {
     let low = line.to_lowercase();
-    const META: [&str; 6] = [
+    const META: [&str; 10] = [
         "compression budget",
         "haven't compressed",
         "have not compressed",
         "compressions remain",
         "raise the limit",
         "remain in memory unchanged",
+        "not compressing",
+        "no line written",
+        "unsaved range",
+        "already saved as",
     ];
     if META.iter().any(|m| low.contains(m)) {
         return Err("That is about the task, not a memory. There is no budget to save: write the merged line itself.".into());
@@ -1361,5 +1365,18 @@ mod tests {
         )
         .is_ok());
         assert!(a_memory("#116 closed: openiris 9f51407".into(), None).is_ok());
+        let lux = "Not compressing this one. #13028-13029 and #13030-13031 are already saved as two compressed lines";
+        assert!(a_memory(lux.into(), Some("13028-13031")).is_err());
+        assert!(a_memory(
+            "No line written. #13040-13043 are already saved.".into(),
+            Some("13040-13047")
+        )
+        .is_err());
+        // a real memory about compressing code is fine
+        assert!(a_memory(
+            "2024-11-04: My unrun recompress one-liner blanked Rob's memories".into(),
+            Some("826-827")
+        )
+        .is_ok());
     }
 }

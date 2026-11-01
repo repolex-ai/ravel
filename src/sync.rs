@@ -172,6 +172,9 @@ pub struct SyncStats {
     /// Mirror files skipped at ingest because the manifest shows them
     /// unchanged since their last successful ingest.
     pub skipped: usize,
+    /// Dated copies (`YYYY-MM-DD-<session>.jsonl`) left out because the
+    /// current `<session>.jsonl` begins with every byte of them.
+    pub superseded: usize,
     /// Transcripts this pass could not parse, as `path: reason`. One bad file
     /// is reported and skipped; the rest of the soul still syncs.
     pub failed: Vec<String>,
@@ -300,6 +303,51 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
         }
     }
     Ok((copied, unchanged))
+}
+
+/// The current file a dated copy is an older version of, when it is one:
+/// `YYYY-MM-DD-<session>.jsonl` beside `<session>.jsonl`, and every byte of
+/// the dated copy is the start of the current file. A copy that differs
+/// anywhere may hold turns the current file has lost, and is kept in the store.
+fn superseded_by(path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let name = path.file_name()?.to_str()?;
+    let b = name.as_bytes();
+    let dated = b.len() > 11
+        && b[..10].iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+        && b[10] == b'-';
+    if !dated {
+        return None;
+    }
+    let current = path.with_file_name(&name[11..]);
+    let (old, new) = (
+        std::fs::metadata(path).ok()?,
+        std::fs::metadata(&current).ok()?,
+    );
+    if old.len() > new.len() {
+        return None;
+    }
+    let (mut a, mut c) = (
+        std::fs::File::open(path).ok()?,
+        std::fs::File::open(&current).ok()?,
+    );
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = a.read(&mut x).ok()?;
+        if n == 0 {
+            return Some(current);
+        }
+        c.read_exact(&mut y[..n]).ok()?;
+        if x[..n] != y[..n] {
+            return None;
+        }
+    }
 }
 
 /// Per-transcript ingest bookkeeping: `<filename>\t<bytes>` per line, living
@@ -678,6 +726,28 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
             // mirror cost nothing per pass.
             if manifest.get(&name) == Some(&len) {
                 stats.skipped += 1;
+                continue;
+            }
+            // An older dated copy of a session that the current file still
+            // holds in full: loading it would put every one of its turns in
+            // the store twice (selkie, 2026-11-01: lUX had 484,681 Turn rows
+            // for 379,896 turns). Its graph is cleared; the file stays.
+            let sup_key = format!("superseded:{name}");
+            if manifest.get(&sup_key) == Some(&len) {
+                stats.superseded += 1;
+                continue;
+            }
+            if let Some(current) = superseded_by(&path) {
+                let id = name.trim_end_matches(".jsonl");
+                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(id))?;
+                store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+                eprintln!(
+                    "[raveld] {name}: an older copy of {}, left out of the store",
+                    current.display()
+                );
+                manifest.remove(&name);
+                manifest.insert(sup_key, len);
+                stats.superseded += 1;
                 continue;
             }
             let jsonl = match std::fs::read_to_string(&path) {
@@ -1536,6 +1606,34 @@ mod tests {
     }
 
     /// Manifest round-trip: what write_manifest stores, read_manifest returns.
+    #[test]
+    fn a_dated_copy_is_superseded_only_when_the_current_file_holds_all_of_it() {
+        let dir = std::env::temp_dir().join(format!("ravel-superseded-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let cur = dir.join("4d4b072c.jsonl");
+        fs::write(&cur, "line1\nline2\nline3\n").unwrap();
+        let older = dir.join("2026-05-30-4d4b072c.jsonl");
+        fs::write(&older, "line1\nline2\n").unwrap();
+        assert_eq!(superseded_by(&older), Some(cur.clone()));
+        let differs = dir.join("2026-05-31-4d4b072c.jsonl");
+        fs::write(&differs, "line1\nOTHER\n").unwrap();
+        assert_eq!(
+            superseded_by(&differs),
+            None,
+            "a copy that differs may hold lost turns"
+        );
+        let alone = dir.join("2026-05-30-ffff.jsonl");
+        fs::write(&alone, "x\n").unwrap();
+        assert_eq!(
+            superseded_by(&alone),
+            None,
+            "no current file: the copy is the only record"
+        );
+        assert_eq!(superseded_by(&cur), None, "an undated file is never a copy");
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn ingest_manifest_round_trips() {
         let repo = std::env::temp_dir().join("ravel-sync-test-manifest");

@@ -48,7 +48,26 @@ pub fn open(path: impl AsRef<Path>) -> Result<Store> {
 /// Open the store read-only (shared lock — many readers, or a reader beside a
 /// writer). The path must already exist.
 pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
-    Store::open_read_only(path.as_ref()).with_context(|| {
+    // A read-only open lists the store's log files while the writer may be
+    // rotating them; one vanishing mid-open fails it with "No such file …
+    // .log" (selkie, 2026-11-01). The next open sees the new set, so it is
+    // tried five times over about two seconds, then fails loud. One shared
+    // handle per soul in raveld would end the race; this bounds it.
+    let mut last = None;
+    for k in 0..5 {
+        match Store::open_read_only(path.as_ref()) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                let gone = e.to_string().contains("No such file");
+                last = Some(e);
+                if !gone {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100 << k.min(3)));
+            }
+        }
+    }
+    Err(last.expect("tried at least once")).with_context(|| {
         format!(
             "open read-only oxigraph store at {}",
             path.as_ref().display()

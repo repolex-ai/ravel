@@ -201,7 +201,10 @@ pub fn nap_prompt(
         |c| summaries.get(&memory::block_id(c)).map(|s| s.text.clone()),
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    Ok(format!("{}{HAND_BACK}\n", memory::nap_prompt(b, &body, left)))
+    Ok(format!(
+        "{}{HAND_BACK}\n",
+        memory::nap_prompt(b, &body, left)
+    ))
 }
 
 /// What stands in for OptMem's last line, `Run: memo nap lo-hi "<your line>"`:
@@ -209,8 +212,13 @@ pub fn nap_prompt(
 /// its line ("Compressed line (276 bytes, within the limit): …"), then, refused
 /// for the extra lines, decided it had no memory tool and reported "NOT DONE"
 /// 12 times over (spaceGOAT, 2026-10-16, both wordings of the story test).
+///
+/// Its second sentence answers the other way a session refused: lUX's writer
+/// answered 299 merges with "Not compressing this one. #13028-13029 and
+/// #13030-13031 are already saved…, so a combined line would duplicate them",
+/// not seeing that covering lines already merged below is what a merge is.
 pub const HAND_BACK: &str =
-    "Answer with the line alone, as `text`: no label, no byte count, nothing before or after it. Answering is how it is saved.";
+    "Answer with the line alone, as `text`: no label, no byte count, nothing before or after it. Answering is how it is saved. A merge always covers lines that are already merged below it; that is how the memory is built, so always write the line.";
 
 /// One line of the wake view.
 #[derive(Debug, Clone, Serialize)]

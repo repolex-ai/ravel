@@ -260,6 +260,9 @@ fn memory(client: &Client, id: &str) -> Result<()> {
         "[ravel memory] {id}: {} notes, {} blocks — `ravel memory open <#i or lo-hi>` opens a line",
         v["memories"], v["summaries"]
     );
+    // A merge reads like a statement of fact, but it is how things stood over
+    // its dates (selkie, 2026-11-01: an April rule had since changed).
+    println!("Oldest first. Each line is how things stood over its dates; where two disagree, the later one is current.");
     print_lines(&lines);
     Ok(())
 }
@@ -333,7 +336,7 @@ fn memory_recall(client: &Client, id: &str, term: &str) -> Result<()> {
         hit("?x")
     ))?;
     let turns = q(format!(
-        "SELECT (COUNT(?u) AS ?n) (MIN(STR(?ts)) AS ?first) (MAX(STR(?ts)) AS ?last) WHERE {{ GRAPH ?g {{ ?u a ravel:Turn ; ravel:text ?x ; ravel:timestamp ?ts . {} }} }}",
+        "SELECT (COUNT(DISTINCT ?u) AS ?n) (MIN(STR(?ts)) AS ?first) (MAX(STR(?ts)) AS ?last) WHERE {{ GRAPH ?g {{ ?u a ravel:Turn ; ravel:text ?x ; ravel:timestamp ?ts . {} }} }}",
         hit("?x")
     ))?;
     let t = turns.first().cloned().unwrap_or_default();
