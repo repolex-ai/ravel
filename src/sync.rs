@@ -721,13 +721,6 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
             };
             let name = rel.to_string_lossy().into_owned();
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            // Unchanged since its last successful ingest → the graph already
-            // holds this projection; skip the parse. Makes a large backfilled
-            // mirror cost nothing per pass.
-            if manifest.get(&name) == Some(&len) {
-                stats.skipped += 1;
-                continue;
-            }
             // An older dated copy of a session that the current file still
             // holds in full: loading it would put every one of its turns in
             // the store twice (selkie, 2026-11-01: lUX had 484,681 Turn rows
@@ -737,17 +730,28 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 stats.superseded += 1;
                 continue;
             }
-            if let Some(current) = superseded_by(&path) {
-                let id = name.trim_end_matches(".jsonl");
-                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(id))?;
-                store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
-                eprintln!(
-                    "[raveld] {name}: an older copy of {}, left out of the store",
-                    current.display()
-                );
-                manifest.remove(&name);
-                manifest.insert(sup_key, len);
-                stats.superseded += 1;
+            if manifest.get(&name) != Some(&len) {
+                if let Some(current) = superseded_by(&path) {
+                    let id = name.trim_end_matches(".jsonl");
+                    let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(id))?;
+                    store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+                    eprintln!(
+                        "[raveld] {name}: an older copy of {}, left out of the store",
+                        current.display()
+                    );
+                    manifest.remove(&name);
+                    manifest.insert(sup_key, len);
+                    stats.superseded += 1;
+                    continue;
+                }
+            }
+            // Unchanged since its last successful ingest → the graph already
+            // holds this projection; skip the parse. Makes a large backfilled
+            // mirror cost nothing per pass. (A dated copy already ingested is
+            // checked once more above, the first pass after this rule shipped:
+            // the manifest's TURN_PROJECTION bump re-reads every file.)
+            if manifest.get(&name) == Some(&len) {
+                stats.skipped += 1;
                 continue;
             }
             let jsonl = match std::fs::read_to_string(&path) {
@@ -888,7 +892,8 @@ pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
 /// whole history is projected again with the new terms. Without it, a turn
 /// ingested before the change keeps the old shape forever, because an
 /// unchanged file is never read twice. 2: `ravel:model`, `ravel:modelSetting`.
-const TURN_PROJECTION: &str = "2";
+/// 3: superseded dated copies leave the store.
+const TURN_PROJECTION: &str = "3";
 /// The manifest line that records [`TURN_PROJECTION`]. `#` cannot begin a
 /// transcript file name, a conversation id or an export key.
 const PROJECTION_KEY: &str = "#turn-projection";
