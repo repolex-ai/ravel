@@ -305,33 +305,41 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
     Ok((copied, unchanged))
 }
 
-/// A subagent file's own turns, without the ones it repeats from its parent
-/// session. Claude Code starts a compaction (`agent-acompact-…`) or side
-/// question (`agent-aside_question-…`) file with a copy of the parent's
-/// conversation, under the same uuids; loaded as written, each of those turns
-/// sat in the store twice (spaceGOAT: 10,496 from one session). A turn is its
-/// uuid, so the copy adds nothing; what the subagent itself said is kept.
-fn drop_parent_turns(mirror: &Path, rel: &Path, events: Vec<crate::Event>) -> Vec<crate::Event> {
-    let mut parts = rel.components();
-    let (Some(session), Some(sub)) = (parts.next(), parts.next()) else {
-        return events;
-    };
-    if sub.as_os_str() != "subagents" {
-        return events;
+/// The events of transcript `id` that no other transcript in the store holds.
+/// A turn is its uuid, and Claude Code writes the same uuid into more than one
+/// file: a resumed session starts with a copy of the conversation it resumes,
+/// and a compaction or side question (`subagents/agent-acompact-…`,
+/// `agent-aside_question-…`) with a copy of its parent. Loaded as written, each
+/// copy put its turns in the store twice (spaceGOAT: 221,742 Turn rows for
+/// 131,587 turns). The first file to bring a turn in owns it; a later copy
+/// leaves it out. The store says which graph holds a turn, so no other record
+/// of ownership is kept.
+fn owned_here(
+    store: &oxigraph::store::Store,
+    id: &str,
+    events: Vec<crate::Event>,
+) -> Result<Vec<crate::Event>> {
+    use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNodeRef, TermRef};
+    let here = NamedNode::new(graph::transcript_graph_iri(id))?;
+    let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")?;
+    let turn = NamedNode::new(format!("{}Turn", crate::RAVEL_NS))?;
+    let mut out = Vec::with_capacity(events.len());
+    for e in events {
+        let s = NamedNode::new(crate::project::event_iri(soul::TURN_PARTITION, &e.event_id))?;
+        let elsewhere = store
+            .quads_for_pattern(
+                Some(NamedOrBlankNodeRef::from(s.as_ref())),
+                Some(rdf_type.as_ref()),
+                Some(TermRef::from(turn.as_ref())),
+                None,
+            )
+            .filter_map(|q| q.ok())
+            .any(|q| q.graph_name != GraphName::NamedNode(here.clone()));
+        if !elsewhere {
+            out.push(e);
+        }
     }
-    let parent = mirror.join(format!("{}.jsonl", session.as_os_str().to_string_lossy()));
-    let Ok(text) = std::fs::read_to_string(&parent) else {
-        return events;
-    };
-    let ids: std::collections::HashSet<String> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|v| v.get("uuid")?.as_str().map(str::to_string))
-        .collect();
-    events
-        .into_iter()
-        .filter(|e| !ids.contains(&e.event_id))
-        .collect()
+    Ok(out)
 }
 
 /// The current file a dated copy is an older version of, when it is one:
@@ -739,9 +747,34 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
     }
 
     if mirror.is_dir() {
+        let fresh = tsv_is_stale(&repo.join(INGEST_MANIFEST));
         let store = graph::open(repo.join(STORE_SUBDIR))?;
         let mut manifest = read_manifest(repo);
-        for path in walk_jsonl(&mirror) {
+        // Owners first: a turn belongs to the first file that brings it in,
+        // so sessions load before their subagents, and older before newer,
+        // which makes the original conversation the owner of a resumed one.
+        let mut paths = walk_jsonl(&mirror);
+        paths.sort_by_cached_key(|p| {
+            let depth = p
+                .strip_prefix(&mirror)
+                .map(|r| r.components().count())
+                .unwrap_or(usize::MAX);
+            let mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            (depth, mtime, p.clone())
+        });
+        // A new projection starts ownership over: every transcript graph is
+        // emptied first, or an old copy would claim turns from their owner.
+        if fresh {
+            for p in &paths {
+                let Ok(rel) = p.strip_prefix(&mirror) else {
+                    continue;
+                };
+                let id = rel.to_string_lossy().trim_end_matches(".jsonl").to_string();
+                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&id))?;
+                store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+            }
+        }
+        for path in paths {
             // Keyed by the path relative to the mirror, so a nested subagent
             // transcript never collides with a session's file of the same
             // name. A top-level file's key is its bare filename, as before.
@@ -803,9 +836,9 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 manifest.insert(name, len);
                 continue;
             }
-            let events = drop_parent_turns(&mirror, rel, events);
-            let anns = reader::emojikey_read(&events);
             let transcript_id = name.trim_end_matches(".jsonl");
+            let events = owned_here(&store, transcript_id, events)?;
+            let anns = reader::emojikey_read(&events);
             graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
             manifest.insert(name.clone(), len);
             stats.sessions += 1;
@@ -923,11 +956,23 @@ pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
 /// ingested before the change keeps the old shape forever, because an
 /// unchanged file is never read twice. 2: `ravel:model`, `ravel:modelSetting`.
 /// 3: superseded dated copies leave the store. 4: subagent files drop the
-/// turns they copy from their parent session.
-const TURN_PROJECTION: &str = "4";
+/// turns they copy from their parent session. 5: one owner per turn across
+/// all of a soul's transcripts (resumed sessions too).
+const TURN_PROJECTION: &str = "5";
 /// The manifest line that records [`TURN_PROJECTION`]. `#` cannot begin a
 /// transcript file name, a conversation id or an export key.
 const PROJECTION_KEY: &str = "#turn-projection";
+
+/// True when a manifest exists but was written under another
+/// [`TURN_PROJECTION`]: the pass that re-reads everything.
+fn tsv_is_stale(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(s) => !s
+            .lines()
+            .any(|l| l == format!("{PROJECTION_KEY}\t{TURN_PROJECTION}")),
+        Err(_) => false,
+    }
+}
 
 /// An ingest manifest: `<key>\t<value>` per line. A manifest written under an
 /// older [`TURN_PROJECTION`] reads as empty.
@@ -1643,37 +1688,89 @@ mod tests {
 
     /// Manifest round-trip: what write_manifest stores, read_manifest returns.
     #[test]
-    fn a_subagent_file_keeps_its_own_turns_and_drops_the_parents_copy() {
-        let dir = std::env::temp_dir().join(format!("ravel-subcopy-{}", std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(dir.join("s1/subagents")).unwrap();
-        fs::write(dir.join("s1.jsonl"), "{\"uuid\":\"a\"}\n{\"uuid\":\"b\"}\n").unwrap();
-        let ev = |id: &str| crate::Event {
-            event_id: id.into(),
-            parent_id: None,
-            role: "user".into(),
-            timestamp: None,
-            text: None,
-            text_provenance: vec![],
-            thinking: None,
-            model: None,
-            model_setting: None,
+    fn a_turn_copied_into_a_resumed_session_or_a_subagent_is_stored_once() {
+        let repo = std::env::temp_dir().join(format!("ravel-owner-{}", std::process::id()));
+        fs::remove_dir_all(&repo).ok();
+        let mirror = repo.join(TRANSCRIPTS_SUBDIR);
+        fs::create_dir_all(mirror.join("s1/subagents")).unwrap();
+        let src = repo.join("no-sessions");
+        fs::create_dir_all(&src).unwrap();
+        let rec = |id: &str, t: &str| {
+            format!(
+            "{{\"type\":\"user\",\"uuid\":\"{id}\",\"timestamp\":\"{t}\",\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}\n")
         };
-        let kept = drop_parent_turns(
-            &dir,
-            Path::new("s1/subagents/agent-acompact-x.jsonl"),
-            vec![ev("a"), ev("b"), ev("c")],
+        // s1 is the original; s2 resumes it (copies a, b); the compaction copies b.
+        fs::write(
+            mirror.join("s1.jsonl"),
+            rec(
+                "a1111111-0000-0000-0000-000000000000",
+                "2026-01-01T00:00:00Z",
+            ) + &rec(
+                "b2222222-0000-0000-0000-000000000000",
+                "2026-01-01T00:01:00Z",
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            mirror.join("s2.jsonl"),
+            rec(
+                "a1111111-0000-0000-0000-000000000000",
+                "2026-01-01T00:00:00Z",
+            ) + &rec(
+                "b2222222-0000-0000-0000-000000000000",
+                "2026-01-01T00:01:00Z",
+            ) + &rec(
+                "c3333333-0000-0000-0000-000000000000",
+                "2026-01-02T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            mirror.join("s1/subagents/agent-acompact-x.jsonl"),
+            rec(
+                "b2222222-0000-0000-0000-000000000000",
+                "2026-01-01T00:01:00Z",
+            ) + &rec(
+                "d4444444-0000-0000-0000-000000000000",
+                "2026-01-01T00:02:00Z",
+            ),
+        )
+        .unwrap();
+        sync_soul(&repo, Some(&src)).unwrap();
+        let store = graph::open(repo.join(STORE_SUBDIR)).unwrap();
+        let rows = graph::query_rows(&store, "SELECT (COUNT(*) AS ?n) (COUNT(DISTINCT ?t) AS ?d) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
+        assert_eq!(rows[0]["n"], "4", "{rows:?}");
+        assert_eq!(rows[0]["d"], "4", "{rows:?}");
+        let owner = graph::query_rows(&store, "SELECT ?g WHERE { GRAPH ?g { <https://repolex.ai/ravel/Turn/a1111111-0000-0000-0000-000000000000> a ?k } }").unwrap();
+        assert!(
+            owner[0]["g"].ends_with("/s1"),
+            "the original session owns its turns: {owner:?}"
         );
+        drop(store);
+        // Both files grow: the owner keeps its turns, the copy still leaves them out.
+        let mut f1 = fs::read_to_string(mirror.join("s1.jsonl")).unwrap();
+        f1 += &rec(
+            "e5555555-0000-0000-0000-000000000000",
+            "2026-01-01T00:03:00Z",
+        );
+        fs::write(mirror.join("s1.jsonl"), f1).unwrap();
+        let mut f2 = fs::read_to_string(mirror.join("s2.jsonl")).unwrap();
+        f2 += &rec(
+            "f6666666-0000-0000-0000-000000000000",
+            "2026-01-02T00:01:00Z",
+        );
+        fs::write(mirror.join("s2.jsonl"), f2).unwrap();
+        sync_soul(&repo, Some(&src)).unwrap();
+        let store = graph::open(repo.join(STORE_SUBDIR)).unwrap();
+        let rows = graph::query_rows(&store, "SELECT (COUNT(*) AS ?n) (COUNT(DISTINCT ?t) AS ?d) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
         assert_eq!(
-            kept.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
-            ["c"]
+            (rows[0]["n"].as_str(), rows[0]["d"].as_str()),
+            ("6", "6"),
+            "{rows:?}"
         );
-        // a top-level session is left alone
-        assert_eq!(
-            drop_parent_turns(&dir, Path::new("s1.jsonl"), vec![ev("a")]).len(),
-            1
-        );
-        fs::remove_dir_all(&dir).ok();
+        drop(store);
+        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
