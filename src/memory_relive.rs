@@ -16,18 +16,18 @@
 
 use crate::memory::{self, ENTRY_CHARS, WAKE_LINES};
 use crate::memory_extract::{
-    account_limit_note, clip, conversations, is_account_limit, relabel_channels, summary_schema,
-    Conversation, Ledger, Llm, ProseTurn, Speakers,
+    clip, conversations, relabel_channels, summary_schema, Conversation, ProseTurn, Speakers,
 };
 use crate::memory_log::{self, wake_text, wake_view, Memory, MemoryLog, Summary};
 use crate::peers::{PeerIndex, Sent};
+use crate::writer::{is_usage_limit, Llm};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
 /// Prose shown per step. Small enough that "now" stays close to every turn.
-const STRETCH_CHARS: usize = 24_000;
+pub const STRETCH_CHARS: usize = 24_000;
 /// How much of SOUL.md is shown as who the soul is.
 const SOUL_CHARS: usize = 6_000;
 /// Asks for a line that fits before the run stops. OptMem's agent is refused
@@ -115,9 +115,11 @@ fn local_time(ts: &str) -> String {
 fn call(llm: &dyn Llm, system: &str, user: &str, schema: &Value) -> Result<(Value, u64, u64)> {
     let mut wait = 30;
     for attempt in 1.. {
-        match llm.json(system, user, schema, 4096) {
+        match llm.json(system, user, schema) {
             Ok(x) => return Ok(x),
-            Err(e) if is_account_limit(&e) => anyhow::bail!(account_limit_note(&e)),
+            // The subscription is out of allowance until it resets: every
+            // call would fail the same way, so the pass stops and waits.
+            Err(e) if is_usage_limit(&e) => return Err(e),
             // The same words get the same refusal: waiting does not help, and
             // the caller decides what a refused stretch becomes.
             Err(e) if is_policy_refusal(&e) => return Err(e),
@@ -267,6 +269,9 @@ pub struct ReliveReport {
     /// Stretches the model's usage policy refused twice, left blank and
     /// logged in `dropped.tsv`.
     pub refused: usize,
+    /// The run gave its turn up before the end — its call limit, or raveld
+    /// stopping — with nothing wrong. The rest is read next time.
+    pub yielded: bool,
 }
 
 /// The stretches over `[from, to)` exactly as the reader is shown them,
@@ -319,7 +324,6 @@ fn ask_line(
     merge: Option<&str>,
     log: &MemoryLog,
     r: &mut ReliveReport,
-    ledger: &Ledger,
     soul: &str,
 ) -> Result<Option<String>> {
     let mut line = first;
@@ -356,7 +360,7 @@ fn ask_line(
                 };
                 let (v, i, o) = call_or_fresh(llm, sys, &again, &cold, &summary_schema())
                     .with_context(|| format!("asking again for a line refused by check: {line}"))?;
-                ledger.record(soul, i, o)?;
+                log.append_usage(soul, i, o)?;
                 r.input_tokens += i;
                 r.output_tokens += o;
                 r.reasked += 1;
@@ -469,7 +473,6 @@ fn nap(
     sys: &str,
     log: &MemoryLog,
     r: &mut ReliveReport,
-    ledger: &Ledger,
     soul: &str,
     take_call: &mut dyn FnMut(&mut ReliveReport) -> bool,
 ) -> Result<bool> {
@@ -493,11 +496,11 @@ fn nap(
                     return Ok(false);
                 }
             };
-        ledger.record(soul, i, o)?;
+        log.append_usage(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
         let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, sys, first, Some(&prompt), log, r, ledger, soul)? else {
+        let Some(text) = ask_line(llm, sys, first, Some(&prompt), log, r, soul)? else {
             r.stopped = Some(format!(
                 "merge #{}: no line passing OptMem's check after {ASKS} asks",
                 memory::block_id(b)
@@ -550,13 +553,7 @@ pub fn to_repair(log: &MemoryLog) -> Result<Vec<memory::Block>> {
 /// Rebuild the merges [`to_repair`] lists, each from its notes or halves as
 /// they stand now, with the same prompt and checks as a run. A new line is
 /// appended and wins over the old; nothing is deleted, and no turn is read.
-pub fn repair(
-    llm: &dyn Llm,
-    repo: &Path,
-    soul: &str,
-    log: &MemoryLog,
-    ledger: &Ledger,
-) -> Result<ReliveReport> {
+pub fn repair(llm: &dyn Llm, repo: &Path, soul: &str, log: &MemoryLog) -> Result<ReliveReport> {
     let mut r = ReliveReport::default();
     let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
         .unwrap_or_default()
@@ -577,12 +574,11 @@ pub fn repair(
                     return Ok(r);
                 }
             };
-        ledger.record(soul, i, o)?;
+        log.append_usage(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
         let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, ledger, soul)?
-        else {
+        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, soul)? else {
             r.stopped = Some(format!(
                 "merge #{}: no line passing the checks after {ASKS} asks",
                 memory::block_id(b)
@@ -611,7 +607,6 @@ pub fn rebuild(
     repo: &Path,
     soul: &str,
     log: &MemoryLog,
-    ledger: &Ledger,
     extra: Option<&str>,
 ) -> Result<ReliveReport> {
     let mut r = ReliveReport::default();
@@ -638,12 +633,11 @@ pub fn rebuild(
                     return Ok(r);
                 }
             };
-        ledger.record(soul, i, o)?;
+        log.append_usage(soul, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
         let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, ledger, soul)?
-        else {
+        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, soul)? else {
             r.stopped = Some(format!(
                 "merge #{}: no line passing the checks after {ASKS} asks",
                 memory::block_id(b)
@@ -662,21 +656,43 @@ pub fn rebuild(
     }
 }
 
+/// A soul's conversations as the reader sees them: every mirror read, each
+/// peer's message marked from the sender's side, the soul's own subagents
+/// dropped. The slow part of a pass (every soul's sends are read), and the
+/// only part that reads the mirrors, so raveld holds its gate for this alone.
+pub fn load(repo: &Path, sp: &Speakers, peers: &PeerIndex) -> Result<Vec<Conversation>> {
+    let mut convs = conversations(repo)?;
+    label_peers(&mut convs, &sp.agent, peers);
+    Ok(convs)
+}
+
+/// What is left to read before `to`: (turns, prose characters, the oldest
+/// such turn's time). How raveld decides a pass is worth a call.
+pub fn unread(convs: &[Conversation], log: &MemoryLog, to: &str) -> Result<(usize, usize, String)> {
+    let done = log.extracted()?;
+    let st: Vec<StreamTurn> = stream(convs)
+        .into_iter()
+        .filter(|s| s.turn.ts.as_str() < to && !done.contains(&s.turn.id))
+        .collect();
+    let chars = st.iter().map(|s| clip(s.turn.text.trim()).len()).sum();
+    let oldest = st.first().map(|s| s.turn.ts.clone()).unwrap_or_default();
+    Ok((st.len(), chars, oldest))
+}
+
 /// Relive a soul's turns in `[from, to)` (RFC 3339 strings) into `log`,
-/// resuming after the turns `log` has already read.
+/// resuming after the turns `log` has already read. `convs` is [`load`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn relive(
     repo: &Path,
-    soul: &str,
     sp: &Speakers,
     llm: &dyn Llm,
-    ledger: &Ledger,
     log: &MemoryLog,
-    peers: &PeerIndex,
+    convs: &[Conversation],
     from: &str,
     to: &str,
     max_calls: usize,
     session_tokens: u64,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<ReliveReport> {
     let mut r = ReliveReport::default();
     let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
@@ -685,10 +701,8 @@ pub fn relive(
         .take(SOUL_CHARS)
         .collect();
     let sys = system(&sp.agent, soul_md.trim());
-    let mut convs = conversations(repo)?;
-    label_peers(&mut convs, &sp.agent, peers);
     let done = log.extracted()?;
-    let all: Vec<StreamTurn> = stream(&convs)
+    let all: Vec<StreamTurn> = stream(convs)
         .into_iter()
         .filter(|s| s.turn.ts.as_str() >= from && s.turn.ts.as_str() < to)
         .collect();
@@ -699,13 +713,9 @@ pub fn relive(
         .collect();
     let mut calls = 0usize;
     let mut take_call = |r: &mut ReliveReport| -> bool {
-        if let Err(e) = ledger.check() {
-            r.stopped.get_or_insert(e.to_string());
-            return false;
-        }
-        if calls >= max_calls {
-            r.stopped
-                .get_or_insert(format!("call limit for this run ({max_calls}) reached"));
+        // Giving the turn up is not a failure: the rest is read next pass.
+        if calls >= max_calls || stop.load(std::sync::atomic::Ordering::Relaxed) {
+            r.yielded = true;
             return false;
         }
         calls += 1;
@@ -714,7 +724,7 @@ pub fn relive(
 
     // Merges left over from a run that stopped mid-nap come first: OptMem's
     // wake will not print with a needed block missing.
-    if !nap(llm, &sys, log, &mut r, ledger, soul, &mut take_call)? {
+    if !nap(llm, &sys, log, &mut r, &sp.agent, &mut take_call)? {
         llm.reset();
         return Ok(r);
     }
@@ -752,7 +762,7 @@ pub fn relive(
             } else {
                 None
             };
-            let prompt = note_prompt(wake.as_deref(), &stretch, &convs, sp);
+            let prompt = note_prompt(wake.as_deref(), &stretch, convs, sp);
             if !take_call(&mut r) {
                 return Ok(r);
             }
@@ -790,7 +800,7 @@ pub fn relive(
             }
         };
         let Some((v, i, o)) = answer else { continue };
-        ledger.record(soul, i, o)?;
+        log.append_usage(&sp.agent, i, o)?;
         r.input_tokens += i;
         r.output_tokens += o;
         let mut notes = Vec::new();
@@ -800,8 +810,7 @@ pub fn relive(
             if raw.trim().is_empty() {
                 continue;
             }
-            let Some(text) = ask_line(llm, &sys, raw.clone(), None, log, &mut r, ledger, soul)?
-            else {
+            let Some(text) = ask_line(llm, &sys, raw.clone(), None, log, &mut r, &sp.agent)? else {
                 dropped.push(format!("failed OptMem's check after {ASKS} asks: {raw}"));
                 continue;
             };
@@ -836,7 +845,7 @@ pub fn relive(
         r.notes += notes.len();
         r.dropped += dropped.len();
         // 3. Every merge that came due, before reading on.
-        if !nap(llm, &sys, log, &mut r, ledger, soul, &mut take_call)? {
+        if !nap(llm, &sys, log, &mut r, &sp.agent, &mut take_call)? {
             llm.reset();
             return Ok(r);
         }
@@ -1059,7 +1068,7 @@ mod tests {
         fn model(&self) -> &str {
             "fake"
         }
-        fn json(&self, _: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+        fn json(&self, _: &str, user: &str, _: &Value) -> Result<(Value, u64, u64)> {
             if let Some(rest) = user.strip_prefix("Compress memories #") {
                 let id = rest.split_whitespace().next().unwrap().to_string();
                 let mut n = self.0.lock().unwrap();
@@ -1104,25 +1113,24 @@ mod tests {
         )
         .unwrap();
         let log = MemoryLog::at(base.join("out"));
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 1.0).unwrap();
         let sp = Speakers {
             agent: "soul".into(),
             peers: vec![],
             human: "human".into(),
         };
         let fake = Fake(std::sync::Mutex::new(0));
+        let convs = load(&repo, &sp, &PeerIndex::default()).unwrap();
         let r = relive(
             &repo,
-            "s",
             &sp,
             &fake,
-            &ledger,
             &log,
-            &PeerIndex::default(),
+            &convs,
             "2026",
             "2027",
             100,
             0,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert!(r.stopped.is_none(), "{r:?}");
@@ -1145,7 +1153,7 @@ mod tests {
         fn model(&self) -> &str {
             "fake"
         }
-        fn json(&self, _: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+        fn json(&self, _: &str, user: &str, _: &Value) -> Result<(Value, u64, u64)> {
             if let Some(rest) = user.strip_prefix("Compress memories #") {
                 let id = rest.split_whitespace().next().unwrap().to_string();
                 return Ok((json!({ "text": format!("S{id}") }), 1, 1));
@@ -1172,7 +1180,7 @@ mod tests {
             fn model(&self) -> &str {
                 "fake"
             }
-            fn json(&self, _: &str, user: &str, _: &Value, _: u32) -> Result<(Value, u64, u64)> {
+            fn json(&self, _: &str, user: &str, _: &Value) -> Result<(Value, u64, u64)> {
                 if let Some(rest) = user.strip_prefix("Compress memories #") {
                     let id = rest.split_whitespace().next().unwrap().to_string();
                     return Ok((json!({ "text": format!("S{id}") }), 1, 1));
@@ -1209,25 +1217,24 @@ mod tests {
         )
         .unwrap();
         let log = MemoryLog::at(base.join("out"));
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 1.0).unwrap();
         let sp = Speakers {
             agent: "soul".into(),
             peers: vec![],
             human: "human".into(),
         };
         let llm = Balker(std::sync::Mutex::new(true));
+        let convs = load(&repo, &sp, &PeerIndex::default()).unwrap();
         let r = relive(
             &repo,
-            "s",
             &sp,
             &llm,
-            &ledger,
             &log,
-            &PeerIndex::default(),
+            &convs,
             "2026",
             "2027",
             100,
             0,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert!(r.stopped.is_none(), "{r:?}");
@@ -1261,25 +1268,24 @@ mod tests {
         )
         .unwrap();
         let log = MemoryLog::at(base.join("out"));
-        let ledger = Ledger::open_at(base.join("spend.tsv"), 1.0).unwrap();
         let sp = Speakers {
             agent: "soul".into(),
             peers: vec![],
             human: "human".into(),
         };
         let llm = Refuser(std::sync::Mutex::new(0));
+        let convs = load(&repo, &sp, &PeerIndex::default()).unwrap();
         let r = relive(
             &repo,
-            "s",
             &sp,
             &llm,
-            &ledger,
             &log,
-            &PeerIndex::default(),
+            &convs,
             "2026",
             "2027",
             100,
             0,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert!(r.stopped.is_none(), "{r:?}");

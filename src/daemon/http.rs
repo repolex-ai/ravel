@@ -7,11 +7,11 @@
 //!   GET  /souls/{id}/health           the read-only diagnostic (findings + attention flag)
 //!   GET  /souls/{id}/stats            counts: quads, graphs, turns, dated turns, claims, top predicates
 //!   POST /souls/{id}/query  {query}   SPARQL, W3C results JSON
-//!   GET  /souls/{id}/emojikeys[?origin=authored]
 //!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
 //!   GET  /souls/{id}/memory[?lines=N] the memory wake view: OptMem's cover (default 96 lines)
 //!   GET  /souls/{id}/memory/{node}    one node opened: a block's two halves (`16-31`), a note's turns
 //!   GET  /souls/{id}/memory-progress  turns, turns read, notes, blocks, blocks pending, done
+//!   GET  /souls/{id}/memory-check     the memory checked end to end; `failures` empty = good
 //!   POST /shutdown                    stop, after answering
 //!
 //! Reads open the store read-only; only the sync pass writes.
@@ -28,7 +28,6 @@ use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 type Shared = Arc<Daemon>;
@@ -62,11 +61,11 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .route("/souls/{id}/import", post(import_one))
         .route("/souls/{id}/memory", get(memory_view))
         .route("/souls/{id}/memory-progress", get(memory_progress))
+        .route("/souls/{id}/memory-check", get(memory_check))
         .route("/souls/{id}/memory/{node}", get(memory_open))
         .route("/souls/{id}/health", get(soul_health))
         .route("/souls/{id}/stats", get(soul_stats))
         .route("/souls/{id}/query", post(soul_query))
-        .route("/souls/{id}/emojikeys", get(soul_emojikeys))
         .route("/shutdown", post(shutdown))
         .with_state(d.clone());
     let addr = format!("127.0.0.1:{}", d.cfg.port);
@@ -79,6 +78,8 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
                 _ = tokio::signal::ctrl_c() => super::log("interrupted; stopping"),
                 _ = stop.shutdown.notified() => super::log("asked to stop; stopping"),
             }
+            stop.stopping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         })
         .await?;
     Ok(())
@@ -115,6 +116,7 @@ async fn souls(State(d): State<Shared>) -> Json<Value> {
                 "last_error": st.last_error,
                 "passes": st.passes,
                 "last": st.last,
+                "memory": d.memory_of(&s.id),
             })
         })
         .collect();
@@ -480,31 +482,22 @@ async fn soul_query(
     Ok(Json(v))
 }
 
-async fn soul_emojikeys(
+/// `ravel memory check`: the soul's memory against OptMem's rules and its
+/// own records — every line passes the checks, every block due is built,
+/// every note cites real turns, the wake is OptMem's cover.
+async fn memory_check(
     State(d): State<Shared>,
     Path(id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let soul = d.soul(&id).map_err(not_found)?.clone();
-    let origin = q.get("origin").cloned();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let store = open_store(&soul)?;
-        let hits = graph::query_emojikeys(&store, origin.as_deref())?;
-        Ok(json!(hits
-            .iter()
-            .map(|h| json!({
-                "transcript": h.transcript,
-                "origin": h.source_kind,
-                "me": h.me,
-                "content": h.content,
-                "you": h.you,
-                "ts": h.ts,
-            }))
-            .collect::<Vec<_>>()))
+        let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
+        let v = crate::memory_relive::verify(&soul.path, &log)?;
+        Ok(json!({ "id": soul.id, "check": v }))
     })
     .await
     .map_err(internal)?
-    .map_err(bad)?;
+    .map_err(internal)?;
     Ok(Json(v))
 }
 

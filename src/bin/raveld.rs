@@ -148,12 +148,16 @@ fn serve() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async {
+    let served = rt.block_on(async {
         let looper = d.clone();
         tokio::spawn(daemon::run_sync_loop(looper));
         tokio::spawn(daemon::run_memory_loop(d.clone()));
         daemon::http::serve(d).await
-    })
+    });
+    // A memory pass in flight makes no new call once stopping is set; one
+    // already waiting on the writer is not waited for.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    served
 }
 
 /// Plain words, exit 0 when running and answering, 1 otherwise — so a

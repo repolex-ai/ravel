@@ -22,14 +22,16 @@ souls:
   - ~/repos/7R1PL3F0RC3/W4R3Z
   - ~/repos/7R1PL3F0RC3/lUX
 
-# The memory index (`ravel memory`) reads transcripts with Claude Haiku 4.5 and
-# writes one-line memories and hierarchical window summaries.
-#
-# It is completely disabled by default — calling no model and spending nothing —
-# unless memory_budget_usd is set to a positive dollar cap AND an Anthropic API
-# key is placed in ~/.config/ravel/anthropic-api-key (chmod 600).
-#
-# Every model call is priced and recorded in ~/.config/ravel/memory-spend.tsv.
-# raveld stops calling the model as soon as spend reaches this ceiling.
-# memory_budget_usd: 50
+# The human these souls work with, by name: how the memory labels the human's
+# turns. Optional; "human" otherwise.
+# human: Ada
 
+# Who keeps every soul's memory (`ravel memory`) up to date. Optional: without
+# this block raveld calls no model, and only shows the memory that is there.
+#
+# The writer is a harness's own command line, run on the subscription you are
+# already logged in with — no API key. Built: claude-code. Named, not built
+# yet: codex, gemini, antigravity, hermes (each refuses with what it needs).
+# memory:
+#   writer: claude-code
+#   model: claude-haiku-5-5    # optional; the writer's default

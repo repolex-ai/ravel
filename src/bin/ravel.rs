@@ -2,7 +2,9 @@
 //! When raveld is not running, any command here starts it first
 //! (goodlux, 2026-09-22).
 //!
-//!   ravel                            what raveld is doing (same as `raveld status`)
+//!   ravel                            what raveld is doing, and every soul it serves
+//!   ravel status [<soul>]            one soul: its health check (exit 1 = attention),
+//!                                    its store's counts, and its memory
 //!   ravel souls                      the souls this machine's raveld serves
 //!   ravel sync   [<soul> [<sessions-dir>]]  a pass now (raveld does this on its own anyway);
 //!                                    <sessions-dir> reads another directory's session files
@@ -14,10 +16,9 @@
 //!                                    lines, recent notes word for word, older ones merged
 //!   ravel memory open [<soul>] <id>  one line opened, as OptMem's zoom: a block's two
 //!                                    halves (`16-31`), or a note's source turns (`#12`)
-//!   ravel health [<soul>]            the read-only diagnostic; exit 1 = attention
-//!   ravel stats  [<soul>]            counts: quads, graphs, turns, claims, top predicates
+//!   ravel memory recall <words>      one term across the whole history
+//!   ravel memory check [<soul>]      the memory checked end to end; exit 1 on any failure
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
-//!   ravel emojikeys [<soul>] [authored]
 //!
 //! `<soul>` is a six-character id (the start of the soul's genesis commit) or
 //! a path inside the soul repo; absent = the repo this command runs in.
@@ -33,14 +34,12 @@ fn usage() -> ! {
         "ravel {} — talks to raveld (and starts it when it is not running)\n\n\
          USAGE:\n  \
            ravel\n  \
+           ravel status [<soul>]\n  \
            ravel souls\n  \
            ravel sync   [<soul> [<sessions-dir>]]\n  \
            ravel import [<soul>] <export-dir>\n  \
-           ravel memory [<soul>] | memory open [<soul>] <id> | memory recall <words>\n  \
-           ravel health [<soul>]\n  \
-           ravel stats  [<soul>]\n  \
-           ravel query  [<soul>] \"<sparql>\"\n  \
-           ravel emojikeys [<soul>] [authored]\n\n\
+           ravel memory [<soul>] | memory open [<soul>] <id> | memory recall <words> | memory check [<soul>]\n  \
+           ravel query  [<soul>] \"<sparql>\"\n\n\
          <soul> = six-character id or a path inside the soul repo; absent = here.\n\
          Config: {}",
         env!("CARGO_PKG_VERSION"),
@@ -66,7 +65,9 @@ fn main() -> Result<()> {
     let cfg = DaemonConfig::load()?;
     let client = ensure_running(&cfg)?;
     match a.as_slice() {
-        [] | ["status"] => status(&cfg, &client),
+        [] => status(&cfg, &client),
+        ["status"] => soul_status(&client, &resolve(&client, None)?),
+        ["status", s] => soul_status(&client, &resolve(&client, Some(s))?),
         ["souls"] => souls(&client),
         ["sync"] => sync(&client, &resolve(&client, None)?, None),
         ["sync", s] => sync(&client, &resolve(&client, Some(s))?, None),
@@ -79,19 +80,11 @@ fn main() -> Result<()> {
         }
         ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
         ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
+        ["memory", "check"] => memory_check(&client, &resolve(&client, None)?),
+        ["memory", "check", s] => memory_check(&client, &resolve(&client, Some(s))?),
         ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
-        ["health"] => health(&client, &resolve(&client, None)?),
-        ["health", s] => health(&client, &resolve(&client, Some(s))?),
-        ["stats"] => stats(&client, &resolve(&client, None)?),
-        ["stats", s] => stats(&client, &resolve(&client, Some(s))?),
         ["query", q] => query(&client, &resolve(&client, None)?, q),
         ["query", s, q] => query(&client, &resolve(&client, Some(s))?, q),
-        ["emojikeys"] => emojikeys(&client, &resolve(&client, None)?, None),
-        ["emojikeys", "authored"] => emojikeys(&client, &resolve(&client, None)?, Some("authored")),
-        ["emojikeys", s] => emojikeys(&client, &resolve(&client, Some(s))?, None),
-        ["emojikeys", s, "authored"] => {
-            emojikeys(&client, &resolve(&client, Some(s))?, Some("authored"))
-        }
         _ => usage(),
     }
 }
@@ -147,7 +140,7 @@ fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
         .and_then(|s| s["id"].as_str())
         .unwrap_or("<id>");
     anyhow!(
-        "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by id or path:\n    ravel health {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
+        "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by id or path:\n    ravel status {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
         p.display(),
         ravel::daemon::config::config_path().display()
     )
@@ -175,7 +168,7 @@ fn status(cfg: &DaemonConfig, client: &Client) -> Result<()> {
     for p in h["config_problems"].as_array().unwrap_or(&Vec::new()) {
         println!("  CONFIG PROBLEM: {}", p.as_str().unwrap_or("?"));
     }
-    println!("  memory index: {}", h["memory"].as_str().unwrap_or("?"));
+    println!("  memory: {}", h["memory"].as_str().unwrap_or("?"));
     souls(client)
 }
 
@@ -201,6 +194,9 @@ fn souls(client: &Client) -> Result<()> {
                 ),
             }
         );
+        if let Some(m) = memory_line(&s["memory"]) {
+            println!("      memory {m}");
+        }
     }
     Ok(())
 }
@@ -472,9 +468,24 @@ fn sync(client: &Client, id: &str, sessions_dir: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn health(client: &Client, id: &str) -> Result<()> {
+/// A soul's memory pass in words, or `None` before the first one.
+fn memory_line(m: &Value) -> Option<String> {
+    let last = m["last"].as_str()?;
+    let when = m["last_pass"].as_str().map(short).unwrap_or_default();
+    Some(match m["error"].as_str() {
+        Some(e) => format!(
+            "{when}: FAILED — {e}; next try after {}",
+            m["retry_after"].as_str().map(short).unwrap_or_default()
+        ),
+        None => format!("{when}: {last}"),
+    })
+}
+
+/// `ravel status <soul>`: the health check, the store's counts and the
+/// memory, in one place. Exit 1 when the health check wants attention.
+fn soul_status(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/health"))?;
-    println!("[ravel health] {id} {}", v["path"].as_str().unwrap_or("?"));
+    println!("[ravel status] {id} {}", v["path"].as_str().unwrap_or("?"));
     for f in v["findings"].as_array().unwrap_or(&Vec::new()) {
         println!(
             "  {}{}",
@@ -487,6 +498,32 @@ fn health(client: &Client, id: &str) -> Result<()> {
         );
     }
     let attention = v["attention"].as_bool().unwrap_or(false);
+    if let Ok(st) = client.get(&format!("/souls/{id}/stats")) {
+        println!(
+            "  store: {} turns ({} dated, {} to {}), {} quads in {} graphs, {} unasserted claims",
+            st["turns"],
+            st["dated_turns"],
+            st["earliest"].as_str().map(short).unwrap_or_default(),
+            st["latest"].as_str().map(short).unwrap_or_default(),
+            st["quads"],
+            st["graphs"],
+            st["claims"]
+        );
+    }
+    if let Ok(p) = client.get(&format!("/souls/{id}/memory-progress")) {
+        println!(
+            "  memory: {} notes, {} merges ({} due), {} of {} turns read",
+            p["memories"], p["blocks"], p["pending_blocks"], p["turns_read"], p["turns"]
+        );
+    }
+    let souls = client.get("/souls")?;
+    if let Some(m) = souls
+        .as_array()
+        .and_then(|a| a.iter().find(|s| s["id"] == id))
+        .and_then(|s| memory_line(&s["memory"]))
+    {
+        println!("  last memory pass {m}");
+    }
     println!(
         "  verdict: {}",
         if attention {
@@ -501,29 +538,23 @@ fn health(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn stats(client: &Client, id: &str) -> Result<()> {
-    let v = client.get(&format!("/souls/{id}/stats"))?;
-    println!("=== {id} {} ===", v["path"].as_str().unwrap_or("?"));
-    println!("total quads:       {}", v["quads"]);
-    println!("named graphs:      {}", v["graphs"]);
-    println!("distinct subjects: {}", v["subjects"]);
-    println!("Turn subjects:     {}", v["turns"]);
-    println!("dated turns:       {}", v["dated_turns"]);
+/// `ravel memory check`: every failure by name; exit 1 on any.
+fn memory_check(client: &Client, id: &str) -> Result<()> {
+    let v = client.get(&format!("/souls/{id}/memory-check"))?;
+    let c = &v["check"];
     println!(
-        "earliest:          {}",
-        v["earliest"].as_str().unwrap_or("")
+        "[ravel memory check] {id}: {} notes, {} merges, {} turn links, {} wake lines",
+        c["notes"], c["blocks"], c["turn_links"], c["wake_lines"]
     );
-    println!("latest:            {}", v["latest"].as_str().unwrap_or(""));
-    println!("unasserted claims: {}", v["claims"]);
-    println!("--- top predicates ---");
-    for p in v["top_predicates"].as_array().unwrap_or(&Vec::new()) {
-        println!(
-            "  {:>7}  {}",
-            p["n"],
-            p["predicate"].as_str().unwrap_or("?")
-        );
+    let failures = c["failures"].as_array().cloned().unwrap_or_default();
+    for f in &failures {
+        println!("  FAILED: {}", f.as_str().unwrap_or("?"));
     }
-    Ok(())
+    if failures.is_empty() {
+        println!("  every check passed");
+        return Ok(());
+    }
+    std::process::exit(1);
 }
 
 fn query(client: &Client, id: &str, q: &str) -> Result<()> {
@@ -564,33 +595,6 @@ fn query(client: &Client, id: &str, q: &str) -> Result<()> {
         println!("  {}", cells.join("   "));
     }
     println!("[{} row(s)]", rows.len());
-    Ok(())
-}
-
-fn emojikeys(client: &Client, id: &str, origin: Option<&str>) -> Result<()> {
-    let path = match origin {
-        Some(o) => format!("/souls/{id}/emojikeys?origin={o}"),
-        None => format!("/souls/{id}/emojikeys"),
-    };
-    let v = client.get(&path)?;
-    let hits = v.as_array().cloned().unwrap_or_default();
-    let mut last = String::new();
-    for h in &hits {
-        let t = h["transcript"].as_str().unwrap_or("");
-        if t != last {
-            println!("▸ session {}", if t.len() > 12 { &t[..12] } else { t });
-            last = t.to_string();
-        }
-        println!(
-            "    [{}] [ME|{}]~[CONTENT|{}]~[YOU|{}]  @ {}",
-            h["origin"].as_str().unwrap_or("?"),
-            h["me"].as_str().unwrap_or(""),
-            h["content"].as_str().unwrap_or(""),
-            h["you"].as_str().unwrap_or(""),
-            h["ts"].as_str().unwrap_or("")
-        );
-    }
-    println!("[{} emojikey(s)]", hits.len());
     Ok(())
 }
 

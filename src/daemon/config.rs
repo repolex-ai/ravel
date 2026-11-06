@@ -6,8 +6,10 @@
 //! souls:
 //!   - ~/repos/7R1PL3F0RC3/spaceGOAT
 //!   - ~/repos/7R1PL3F0RC3/W4R3Z
-//! memory_budget_usd: 100   # optional; the memory index spends nothing without it
 //! human: Rob                # optional; the human the souls work with, by name
+//! memory:                   # optional; without it raveld never calls a model
+//!   writer: claude-code     # the harness whose command line writes the memory
+//!   model: claude-haiku-5-5 # optional; the writer's default otherwise
 //! ```
 //!
 //! A missing file is not an error: the daemon starts with no souls and says
@@ -31,8 +33,23 @@ struct Raw {
     interval_secs: Option<u64>,
     #[serde(default)]
     souls: Vec<String>,
-    memory_budget_usd: Option<f64>,
     human: Option<String>,
+    memory: Option<RawMemory>,
+    /// Retired 2026-11-05 with the API path. Read only to say so.
+    memory_budget_usd: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawMemory {
+    writer: Option<String>,
+    model: Option<String>,
+}
+
+/// Who writes the souls' memories, and with which model.
+#[derive(Debug, Clone)]
+pub struct MemoryWriter {
+    pub harness: crate::writer::Harness,
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -45,14 +62,15 @@ pub struct DaemonConfig {
     pub interval_secs: u64,
     /// Soul repo paths, `~` expanded, in file order.
     pub souls: Vec<PathBuf>,
-    /// The most the memory index may spend on model calls, in US dollars,
-    /// counted from `memory-spend.tsv`. Zero (the default) means the memory
-    /// index never calls a model: nothing billed unless a human wrote a number
-    /// here (goodlux, 2026-10-04).
-    pub memory_budget_usd: f64,
     /// The human these souls work with, by name: how a memory reader labels
     /// the human's turns. `None`: "human".
     pub human: Option<String>,
+    /// Who keeps the memories up to date. `None`: nobody, and raveld never
+    /// calls a model — a machine's subscription is spent only when a human
+    /// wrote `memory:` here (goodlux, 2026-11-05).
+    pub memory: Option<MemoryWriter>,
+    /// Lines of the file that parse but do nothing, said on every /health.
+    pub warnings: Vec<String>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -98,14 +116,33 @@ impl DaemonConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Raw::default(), false),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
+        let memory = match raw.memory.as_ref().and_then(|m| m.writer.as_deref()) {
+            None | Some("none") => None,
+            Some(w) => {
+                let harness = crate::writer::Harness::parse(w)
+                    .with_context(|| format!("memory.writer in {}", path.display()))?;
+                let model = raw
+                    .memory
+                    .as_ref()
+                    .and_then(|m| m.model.clone())
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| harness.default_model().to_string());
+                Some(MemoryWriter { harness, model })
+            }
+        };
+        let mut warnings = Vec::new();
+        if raw.memory_budget_usd.is_some() {
+            warnings.push("memory_budget_usd is no longer read: ravel no longer calls the API. Remove the line; `memory:` says who writes the memories".to_string());
+        }
         Ok(Self {
             path: path.to_path_buf(),
             present,
             port: raw.port.unwrap_or(DEFAULT_PORT),
             interval_secs: raw.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
             souls: raw.souls.iter().map(|s| expand_tilde(s)).collect(),
-            memory_budget_usd: raw.memory_budget_usd.unwrap_or(0.0),
             human: raw.human.filter(|h| !h.trim().is_empty()),
+            memory,
+            warnings,
         })
     }
 
@@ -140,6 +177,28 @@ mod tests {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         assert_eq!(cfg.souls[0], home.join("repos/x"));
         assert_eq!(cfg.souls[1], PathBuf::from("/abs/y"));
+    }
+
+    #[test]
+    fn memory_writer_is_off_unless_named_and_an_unknown_one_refuses() {
+        let dir = std::env::temp_dir().join("ravel-config-test-memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.yml");
+        std::fs::write(&p, "souls: []\nmemory_budget_usd: 0\n").unwrap();
+        let cfg = DaemonConfig::load_from(&p).unwrap();
+        assert!(cfg.memory.is_none());
+        assert_eq!(cfg.warnings.len(), 1, "a retired key is said, not ignored");
+        std::fs::write(&p, "memory:\n  writer: claude-code\n").unwrap();
+        let m = DaemonConfig::load_from(&p).unwrap().memory.unwrap();
+        assert_eq!(m.harness, crate::writer::Harness::ClaudeCode);
+        assert_eq!(m.model, "claude-haiku-5-5");
+        std::fs::write(&p, "memory:\n  writer: codex\n  model: gpt-x\n").unwrap();
+        assert_eq!(
+            DaemonConfig::load_from(&p).unwrap().memory.unwrap().model,
+            "gpt-x"
+        );
+        std::fs::write(&p, "memory:\n  writer: vim\n").unwrap();
+        assert!(DaemonConfig::load_from(&p).is_err());
     }
 
     #[test]

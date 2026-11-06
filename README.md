@@ -46,20 +46,20 @@ Commands default to the soul repository you are currently in. To query or inspec
 # 1. Any command starts the daemon if it is not running, then answers.
 ravel
 # raveld is RUNNING — pid 52756, up 0h 00m 10s, version 0.5.0, 20 on http://127.0.0.1:7881
-#   memory index: projected — written by ravel-relive and the soul's own notes; raveld never calls a model
+#   memory: written by claude-code (claude-haiku-5-5) on the subscription, every 10 min
 #   9bdf2a  /Volumes/f00/repos/7R1PL3F0RC3/spaceGOAT
 #       last pass 2026-10-04T16:11:50-07:00  mirrored 1 (unchanged 589), ingested 1 session(s) ...
+#       memory 2026-10-04 16:10: 9 notes and 7 merges from 63 turns
 
-# 2. Inside a soul repo, ask how its backup is doing. Exit 1 means look.
-ravel health
+# 2. Inside a soul repo: its backup's health, its store, its memory. Exit 1 means look.
+ravel status
 
 # 3. What the graph holds
-ravel stats
 ravel query 'SELECT (COUNT(DISTINCT ?t) AS ?turns) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }'
 
 # 4. Another soul, by its six-character id or a path
-ravel health 700c5b
-ravel stats ~/repos/SQUAD/lUX
+ravel status 700c5b
+ravel status ~/repos/SQUAD/lUX
 
 # 5. List all registered souls and sync status
 ravel souls
@@ -139,34 +139,50 @@ The lines are OptMem's own format: `#i date text` for a note and `#lo-hi
 text` for a merge. `tests/optmem_conformance.rs` runs OptMem's `memo` beside
 ravel and requires the same bytes for every merge prompt and every wake view.
 
-### Building a memory from the past: `ravel-relive`
+### Keeping it up to date
 
-A soul's past was not noted as it happened, so `ravel-relive` relives it. It
-reads every turn the soul has, from every harness, in one stream ordered by
-time, a stretch at a time. Before each stretch the reader wakes as OptMem
-wakes. It then notes what the soul would have noted, and does every merge that
-came due before reading on. The reader is the soul: it is given its name and
-SOUL.md, and it merges its own memory, as OptMem's agent does.
+raveld writes every soul's memory itself, on the subscription you already
+have. Turn it on with one block in `config.yml`:
 
-```sh
-ravel-relive plan   <soul-repo> 2000 2100        # how much there is to read; no model calls
-ravel-relive dump   <soul-repo> <from> <to>      # exactly what the reader is shown; no model calls
-ravel-relive run    <soul-repo> 2000 2100 <soul-repo>/.ravel/_ignore/optmem sub:claude-haiku-5-5+session
-ravel-relive verify <soul-repo> <soul-repo>/.ravel/_ignore/optmem   # check the result end to end
+```yaml
+memory:
+  writer: claude-code        # the harness whose command line writes the memory
+  model: claude-haiku-5-5    # optional; this is the default
 ```
 
-- **The model runs on your Claude subscription**, through Claude Code (`claude
-  -p`), one call at a time. The API key is removed from the call's
-  environment, and a call that used one is refused.
-- `+session` keeps one Claude Code session open across stretches, the way the
-  soul lived them. A new session, and a fresh wake, starts once the context
-  passes 90,000 tokens.
-- The run resumes exactly where it stopped. It never skips a stretch or a
-  merge.
-- `api:<max-usd>` uses an API key from `~/.config/ravel/anthropic-api-key`
-  instead, priced into `~/.config/ravel/memory-spend.tsv`.
+Without `memory:`, raveld calls no model and only shows the memory that is
+there.
 
-**What the reader is shown** (`ravel-relive dump` prints it):
+Every ten minutes, for each soul whose transcripts gained turns, raveld:
+
+1. reads the turns its memory has not read yet, as one stream ordered by time;
+2. leaves anything younger than 30 minutes for later, so a conversation still
+   going on is not noted halfway, and waits until the rest fills a stretch of
+   about 24,000 characters, or until its oldest turn is six hours old;
+3. relives that stretch as the soul. It wakes as OptMem wakes, notes what the
+   soul would have noted, and does every merge that came due, with OptMem's own
+   prompt. The writer is given the soul's name and SOUL.md, because in OptMem
+   the agent writes and merges its own memory;
+4. rebuilds any merge the checks refuse, with every merge above it.
+
+A first pass catches up the whole past, so a new soul's memory is built the
+same way. At most 60 model calls go to one soul per pass, so one long
+catch-up never holds the other souls back.
+
+**On the subscription.** The writer is the harness's own command line, run
+with no tools, no settings and no project, in an empty directory. For Claude
+Code that is `claude -p`; `ANTHROPIC_API_KEY` is removed from its environment,
+and a call that used an API key anyway is refused. When the subscription
+reports its usage limit, every soul waits 30 minutes, and `ravel` says so.
+
+**Writers.** ravel does not need Claude. Any harness whose command line can
+answer one prompt with structured output, on the user's own login, with no
+tools, and without saving its session where ravel reads transcripts, can be a
+writer. Claude Code is built. Codex, Gemini CLI, Antigravity and Hermes are
+named in the config and refuse with what each one still needs
+(`src/writer.rs`).
+
+**What the reader is shown:**
 
 - Only the soul's own life: what the soul said, what its human said
   (labelled by name, from `human:` in config.yml), and messages from other
@@ -176,11 +192,12 @@ ravel-relive verify <soul-repo> <soul-repo>/.ravel/_ignore/optmem   # check the 
   Antigravity subagents. In OptMem, a subagent never writes memory.
 - Harness records that arrive as user input are left out: notifications,
   slash commands, system reminders and the like.
-- A message another agent typed in through herdr is recognised from the
+- A message another soul typed in through herdr is recognised from the
   sender's side: the sender's own transcript holds the `herdr agent prompt`
-  that sent it.
+  that sent it. The senders are the other souls in `config.yml`.
 
-**`verify` checks:**
+**`ravel memory check`** tests a soul's memory end to end, and exits 1 on any
+failure:
 
 - every line passes OptMem's limits;
 - every merge that is due is built;
@@ -188,11 +205,6 @@ ravel-relive verify <soul-repo> <soul-repo>/.ravel/_ignore/optmem   # check the 
 - the wake is OptMem's cover;
 - the graph projection loads;
 - every cited turn is a Turn in the soul's store.
-
-It exits 1 on any failure.
-
-`raveld` never calls a model. It projects each soul's memory into the
-`memory-v1` graph on its passes.
 
 ## What lives where
 
@@ -208,14 +220,14 @@ It exits 1 on any failure.
 │   ├── memories.jsonl                    OptMem's log: one note per line, in order noted
 │   ├── summaries.jsonl                   OptMem's tree: one merged block per line (`16-31`)
 │   ├── extracted.tsv                     ids of turns already read, one per line
+│   ├── dropped.tsv                       lines the checks refused, and stretches left blank
+│   ├── stream.json                       how many turns the reader's stream held at the last pass
 │   └── usage.tsv                         tokens per model call
 └── oxigraph/                             the graph: one named graph per transcript,
                                           plus memory-v1 for the memory index
 
 ~/.config/ravel/config.yml                daemon config: port, interval, souls, the human's name
 ~/.config/ravel/raveld.log                log output from detached daemon
-~/.config/ravel/anthropic-api-key         optional: an API key for `ravel-relive api:` (chmod 600)
-~/.config/ravel/memory-spend.tsv          audit ledger for API calls: timestamp, soul, tokens, USD
 ```
 
 A soul's id is the first six characters of its repository's genesis commit —
@@ -249,7 +261,7 @@ a claude.ai `human` turn is projected as `user`, the value Claude Code uses.
 A reader's claim is never asserted as fact. It is recorded as an unasserted
 RDF 1.2 triple term (`rdf:reifies`), with the reader named, the source span
 anchored, and whether the text was authored live or quoted from a tool result.
-Queries filter; ingest never drops. That is why `ravel stats` counts
+Queries filter; ingest never drops. That is why `ravel status` counts
 "unasserted claims" separately from everything else.
 
 ## The ontology
@@ -272,7 +284,7 @@ The store partitions data into named graphs under `https://repolex.ai/ravel/Name
 
 ## Health
 
-`ravel health` is the one diagnostic, and it is read-only. It reports the
+`ravel status <soul>` is the one diagnostic, and it is read-only. It reports the
 layout, the kit, whether every session on disk is mirrored, how long any live
 session has been ahead of its mirror, session directories under a name the
 repo no longer uses, Antigravity conversations that belong to no soul, and the

@@ -13,7 +13,10 @@
 
 pub mod config;
 pub mod http;
+pub mod memory;
 pub mod registry;
+
+pub use memory::run_memory_loop;
 
 use crate::sync::{self, SyncStats};
 use anyhow::{anyhow, Result};
@@ -103,9 +106,13 @@ pub struct Daemon {
     /// One pass at a time across all souls.
     gate: tokio::sync::Mutex<()>,
     pub shutdown: Notify,
-    /// The last account-level refusal from the model API, shown on /health
-    /// until a pass gets through.
-    pub memory_refused: Mutex<Option<String>>,
+    /// Set once raveld is asked to stop: a memory pass makes no new call.
+    pub stopping: std::sync::atomic::AtomicBool,
+    /// What the memory writer has done, per soul.
+    pub memory: Mutex<memory::MemoryState>,
+    /// Souls whose transcripts gained turns their memory has not read. All
+    /// of them at start: a restart catches up.
+    memory_dirty: Mutex<std::collections::HashSet<String>>,
 }
 
 pub fn log(msg: impl AsRef<str>) {
@@ -118,7 +125,9 @@ pub fn log(msg: impl AsRef<str>) {
 
 impl Daemon {
     pub fn open(cfg: DaemonConfig) -> Result<Self> {
-        let (souls, problems) = registry::build(&cfg.souls);
+        let (souls, mut problems) = registry::build(&cfg.souls);
+        problems.extend(cfg.warnings.iter().cloned());
+        let dirty = souls.iter().map(|s| s.id.clone()).collect();
         let state = souls
             .iter()
             .map(|s| (s.id.clone(), SoulState::default()))
@@ -132,7 +141,9 @@ impl Daemon {
             state: Mutex::new(state),
             gate: tokio::sync::Mutex::new(()),
             shutdown: Notify::new(),
-            memory_refused: Mutex::new(None),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            memory: Mutex::new(memory::MemoryState::default()),
+            memory_dirty: Mutex::new(dirty),
         })
     }
 
@@ -209,7 +220,11 @@ impl Daemon {
         match &res {
             Ok(stats) => {
                 st.last_error = None;
-                st.last = Some(SyncSummary::from(stats));
+                let sum = SyncSummary::from(stats);
+                if sum.sessions + sum.agy_sessions + sum.claude_ai_conversations > 0 {
+                    self.mark(&soul.id);
+                }
+                st.last = Some(sum);
             }
             Err(e) => {
                 st.last_error = Some(format!("{e:#}"));
@@ -264,51 +279,5 @@ pub async fn run_sync_loop(d: Arc<Daemon>) {
             }
         }
         tokio::time::sleep(interval).await;
-    }
-}
-
-/// How often the memory loop re-projects each soul's memory into its graph.
-const MEMORY_INTERVAL: Duration = Duration::from_secs(10 * 60);
-
-impl Daemon {
-    /// What the memory is doing, said by name on /health. raveld never
-    /// calls a model: a soul's memory is written by `ravel-relive` (the
-    /// backfill) and by the soul's own notes; raveld projects it.
-    pub fn memory_status(&self) -> String {
-        "projected — written by ravel-relive and the soul's own notes; raveld never calls a model"
-            .into()
-    }
-
-    /// The memory's state as one word for a UI.
-    pub fn memory_state(&self) -> &'static str {
-        "projected"
-    }
-
-    /// Project one soul's memory logs into its `memory-v1` graph, under the
-    /// gate.
-    pub async fn memory_one(self: &Arc<Self>, id: &str) -> Result<()> {
-        let soul = self.soul(id)?.clone();
-        let _g = self.gate.lock().await;
-        let path = soul.path.clone();
-        tokio::task::spawn_blocking(move || crate::memory_log::project_into_store(&path))
-            .await
-            .map_err(|e| anyhow!("memory projection panicked: {e}"))??;
-        Ok(())
-    }
-}
-
-/// The memory schedule: every soul, every ten minutes, after a first wait so
-/// the transcript passes catch up first. Projection only.
-pub async fn run_memory_loop(d: Arc<Daemon>) {
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    log(format!("memory {}", d.memory_status()));
-    loop {
-        let ids: Vec<String> = d.souls.iter().map(|s| s.id.clone()).collect();
-        for id in ids {
-            if let Err(e) = d.memory_one(&id).await {
-                log(format!("{id}: memory projection FAILED — {e:#}"));
-            }
-        }
-        tokio::time::sleep(MEMORY_INTERVAL).await;
     }
 }

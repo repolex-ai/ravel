@@ -100,7 +100,7 @@ impl MemoryLog {
 
     /// How many turns the reader's stream held when the last run began: the
     /// prose turns it reads, after subagents and harness noise are dropped.
-    /// Written by `ravel-relive run`, because counting it needs every soul's
+    /// Written by each memory pass, because counting it needs every soul's
     /// sends (about 11 s), too slow for a progress request. The store's Turn
     /// count is a different number (tool output, subagents), so it never says
     /// whether a soul is fully read.
@@ -164,6 +164,21 @@ impl MemoryLog {
                 l.replace(['\n', '\t'], " ")
             )?;
         }
+        Ok(())
+    }
+
+    /// One model call's tokens, `rfc3339 \t soul \t in \t out \t 0`: what a
+    /// memory costs the subscription, counted beside the memory. The last
+    /// column is the US dollars billed, always 0 on a subscription; it is kept
+    /// so the file reads the same as the years of it written before.
+    pub fn append_usage(&self, soul: &str, input: u64, output: u64) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let mut f = open_append(&self.path("usage.tsv"))?;
+        writeln!(
+            f,
+            "{}\t{soul}\t{input}\t{output}\t0",
+            chrono::Utc::now().to_rfc3339()
+        )?;
         Ok(())
     }
 
