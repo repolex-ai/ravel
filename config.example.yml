@@ -35,3 +35,5 @@ souls:
 # memory:
 #   writer: claude-code
 #   model: claude-haiku-5-5    # optional; the writer's default
+#   reword: off                # rewrite merges left in an older wording: on, off,
+#                              # or a list of soul names (repo folder names)

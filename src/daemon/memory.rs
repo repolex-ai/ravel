@@ -326,7 +326,72 @@ impl Daemon {
     }
 }
 
+/// Merges one soul may rewrite into the current wording in one pass.
+pub const REWORD_CALLS: usize = 40;
+
 impl Daemon {
+    fn failed(&self, id: &str, e: &anyhow::Error) {
+        let retry = stamp(Utc::now() + RETRY_AFTER);
+        self.note(id, |m| {
+            m.error = Some(format!("{e:#}"));
+            m.retry_after = Some(retry.clone());
+        });
+        log(format!(
+            "{id}: memory pass FAILED — {e:#}; next try after {retry}"
+        ));
+    }
+
+    /// Rewrite up to [`REWORD_CALLS`] of one soul's merges that are in an
+    /// older wording, smallest first.
+    async fn reword_one(self: &Arc<Self>, id: &str, w: &MemoryWriter) -> Result<()> {
+        let soul = self.soul(id)?.clone();
+        let name = soul_name(&soul.path);
+        let (path, w2, d) = (soul.path.clone(), w.clone(), self.clone());
+        let left = {
+            let log_ = MemoryLog::for_soul(&soul.path);
+            memory_relive::to_reword(&log_)?.len()
+        };
+        if left == 0 {
+            return Ok(());
+        }
+        self.memory.lock().unwrap().writing = Some(id.to_string());
+        let res = tokio::task::spawn_blocking(move || -> Result<memory_relive::ReliveReport> {
+            let log_ = MemoryLog::for_soul(&path);
+            let llm = w2.harness.open(&w2.model)?;
+            let r =
+                memory_relive::reword(llm.as_ref(), &path, &name, &log_, REWORD_CALLS, &d.stopping);
+            llm.reset();
+            r
+        })
+        .await
+        .map_err(|e| anyhow!("reword panicked: {e}"));
+        self.memory.lock().unwrap().writing = None;
+        let r = res??;
+        let did = format!(
+            "rewrote {} merges in the current wording, {} left",
+            r.merges,
+            left - r.merges
+        );
+        match &r.stopped {
+            Some(why) if crate::writer::is_usage_limit_text(why) => {
+                let mut m = self.memory.lock().unwrap();
+                m.paused_until = Some(Utc::now() + LIMIT_PAUSE);
+                m.paused_why = Some(why.clone());
+                drop(m);
+                log(format!("{id}: memory {did}; subscription limit — {why}"));
+            }
+            Some(why) => anyhow::bail!("{did}, then: {why}"),
+            None => {
+                self.note(id, |s| {
+                    s.error = None;
+                    s.last = Some(did.clone());
+                });
+                log(format!("{id}: memory {did}"));
+            }
+        }
+        Ok(())
+    }
+
     /// One soul's memory pass now, exactly as the loop runs it: for a trial
     /// on one soul before the loop is turned on for all of them.
     pub async fn memory_pass(self: &Arc<Self>, id: &str) -> Result<SoulMemory> {
@@ -392,7 +457,9 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
         {
             break;
         }
-        if !d.memory_dirty.lock().unwrap().contains(&s.id) {
+        let dirty = d.memory_dirty.lock().unwrap().contains(&s.id);
+        let reword = w.reword.covers(&soul_name(&s.path));
+        if !dirty && !reword {
             continue;
         }
         let waits = d
@@ -403,21 +470,29 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
         if waits {
             continue;
         }
-        if peers.is_none() {
-            peers = Some(d.peer_index().await?);
+        if dirty {
+            if peers.is_none() {
+                peers = Some(d.peer_index().await?);
+            }
+            let idx = peers.clone().expect("built just above");
+            if let Err(e) = d.write_one(&s.id, w, idx).await {
+                d.mark(&s.id);
+                d.failed(&s.id, &e);
+                continue;
+            }
         }
-        let idx = peers.clone().expect("built just above");
-        if let Err(e) = d.write_one(&s.id, w, idx).await {
-            d.mark(&s.id);
-            let retry = stamp(Utc::now() + RETRY_AFTER);
-            d.note(&s.id, |m| {
-                m.error = Some(format!("{e:#}"));
-                m.retry_after = Some(retry.clone());
-            });
-            log(format!(
-                "{}: memory pass FAILED — {e:#}; next try after {retry}",
-                s.id
-            ));
+        // New turns first; then, with what is left of the pass, merges
+        // still in an older wording.
+        let paused = d
+            .memory
+            .lock()
+            .unwrap()
+            .paused_until
+            .is_some_and(|t| t > Utc::now());
+        if reword && !paused && !d.stopping.load(Ordering::Relaxed) {
+            if let Err(e) = d.reword_one(&s.id, w).await {
+                d.failed(&s.id, &e);
+            }
         }
     }
     Ok(())

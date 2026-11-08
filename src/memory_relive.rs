@@ -466,6 +466,66 @@ fn a_memory(line: String, block: Option<&str>) -> Result<String, String> {
     Ok(line)
 }
 
+/// Build block `b`'s merge from its notes or halves as they stand in `sums`,
+/// with OptMem's prompt (`extra`, when given, appended), the same checks and
+/// re-asks as every merge, and append it. `false` when the run must stop
+/// (`r.stopped` says why).
+#[allow(clippy::too_many_arguments)]
+fn merge(
+    llm: &dyn Llm,
+    sys: &str,
+    log: &MemoryLog,
+    r: &mut ReliveReport,
+    soul: &str,
+    memories: &[Memory],
+    sums: &mut std::collections::HashMap<String, Summary>,
+    b: memory::Block,
+    left: usize,
+    extra: Option<&str>,
+) -> Result<bool> {
+    let mut prompt = memory_log::nap_prompt(memories, sums, b, left)?;
+    if let Some(x) = extra {
+        prompt = format!("{prompt}\n{x}\n");
+    }
+    let (v, i, o) = match call_or_fresh(llm, sys, &prompt, &|| prompt.clone(), &summary_schema()) {
+        Ok(x) => x,
+        Err(e) => {
+            r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
+            return Ok(false);
+        }
+    };
+    log.append_usage(soul, i, o)?;
+    r.input_tokens += i;
+    r.output_tokens += o;
+    let first = v["text"].as_str().unwrap_or("").to_string();
+    let Some(text) = ask_line(llm, sys, first, Some(&prompt), log, r, soul)? else {
+        r.stopped = Some(format!(
+            "merge #{}: no line passing the checks after {ASKS} asks",
+            memory::block_id(b)
+        ));
+        return Ok(false);
+    };
+    let sm = Summary {
+        block: memory::block_id(b),
+        text,
+        model: llm.model().to_string(),
+        written: chrono::Utc::now().to_rfc3339(),
+        // A rebuild with extra words is a trial, not the current wording.
+        wording: Some(
+            if extra.is_some() {
+                "trial"
+            } else {
+                memory_log::WORDING
+            }
+            .to_string(),
+        ),
+    };
+    log.append_summary(&sm)?;
+    sums.insert(sm.block.clone(), sm);
+    r.merges += 1;
+    Ok(true)
+}
+
 /// Answer every merge due over the log, in OptMem's order. `false` when the
 /// run must stop (`r.stopped` says why).
 fn nap(
@@ -484,57 +544,34 @@ fn nap(
         let Some(&b) = todo.first() else {
             return Ok(true);
         };
-        let prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1)?;
         if !take_call(r) {
             return Ok(false);
         }
-        let (v, i, o) =
-            match call_or_fresh(llm, sys, &prompt, &|| prompt.clone(), &summary_schema()) {
-                Ok(x) => x,
-                Err(e) => {
-                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
-                    return Ok(false);
-                }
-            };
-        log.append_usage(soul, i, o)?;
-        r.input_tokens += i;
-        r.output_tokens += o;
-        let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, sys, first, Some(&prompt), log, r, soul)? else {
-            r.stopped = Some(format!(
-                "merge #{}: no line passing OptMem's check after {ASKS} asks",
-                memory::block_id(b)
-            ));
+        if !merge(
+            llm,
+            sys,
+            log,
+            r,
+            soul,
+            &memories,
+            &mut sums,
+            b,
+            todo.len() - 1,
+            None,
+        )? {
             return Ok(false);
-        };
-        let sm = Summary {
-            block: memory::block_id(b),
-            text,
-            model: llm.model().to_string(),
-            written: chrono::Utc::now().to_rfc3339(),
-        };
-        log.append_summary(&sm)?;
-        sums.insert(sm.block.clone(), sm);
-        r.merges += 1;
+        }
     }
 }
 
-/// The merges `verify` refuses, with every merge built on top of them, in the
-/// order they must be rebuilt: smallest first, left to right, as OptMem builds.
-pub fn to_repair(log: &MemoryLog) -> Result<Vec<memory::Block>> {
-    let sums = log.summaries()?;
+/// Every built block `b` and each aligned block above it that was built,
+/// smallest first, left to right, as OptMem builds.
+fn with_ancestors(
+    sums: &std::collections::HashMap<String, Summary>,
+    bad: impl Iterator<Item = memory::Block>,
+) -> Vec<memory::Block> {
     let mut out: std::collections::BTreeSet<(usize, usize)> = Default::default();
-    for (id, s) in &sums {
-        let Some(b) = memory::parse_block(id) else {
-            continue;
-        };
-        let ok = memory::check(&s.text)
-            .and_then(not_wrapped)
-            .and_then(|l| a_memory(l, Some(id)));
-        if ok.is_ok() {
-            continue;
-        }
-        // b and each aligned block above it that was built
+    for b in bad {
         let (mut lo, mut n) = (b.0, b.1 - b.0);
         loop {
             let up = (lo, lo + n);
@@ -547,61 +584,116 @@ pub fn to_repair(log: &MemoryLog) -> Result<Vec<memory::Block>> {
             lo -= lo % n;
         }
     }
-    Ok(out.into_iter().map(|(n, lo)| (lo, lo + n)).collect())
+    out.into_iter().map(|(n, lo)| (lo, lo + n)).collect()
 }
 
-/// Rebuild the merges [`to_repair`] lists, each from its notes or halves as
-/// they stand now, with the same prompt and checks as a run. A new line is
-/// appended and wins over the old; nothing is deleted, and no turn is read.
-pub fn repair(llm: &dyn Llm, repo: &Path, soul: &str, log: &MemoryLog) -> Result<ReliveReport> {
-    let mut r = ReliveReport::default();
+/// The merges `verify` refuses, with every merge built on top of them, in the
+/// order they must be rebuilt: smallest first, left to right, as OptMem builds.
+pub fn to_repair(log: &MemoryLog) -> Result<Vec<memory::Block>> {
+    let sums = log.summaries()?;
+    let bad: Vec<memory::Block> = sums
+        .iter()
+        .filter(|(id, s)| {
+            memory::check(&s.text)
+                .and_then(not_wrapped)
+                .and_then(|l| a_memory(l, Some(id)))
+                .is_err()
+        })
+        .filter_map(|(id, _)| memory::parse_block(id))
+        .collect();
+    Ok(with_ancestors(&sums, bad.into_iter()))
+}
+
+/// The merges written in an older wording than [`memory_log::WORDING`], in
+/// the order they must be rebuilt: smallest first, so every merge is rebuilt
+/// from halves already in the current wording.
+pub fn to_reword(log: &MemoryLog) -> Result<Vec<memory::Block>> {
+    let sums = log.summaries()?;
+    let old: Vec<memory::Block> = sums
+        .iter()
+        .filter(|(_, s)| s.wording.as_deref() != Some(memory_log::WORDING))
+        .filter_map(|(id, _)| memory::parse_block(id))
+        .collect();
+    Ok(with_ancestors(&sums, old.into_iter()))
+}
+
+fn soul_system(repo: &Path, soul: &str) -> String {
     let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
         .unwrap_or_default()
         .chars()
         .take(SOUL_CHARS)
         .collect();
-    let sys = system(soul, soul_md.trim());
+    system(soul, soul_md.trim())
+}
+
+/// Rebuild `todo`'s merges in order, each from its notes or halves as they
+/// stand now, with the same prompt and checks as a run. A new line is
+/// appended and wins over the old; nothing is deleted, and no turn is read.
+/// At most `max_calls` merges; `r.yielded` when more were left.
+fn rebuild_blocks(
+    llm: &dyn Llm,
+    repo: &Path,
+    soul: &str,
+    log: &MemoryLog,
+    todo: &[memory::Block],
+    max_calls: usize,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<ReliveReport> {
+    let mut r = ReliveReport::default();
+    let sys = soul_system(repo, soul);
     let memories = log.memories()?;
     let mut sums = log.summaries()?;
-    let todo = to_repair(log)?;
     for (k, &b) in todo.iter().enumerate() {
-        let prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1 - k)?;
-        let (v, i, o) =
-            match call_or_fresh(llm, &sys, &prompt, &|| prompt.clone(), &summary_schema()) {
-                Ok(x) => x,
-                Err(e) => {
-                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
-                    return Ok(r);
-                }
-            };
-        log.append_usage(soul, i, o)?;
-        r.input_tokens += i;
-        r.output_tokens += o;
-        let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, soul)? else {
-            r.stopped = Some(format!(
-                "merge #{}: no line passing the checks after {ASKS} asks",
-                memory::block_id(b)
-            ));
-            return Ok(r);
-        };
-        let sm = Summary {
-            block: memory::block_id(b),
-            text,
-            model: llm.model().to_string(),
-            written: chrono::Utc::now().to_rfc3339(),
-        };
-        log.append_summary(&sm)?;
-        sums.insert(sm.block.clone(), sm);
-        r.merges += 1;
+        if k >= max_calls || stop.load(std::sync::atomic::Ordering::Relaxed) {
+            r.yielded = true;
+            break;
+        }
+        // A long run of merges in one session ends, and the next begins fresh.
+        if llm.context_tokens() > 90_000 {
+            llm.reset();
+        }
+        if !merge(
+            llm,
+            &sys,
+            log,
+            &mut r,
+            soul,
+            &memories,
+            &mut sums,
+            b,
+            todo.len() - 1 - k,
+            None,
+        )? {
+            break;
+        }
     }
     Ok(r)
 }
 
+/// Rebuild the merges [`to_repair`] lists.
+pub fn repair(llm: &dyn Llm, repo: &Path, soul: &str, log: &MemoryLog) -> Result<ReliveReport> {
+    let todo = to_repair(log)?;
+    rebuild_blocks(llm, repo, soul, log, &todo, usize::MAX, &Default::default())
+}
+
+/// Rebuild up to `max_calls` of the merges [`to_reword`] lists: a memory
+/// moves to a new merge wording a few merges a pass, with no script.
+pub fn reword(
+    llm: &dyn Llm,
+    repo: &Path,
+    soul: &str,
+    log: &MemoryLog,
+    max_calls: usize,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<ReliveReport> {
+    let todo = to_reword(log)?;
+    rebuild_blocks(llm, repo, soul, log, &todo, max_calls, stop)
+}
+
 /// Build every merge due over `log`'s notes, cold, from nothing but the notes:
 /// a side-by-side test of the merge wording. `extra`, when given, is appended
-/// to OptMem's merge prompt, so the only difference between two rebuilds of
-/// the same notes is that text. No turn is read.
+/// to the merge prompt, so the only difference between two rebuilds of the
+/// same notes is that text. No turn is read.
 pub fn rebuild(
     llm: &dyn Llm,
     repo: &Path,
@@ -610,49 +702,26 @@ pub fn rebuild(
     extra: Option<&str>,
 ) -> Result<ReliveReport> {
     let mut r = ReliveReport::default();
-    let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
-        .unwrap_or_default()
-        .chars()
-        .take(SOUL_CHARS)
-        .collect();
-    let sys = system(soul, soul_md.trim());
+    let sys = soul_system(repo, soul);
     let memories = log.memories()?;
     let mut sums = log.summaries()?;
     loop {
         let todo = memory_log::pending(&sums, memories.len());
         let Some(&b) = todo.first() else { return Ok(r) };
-        let mut prompt = memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1)?;
-        if let Some(x) = extra {
-            prompt = format!("{prompt}\n{x}\n");
-        }
-        let (v, i, o) =
-            match call_or_fresh(llm, &sys, &prompt, &|| prompt.clone(), &summary_schema()) {
-                Ok(x) => x,
-                Err(e) => {
-                    r.stopped = Some(format!("merge #{}: {e:#}", memory::block_id(b)));
-                    return Ok(r);
-                }
-            };
-        log.append_usage(soul, i, o)?;
-        r.input_tokens += i;
-        r.output_tokens += o;
-        let first = v["text"].as_str().unwrap_or("").to_string();
-        let Some(text) = ask_line(llm, &sys, first, Some(&prompt), log, &mut r, soul)? else {
-            r.stopped = Some(format!(
-                "merge #{}: no line passing the checks after {ASKS} asks",
-                memory::block_id(b)
-            ));
+        if !merge(
+            llm,
+            &sys,
+            log,
+            &mut r,
+            soul,
+            &memories,
+            &mut sums,
+            b,
+            todo.len() - 1,
+            extra,
+        )? {
             return Ok(r);
-        };
-        let sm = Summary {
-            block: memory::block_id(b),
-            text,
-            model: llm.model().to_string(),
-            written: chrono::Utc::now().to_rfc3339(),
-        };
-        log.append_summary(&sm)?;
-        sums.insert(sm.block.clone(), sm);
-        r.merges += 1;
+        }
     }
 }
 
@@ -695,12 +764,7 @@ pub fn relive(
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<ReliveReport> {
     let mut r = ReliveReport::default();
-    let soul_md: String = std::fs::read_to_string(repo.join("SOUL.md"))
-        .unwrap_or_default()
-        .chars()
-        .take(SOUL_CHARS)
-        .collect();
-    let sys = system(&sp.agent, soul_md.trim());
+    let sys = soul_system(repo, &sp.agent);
     let done = log.extracted()?;
     let all: Vec<StreamTurn> = stream(convs)
         .into_iter()
@@ -1329,6 +1393,7 @@ mod tests {
             text: t.into(),
             model: "m".into(),
             written: "w".into(),
+            wording: Some(memory_log::WORDING.into()),
         };
         for (b, t) in [
             ("0-1", "a"),
@@ -1347,6 +1412,50 @@ mod tests {
             log.append_summary(&sm(b, t)).unwrap();
         }
         assert!(to_repair(&log).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merges_in_an_older_wording_are_rewritten_a_few_a_pass_smallest_first() {
+        let dir = std::env::temp_dir().join(format!("ravel-reword-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = MemoryLog::at(dir.join("out"));
+        let notes: Vec<Memory> = (0..4)
+            .map(|k| Memory {
+                id: format!("m{k}"),
+                ts: format!("2026-01-0{}T00:00:00Z", k + 1),
+                text: format!("note {k}"),
+                turns: vec![format!("t{k}")],
+                model: "m".into(),
+            })
+            .collect();
+        log.append_chunk(&notes, &[]).unwrap();
+        let sm = |b: &str, w: Option<&str>| Summary {
+            block: b.into(),
+            text: format!("old {b}"),
+            model: "m".into(),
+            written: "w".into(),
+            wording: w.map(str::to_string),
+        };
+        // 2-3 is already current; 0-1 is not, so 0-1 and 0-3 above it are due.
+        log.append_summary(&sm("0-1", None)).unwrap();
+        log.append_summary(&sm("2-3", Some(memory_log::WORDING)))
+            .unwrap();
+        log.append_summary(&sm("0-3", None)).unwrap();
+        assert_eq!(to_reword(&log).unwrap(), vec![(0, 2), (0, 4)]);
+        let fake = Fake(std::sync::Mutex::new(1));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let r = reword(&fake, &dir, "soul", &log, 1, &stop).unwrap();
+        assert_eq!((r.merges, r.yielded), (1, true), "{r:?}");
+        assert_eq!(to_reword(&log).unwrap(), vec![(0, 4)]);
+        let r = reword(&fake, &dir, "soul", &log, 1, &stop).unwrap();
+        assert_eq!(r.merges, 1);
+        assert!(to_reword(&log).unwrap().is_empty());
+        let sums = log.summaries().unwrap();
+        assert_eq!(sums["0-3"].text, "S0-3", "rebuilt, and the newer line wins");
+        assert!(memory_log::nap_prompt(&notes, &sums, (0, 4), 0)
+            .unwrap()
+            .ends_with(&format!("{}\n", memory_log::STORY)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -10,6 +10,8 @@
 //! memory:                   # optional; without it raveld never calls a model
 //!   writer: claude-code     # the harness whose command line writes the memory
 //!   model: claude-haiku-5-5 # optional; the writer's default otherwise
+//!   reword: on              # optional: rewrite merges left in an older wording,
+//!                           # `on`, `off` (the default), or a list of soul names
 //! ```
 //!
 //! A missing file is not an error: the daemon starts with no souls and says
@@ -43,6 +45,26 @@ struct Raw {
 struct RawMemory {
     writer: Option<String>,
     model: Option<String>,
+    reword: Option<serde_yaml::Value>,
+}
+
+/// Which souls have their merges rewritten into the current wording.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reword {
+    Off,
+    All,
+    /// By soul name (the repo folder's), so a big soul can wait its turn.
+    Souls(Vec<String>),
+}
+
+impl Reword {
+    pub fn covers(&self, name: &str) -> bool {
+        match self {
+            Reword::Off => false,
+            Reword::All => true,
+            Reword::Souls(v) => v.iter().any(|n| n == name),
+        }
+    }
 }
 
 /// Who writes the souls' memories, and with which model.
@@ -50,6 +72,7 @@ struct RawMemory {
 pub struct MemoryWriter {
     pub harness: crate::writer::Harness,
     pub model: String,
+    pub reword: Reword,
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +150,32 @@ impl DaemonConfig {
                     .and_then(|m| m.model.clone())
                     .filter(|m| !m.trim().is_empty())
                     .unwrap_or_else(|| harness.default_model().to_string());
-                Some(MemoryWriter { harness, model })
+                let reword = match raw.memory.as_ref().and_then(|m| m.reword.clone()) {
+                    None => Reword::Off,
+                    Some(serde_yaml::Value::Bool(b)) => {
+                        if b {
+                            Reword::All
+                        } else {
+                            Reword::Off
+                        }
+                    }
+                    Some(serde_yaml::Value::String(s)) if s == "on" || s == "all" => Reword::All,
+                    Some(serde_yaml::Value::String(s)) if s == "off" => Reword::Off,
+                    Some(serde_yaml::Value::Sequence(v)) => Reword::Souls(
+                        v.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect(),
+                    ),
+                    Some(other) => anyhow::bail!(
+                        "memory.reword in {} is on, off or a list of soul names, not {other:?}",
+                        path.display()
+                    ),
+                };
+                Some(MemoryWriter {
+                    harness,
+                    model,
+                    reword,
+                })
             }
         };
         let mut warnings = Vec::new();
@@ -197,6 +245,16 @@ mod tests {
             DaemonConfig::load_from(&p).unwrap().memory.unwrap().model,
             "gpt-x"
         );
+        std::fs::write(
+            &p,
+            "memory:\n  writer: claude-code\n  reword: [m4xx, h4nk]\n",
+        )
+        .unwrap();
+        let m = DaemonConfig::load_from(&p).unwrap().memory.unwrap();
+        assert!(m.reword.covers("h4nk") && !m.reword.covers("lUX"));
+        std::fs::write(&p, "memory:\n  writer: claude-code\n  reword: on\n").unwrap();
+        let m = DaemonConfig::load_from(&p).unwrap().memory.unwrap();
+        assert_eq!(m.reword, Reword::All);
         std::fs::write(&p, "memory:\n  writer: vim\n").unwrap();
         assert!(DaemonConfig::load_from(&p).is_err());
     }

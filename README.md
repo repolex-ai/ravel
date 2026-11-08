@@ -160,10 +160,25 @@ Every ten minutes, for each soul whose transcripts gained turns, raveld:
    going on is not noted halfway, and waits until the rest fills a stretch of
    about 24,000 characters, or until its oldest turn is six hours old;
 3. relives that stretch as the soul. It wakes as OptMem wakes, notes what the
-   soul would have noted, and does every merge that came due, with OptMem's own
-   prompt. The writer is given the soul's name and SOUL.md, because in OptMem
+   soul would have noted, and does every merge that came due, with OptMem's
+   prompt plus one paragraph of ravel's (see "Merges read as a story" below). The writer is given the soul's name and SOUL.md, because in OptMem
    the agent writes and merges its own memory;
 4. rebuilds any merge the checks refuse, with every merge above it.
+
+**Merges read as a story.** OptMem's merge prompt turned a year of a soul's
+work into a list of rules that named no project. ravel adds one paragraph,
+`STORY` in `src/memory_log.rs`, asking for what happened: the work, the
+projects the notes name, who did each thing, and what was left unrun or
+unverified. It was chosen over three rounds of blind audits against OptMem's
+own wording. Every merge records which wording wrote it. With `reword:` in
+the config, raveld rewrites merges left in an older wording, up to 40 per
+soul per pass and only after any new turns:
+
+```yaml
+memory:
+  writer: claude-code
+  reword: [h4nk, w0z]   # or on, or off (the default)
+```
 
 A first pass catches up the whole past, so a new soul's memory is built the
 same way. At most 60 model calls go to one soul per pass, so one long

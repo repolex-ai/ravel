@@ -13,6 +13,11 @@
 //!             every merge due over the notes in <out-dir>, cold: a side-by-side
 //!             test of the merge wording; extra.txt is added to OptMem's prompt.
 //!             <out-dir> must hold a copy of the notes, never the soul's own memory.
+//!   side      <soul-repo> <out-dir> <min-notes> [every-nth-small]
+//!             a judge's packet for a rebuild: each merge of at least <min-notes>
+//!             notes in <out-dir>, beside the soul's own merge of the same notes and
+//!             the lines it was built from; plus every nth smaller merge, with its
+//!             sources. Markdown on stdout.
 //!
 //! `from` and `to` are RFC 3339 prefixes compared as strings ("2026-06-01").
 //! Peers are the souls in ravel's config, as raveld sees them.
@@ -93,6 +98,7 @@ fn main() -> Result<()> {
                 cfg.memory = Some(ravel::daemon::config::MemoryWriter {
                     harness: h,
                     model: h.default_model().to_string(),
+                    reword: ravel::daemon::config::Reword::Off,
                 });
             }
             let id = ravel::daemon::registry::soul_for(&PathBuf::from(repo).canonicalize()?)?.id;
@@ -100,6 +106,72 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let m = rt.block_on(d.memory_pass(&id))?;
             println!("{}", serde_json::to_string_pretty(&m)?);
+        }
+        ["side", repo, out, min, rest @ ..] => {
+            // Blind when a key file is given: the two wordings appear as A and B,
+            // in an order set per merge, each with the lines it was built from.
+            use ravel::memory::{block_id, parse_block, RAW_MAX};
+            let min: usize = min.parse()?;
+            let nth: usize = rest.first().map(|n| n.parse()).transpose()?.unwrap_or(0);
+            let key_file = rest.get(1).map(PathBuf::from);
+            let trial = MemoryLog::at(PathBuf::from(out));
+            let own = MemoryLog::for_soul(&PathBuf::from(repo)).summaries()?;
+            let notes = trial.memories()?;
+            let sums = trial.summaries()?;
+            let mut blocks: Vec<(usize, usize)> = sums.keys().filter_map(|k| parse_block(k)).collect();
+            blocks.sort_by_key(|&(lo, hi)| (std::cmp::Reverse(hi - lo), lo));
+            let get = |m: &std::collections::HashMap<String, ravel::memory_log::Summary>, b| {
+                m.get(&block_id(b)).map(|s| s.text.clone()).unwrap_or_default()
+            };
+            let sources = |m: &std::collections::HashMap<String, ravel::memory_log::Summary>, b: (usize, usize)| {
+                let n = b.1 - b.0;
+                let mut o = String::new();
+                if n <= RAW_MAX {
+                    for (k, x) in notes.iter().enumerate().take(b.1).skip(b.0) {
+                        o += &format!("- note #{k} {} {}\n", x.date(), x.text);
+                    }
+                } else {
+                    let mid = b.0 + n / 2;
+                    o += &format!("- #{} {}\n", block_id((b.0, mid)), get(m, (b.0, mid)));
+                    o += &format!("- #{} {}\n", block_id((mid, b.1)), get(m, (mid, b.1)));
+                }
+                o
+            };
+            let mut key = String::new();
+            let mut small = 0usize;
+            for b in blocks {
+                let n = b.1 - b.0;
+                if n < min {
+                    small += 1;
+                    if nth == 0 || !small.is_multiple_of(nth) {
+                        continue;
+                    }
+                }
+                let id = block_id(b);
+                println!("## #{id} ({n} notes, {} to {})\n", notes[b.0].date(), notes[b.1 - 1].date());
+                let Some(key_file) = &key_file else {
+                    println!("**Trial:** {}\n", get(&sums, b));
+                    if let Some(o) = own.get(&id) {
+                        println!("**The soul's memory now:** {}\n", o.text);
+                    }
+                    println!("**Built from:**\n\n{}", sources(&sums, b));
+                    continue;
+                };
+                let _ = key_file;
+                use sha2::Digest;
+                let flip = sha2::Sha256::digest(id.as_bytes())[0] & 1 == 1;
+                let (a, a_name, bb, b_name) = if flip {
+                    (&own, "current", &sums, "trial")
+                } else {
+                    (&sums, "trial", &own, "current")
+                };
+                key += &format!("{id}\tA={a_name}\tB={b_name}\n");
+                println!("**A:** {}\n\nA was built from:\n\n{}", get(a, b), sources(a, b));
+                println!("**B:** {}\n\nB was built from:\n\n{}", get(bb, b), sources(bb, b));
+            }
+            if let Some(k) = key_file {
+                std::fs::write(k, key)?;
+            }
         }
         ["rebuild", repo, out, model, rest @ ..] => {
             let repo = PathBuf::from(repo);

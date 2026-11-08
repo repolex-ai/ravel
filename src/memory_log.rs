@@ -62,6 +62,10 @@ pub struct Summary {
     pub text: String,
     pub model: String,
     pub written: String,
+    /// Which merge wording wrote it ([`WORDING`]). Absent on merges written
+    /// before the wording was recorded: OptMem's own, with [`HAND_BACK`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wording: Option<String>,
 }
 
 pub struct MemoryLog {
@@ -217,10 +221,40 @@ pub fn nap_prompt(
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     Ok(format!(
-        "{}{HAND_BACK}\n",
+        "{}{HAND_BACK}\n\n{STORY}\n",
         memory::nap_prompt(b, &body, left)
     ))
 }
+
+/// The merge wording in use, recorded on every merge. A merge written in
+/// any other is rebuilt by raveld, a few a pass (`memory_relive::reword`).
+pub const WORDING: &str = "story-3";
+
+/// ravel's one change to what OptMem asks of a merge (goodlux, 2026-11-06:
+/// memories should read as a story, a broad past narrowing to the present,
+/// not a list of rules). OptMem's wording made merges of a year of work into
+/// commandments ("Verify; no invented fallbacks; confirm paths before rm
+/// -rf; …") naming no project.
+///
+/// story-1 ("…what that led to… A rule or a correction belongs only if it
+/// changed what happened next") named the projects, but Kira's audit of
+/// spaceGOAT's first 1,024 notes found it turned rules into events ("ask the
+/// model first" → "heater awaits model"), let the actor drop out level by level
+/// ("my rm -rf purge ran" → "clxbox purged"), and spliced unrelated notes into
+/// cause and effect. story-2 dropped "what that led to" and asked for the
+/// actor, the hedges and the rules to survive: against OptMem on the same 103
+/// merges (Kira, blind), 11 unsupported claims to 3, but 73 things dropped to
+/// 106. Its "keep 'unverified'" let the hedge outlive its noun and land on
+/// work that had been confirmed ("credit for the recovery unverified" →
+/// "rambleC recovered (unverified)"). story-3 says the hedge once, on the work
+/// it belongs to: 7 unsupported, 72 dropped (Kira, 2026-11-07). Three of its
+/// seven were "ravel" named in 2024 notes that said only "compressor.py":
+/// "Name the projects" sent the writer to the SOUL.md in its system prompt for
+/// a name, so it names only the projects the lines name (goodlux's go,
+/// 2026-11-07; shipped untested, checked on a sample of a real soul). Rules a
+/// soul must keep live in its own documents, not in a line built to lose
+/// detail.
+pub const STORY: &str = "Write it as what happened: what was worked on, what was discussed, and where it stood at the end. Name the projects the lines name. Keep who did each thing. Say once which work was unrun or unverified, attached to that work, never to a result someone reported working. Never turn a rule into something that happened.";
 
 /// What stands in for OptMem's last line, `Run: memo nap lo-hi "<your line>"`:
 /// how the writer hands the line back. Without it a writer read cold wrapped
@@ -509,6 +543,7 @@ mod tests {
             block: memory::block_id(b),
             text: text.into(),
             model: "t".into(),
+            wording: None,
             written: "x".into(),
         }
     }
