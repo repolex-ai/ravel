@@ -595,6 +595,21 @@ fn write_agy_manifest(repo: &Path, m: &std::collections::HashMap<String, String>
     write_tsv(&repo.join(AGY_MANIFEST), m)
 }
 
+/// Whether the machine-wide unattributed list differs from the one this
+/// process last printed. The list is the same for every soul, and the daemon
+/// syncs every soul every 30 seconds: printing it each time filled
+/// raveld.log with 1.6 GB of one warning (goodlux, 2026-11-10). It is said
+/// once, again whenever it changes, and `ravel status` always shows it.
+fn unattributed_changed(now: &[String]) -> bool {
+    static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_slice() == now {
+        return false;
+    }
+    *last = now.to_vec();
+    true
+}
+
 /// Mirror and ingest this soul's Gemini/Antigravity conversations.
 ///
 /// A clean no-op when the CLI is not installed or no conversation belongs to
@@ -604,7 +619,7 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     let mut st = AgyStats::default();
     let (convs, unattributed) = agy_conversations_for(repo)?;
     st.unattributed = unattributed;
-    if !st.unattributed.is_empty() {
+    if unattributed_changed(&st.unattributed) && !st.unattributed.is_empty() {
         eprintln!(
             "[raveld] {} agy conversation(s) on disk are attributed to NO workspace and are therefore NOT backed up: {}\n\
              [raveld]   history.jsonl does not name them (it predates them, or they logged no prompt through it).\n\
