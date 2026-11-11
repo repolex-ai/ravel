@@ -75,7 +75,8 @@ raveld stop
 
 `raveld` with no arguments runs in the foreground, for debugging. Day to day
 nobody types it: `ravel` starts it detached, logging to
-`~/.config/ravel/raveld.log`.
+`~/.config/ravel/raveld.log`. The log caps itself: past 100 MB, raveld
+keeps the newest 50 MB.
 
 ## Importing Claude desktop history
 
@@ -242,7 +243,7 @@ failure:
                                           plus memory-v1 for the memory index
 
 ~/.config/ravel/config.yml                daemon config: port, interval, souls, the human's name
-~/.config/ravel/raveld.log                log output from detached daemon
+~/.config/ravel/raveld.log                log output from detached daemon (capped at 100 MB)
 ```
 
 A soul's id is the first six characters of its repository's genesis commit —

@@ -111,6 +111,36 @@ pub fn log_path() -> PathBuf {
     config_dir().join("raveld.log")
 }
 
+/// The log's cap: past [`LOG_CAP`] bytes raveld keeps only its newest
+/// [`LOG_KEEP`], so a log nobody remembers exists cannot fill the disk
+/// (goodlux, 2026-11-10).
+pub const LOG_CAP: u64 = 100 * 1024 * 1024;
+pub const LOG_KEEP: u64 = 50 * 1024 * 1024;
+
+/// Trim the log at `path` to its newest `keep` bytes, starting on a whole
+/// line, once it is over `cap`. In place: a detached raveld writes it in
+/// append mode, so its next line lands at the new end. True when it trimmed.
+pub fn cap_log(path: &std::path::Path, cap: u64, keep: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if len <= cap {
+        return Ok(false);
+    }
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    f.seek(SeekFrom::Start(len - keep.min(len)))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    let start = tail.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+    f.set_len(0)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&tail[start..])?;
+    Ok(true)
+}
+
 pub fn expand_tilde(p: &str) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         if p == "~" {
@@ -202,6 +232,26 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_cap_keeps_the_newest_whole_lines_and_appends_after() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ravel-logcap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("raveld.log");
+        std::fs::write(&p, "line one\nline two\nline three\n").unwrap();
+        // Under the cap: untouched.
+        assert!(!cap_log(&p, 100, 10).unwrap());
+        // Over it: the newest 12 bytes, from the first whole line in them.
+        let mut held = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        assert!(cap_log(&p, 20, 12).unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "line three\n");
+        // The writer raveld already holds lands at the new end.
+        writeln!(held, "line four").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "line three\nline four\n");
+        assert!(!cap_log(&dir.join("absent.log"), 1, 1).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn missing_file_is_defaults_and_says_so() {

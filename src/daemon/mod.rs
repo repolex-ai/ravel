@@ -255,6 +255,8 @@ impl Daemon {
     }
 }
 
+static CAP_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The schedule: a pass over every soul, then wait `interval_secs`, forever.
 /// The first pass starts immediately so a fresh daemon catches up at once.
 pub async fn run_sync_loop(d: Arc<Daemon>) {
@@ -277,6 +279,21 @@ pub async fn run_sync_loop(d: Arc<Daemon>) {
                     ));
                 }
             }
+        }
+        let path = config::log_path();
+        match config::cap_log(&path, config::LOG_CAP, config::LOG_KEEP) {
+            Ok(true) => log(format!(
+                "raveld.log passed {} MB: kept the newest {} MB",
+                config::LOG_CAP >> 20,
+                config::LOG_KEEP >> 20
+            )),
+            Ok(false) => {}
+            // Said once, not every pass: a failing cap must not become the
+            // next thing that fills the log.
+            Err(e) if !CAP_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                log(format!("raveld.log: could not cap it — {e}"))
+            }
+            Err(_) => {}
         }
         tokio::time::sleep(interval).await;
     }
