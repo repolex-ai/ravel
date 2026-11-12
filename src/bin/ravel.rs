@@ -19,6 +19,10 @@
 //!   ravel memory recall <words>      one term across the whole history
 //!   ravel memory check [<soul>]      the memory checked end to end; exit 1 on any failure
 //!   ravel query  [<soul>] "<sparql>" rows, one per line
+//!   ravel hook   <harness>           the memory wake for a harness's session-start
+//!                                    hook, in that harness's format, for the soul
+//!                                    the hook runs in: claude-code, antigravity
+//!                                    (codex, gemini, hermes: planned, print nothing)
 //!
 //! `<soul>` is a six-character id (the start of the soul's genesis commit) or
 //! a path inside the soul repo; absent = the repo this command runs in.
@@ -39,7 +43,8 @@ fn usage() -> ! {
            ravel sync   [<soul> [<sessions-dir>]]\n  \
            ravel import [<soul>] <export-dir>\n  \
            ravel memory [<soul>] | memory open [<soul>] <id> | memory recall <words> | memory check [<soul>]\n  \
-           ravel query  [<soul>] \"<sparql>\"\n\n\
+           ravel query  [<soul>] \"<sparql>\"\n  \
+           ravel hook   <harness>\n\n\
          <soul> = six-character id or a path inside the soul repo; absent = here.\n\
          Config: {}",
         env!("CARGO_PKG_VERSION"),
@@ -61,6 +66,9 @@ fn main() -> Result<()> {
         // soul id (w3bl0rd, 2026-10-05).
         args if args.iter().any(|x| x.starts_with('-')) => usage(),
         _ => {}
+    }
+    if let ["hook", h] = a.as_slice() {
+        return hook(h);
     }
     let cfg = DaemonConfig::load()?;
     let client = ensure_running(&cfg)?;
@@ -217,17 +225,22 @@ fn short(ts: &str) -> String {
 /// Wake lines as OptMem prints them: `#i date text` and `#lo-hi text`.
 fn print_lines(lines: &[Value]) {
     for l in lines {
-        let label = l["label"].as_str().unwrap_or("");
-        let text = l["text"].as_str().unwrap_or("");
-        let date = l["date"].as_str().unwrap_or("");
-        if l["level"].as_u64().unwrap_or(0) == 0 {
-            println!("{label} {date} {text}");
-        } else {
-            println!(
-                "{label} {} {text}",
-                span(date, l["date_to"].as_str().unwrap_or(""))
-            );
-        }
+        println!("{}", line_text(l));
+    }
+}
+
+/// One memory line as the wake shows it.
+fn line_text(l: &Value) -> String {
+    let label = l["label"].as_str().unwrap_or("");
+    let text = l["text"].as_str().unwrap_or("");
+    let date = l["date"].as_str().unwrap_or("");
+    if l["level"].as_u64().unwrap_or(0) == 0 {
+        format!("{label} {date} {text}")
+    } else {
+        format!(
+            "{label} {} {text}",
+            span(date, l["date_to"].as_str().unwrap_or(""))
+        )
     }
 }
 
@@ -246,21 +259,91 @@ fn span(from: &str, to: &str) -> String {
 }
 
 fn memory(client: &Client, id: &str) -> Result<()> {
+    print!("{}", wake(client, id)?);
+    Ok(())
+}
+
+/// The memory wake as text: what `ravel memory` prints, and what a
+/// session-start hook hands the harness.
+fn wake(client: &Client, id: &str) -> Result<String> {
     let v = client.get(&format!("/souls/{id}/memory"))?;
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
     if lines.is_empty() {
-        println!("[ravel memory] {id}: no memories yet.");
-        return Ok(());
+        return Ok(format!("[ravel memory] {id}: no memories yet.\n"));
     }
-    println!(
-        "[ravel memory] {id}: {} notes, {} blocks — `ravel memory open <#i or lo-hi>` opens a line",
+    let mut out = format!(
+        "[ravel memory] {id}: {} notes, {} blocks — `ravel memory open <#i or lo-hi>` opens a line\n",
         v["memories"], v["summaries"]
     );
     // A merge reads like a statement of fact, but it is how things stood over
     // its dates (selkie, 2026-11-01: an April rule had since changed).
-    println!("Oldest first. Each line is how things stood over its dates; where two disagree, the later one is current.");
-    print_lines(&lines);
+    out.push_str("Oldest first. Each line is how things stood over its dates; where two disagree, the later one is current.\n");
+    for l in &lines {
+        out.push_str(&line_text(l));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// `ravel hook <harness>`: the wake, shaped for that harness's session-start
+/// hook, for the soul whose repo the hook runs in. The soul kit ships one
+/// line per harness that calls this, so what each harness needs lives here,
+/// in ravel, and a person without a soul repo can wire the same line into
+/// their own harness (goodlux, 2026-11-12).
+///
+/// A hook must never stop a session from starting: any failure is said on
+/// stderr, and stdout still carries what the harness accepts as "nothing".
+fn hook(harness: &str) -> Result<()> {
+    use ravel::writer::Harness;
+    let h = match Harness::parse(harness) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("ravel hook: {e}");
+            std::process::exit(2);
+        }
+    };
+    let text = || -> Result<String> {
+        let cfg = DaemonConfig::load()?;
+        let client = ensure_running(&cfg)?;
+        wake(&client, &resolve(&client, None)?)
+    };
+    match h {
+        // SessionStart: stdout is added to the session's context as is.
+        Harness::ClaudeCode => match text() {
+            Ok(t) => print!("{t}"),
+            Err(e) => eprintln!("ravel hook claude-code: no memory loaded — {e:#}"),
+        },
+        // SessionStart in .agents/hooks.json: stdout must be one JSON
+        // object, `{}` for nothing. A systemMessage step stays in the
+        // conversation's trajectory, so a resumed conversation keeps it.
+        Harness::Antigravity => {
+            let out = match text() {
+                Ok(t) => serde_json::json!({
+                    "injectSteps": [{"systemMessage": {"systemMessage": t}}]
+                }),
+                Err(e) => {
+                    eprintln!("ravel hook antigravity: no memory loaded — {e:#}");
+                    serde_json::json!({})
+                }
+            };
+            println!("{out}");
+        }
+        Harness::Codex | Harness::Gemini | Harness::Hermes => {
+            eprintln!("ravel hook {}: {}", h.name(), hook_plan(h));
+        }
+    }
     Ok(())
+}
+
+/// What a harness's memory hook still needs before `ravel hook` can serve it.
+fn hook_plan(h: ravel::writer::Harness) -> &'static str {
+    use ravel::writer::Harness;
+    match h {
+        Harness::ClaudeCode | Harness::Antigravity => "built",
+        Harness::Codex => "not built. Needs: Codex's session-start hook, and the form it takes extra context in. To check: whether Codex has hooks at all, or only AGENTS.md.",
+        Harness::Gemini => "not built. Needs: Gemini CLI's SessionStart hook in .gemini/settings.json, and its output form for added context.",
+        Harness::Hermes => "not built. Needs: Hermes Agent's hook or plugin point that runs at session start, and how it takes added context.",
+    }
 }
 
 fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {

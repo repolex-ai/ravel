@@ -222,6 +222,23 @@ failure:
 - the graph projection loads;
 - every cited turn is a Turn in the soul's store.
 
+### Loading the memory when a session starts
+
+**`ravel hook <harness>`** prints the wake for the soul the hook runs in,
+in the form that harness's session-start hook expects. It is one line in
+the harness's own settings, with or without a soul repo:
+
+| Harness | Where the line goes | The line |
+|---|---|---|
+| Claude Code | a `SessionStart` hook in `.claude/settings.json` | `ravel hook claude-code` |
+| Antigravity | a `SessionStart` hook in `.agents/hooks.json` | `ravel hook antigravity` |
+| Codex, Gemini CLI, Hermes | planned | prints what it still needs |
+
+A hook never stops a session from starting. If the folder is not a soul
+raveld serves, or raveld cannot be reached, it says why on stderr and
+prints what the harness reads as nothing. The soul kit ships these lines
+for every soul.
+
 ## What lives where
 
 ```
