@@ -106,6 +106,8 @@ pub fn conversation_events(c: &Conversation) -> Vec<Event> {
             thinking: message_thinking(m),
             model: None,
             model_setting: None,
+            actions: Vec::new(),
+            outcomes: Vec::new(),
         });
         prev = Some(m.uuid.clone());
     }

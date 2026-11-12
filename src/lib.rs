@@ -75,6 +75,147 @@ pub struct Event {
     /// made outside the conversation is not seen, so this is the setting, never
     /// a report of what ran.
     pub model_setting: Option<String>,
+    /// The tool calls this event made: what the speaker DID, as distinct from
+    /// what it said. Kept so a memory reader can see a check the soul ran,
+    /// not only its words about it (#27: Selkie's reruns were invisible, so
+    /// the writer recorded them as never run). Not projected to the graph.
+    pub actions: Vec<Action>,
+    /// The results this event carries back for earlier tool calls, by call id.
+    pub outcomes: Vec<Outcome>,
+}
+
+/// One tool call, as a reader needs it: what kind of thing was done, and to
+/// what. `id` pairs it with its [`Outcome`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub id: String,
+    pub kind: ActionKind,
+    /// The command, path, pattern or request: one line, clipped.
+    pub target: String,
+}
+
+/// What a tool call did, across harnesses' differing tool names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Ran,
+    Read,
+    Edited,
+    Searched,
+    Listed,
+    Subagent,
+    Fetched,
+    /// Anything else, under the tool's own name.
+    Other,
+}
+
+/// A tool call's result: its first line, how many lines followed, and
+/// whether the harness reported it failed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outcome {
+    pub id: String,
+    pub first: String,
+    pub lines: usize,
+    pub failed: bool,
+}
+
+/// One line, at most `n` characters, for a reader: newlines become spaces.
+pub fn one_line(s: &str, n: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= n {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(n).collect::<String>())
+    }
+}
+
+/// An [`Outcome`] from a tool's output text.
+pub fn outcome_of(id: &str, output: &str, failed: bool) -> Outcome {
+    let mut it = output.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = it.next().map(|l| one_line(l, 100)).unwrap_or_default();
+    Outcome {
+        id: id.to_string(),
+        first,
+        lines: it.count(),
+        failed,
+    }
+}
+
+/// What kind of thing a tool call did, from its name in either harness
+/// (Claude Code: `Bash`, `Read`, `Edit`…; Antigravity: `run_command`,
+/// `view_file`, `replace_file_content`…).
+pub fn action_kind(tool: &str) -> ActionKind {
+    let t = tool.to_lowercase();
+    let has = |w: &[&str]| w.iter().any(|x| t.contains(x));
+    if has(&["bash", "command", "shell", "exec"]) {
+        ActionKind::Ran
+    } else if t == "agent" || t == "task" || t.contains("subagent") {
+        ActionKind::Subagent
+    } else if has(&["edit", "write", "replace", "notebook"]) {
+        ActionKind::Edited
+    } else if has(&["read", "view"]) {
+        ActionKind::Read
+    } else if has(&["grep", "search"]) {
+        ActionKind::Searched
+    } else if has(&["glob", "list"]) {
+        ActionKind::Listed
+    } else if has(&["fetch", "url"]) {
+        ActionKind::Fetched
+    } else {
+        ActionKind::Other
+    }
+}
+
+/// The argument that says what a tool call did, from its JSON input: the
+/// command, the path, the pattern, the request. Harness-neutral by key name.
+pub fn action_target(input: &serde_json::Value) -> String {
+    // A shell command: the harness's own one-line description of it (Claude
+    // Code's `description`) first, then the command itself, without the
+    // `cd <dir> &&` that opens most of them and would fill the line.
+    let cmd = ["command", "CommandLine"]
+        .iter()
+        .find_map(|k| input.get(k).and_then(serde_json::Value::as_str));
+    if let Some(c) = cmd {
+        let c = strip_cd(c);
+        return match input.get("description").and_then(serde_json::Value::as_str) {
+            Some(d) if !d.trim().is_empty() => {
+                format!("{} ({})", one_line(d, 80), one_line(c, 100))
+            }
+            _ => one_line(c, 160),
+        };
+    }
+    const KEYS: &[&str] = &[
+        "command", "CommandLine", "file_path", "AbsolutePath", "TargetFile", "path",
+        "DirectoryPath", "pattern", "Query", "query", "url", "Url", "description",
+        "prompt", "skill",
+    ];
+    for k in KEYS {
+        if let Some(v) = input.get(k).and_then(serde_json::Value::as_str) {
+            if !v.trim().is_empty() {
+                return one_line(v, 160);
+            }
+        }
+    }
+    input
+        .as_object()
+        .and_then(|o| {
+            o.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "toolAction" | "toolSummary"))
+                .find_map(|(_, v)| v.as_str().filter(|s| !s.trim().is_empty()))
+        })
+        .map(|s| one_line(s, 160))
+        .unwrap_or_default()
+}
+
+/// A command without its leading `cd <dir> &&` or `cd <dir>;` steps.
+fn strip_cd(c: &str) -> &str {
+    let mut c = c.trim_start();
+    while let Some(rest) = c.strip_prefix("cd ") {
+        match rest.find(['&', ';', '\n']) {
+            Some(i) => c = rest[i..].trim_start_matches(['&', ';', '\n', ' ']),
+            None => break,
+        }
+    }
+    c
 }
 
 /// Where a slice of an event's concatenated `text` came from.

@@ -219,7 +219,13 @@ named in the config and refuse with what each one still needs
 - Only the soul's own life: what the soul said, what its human said
   (labelled by name, from `human:` in config.yml), and messages from other
   agents (labelled by sender).
-- Tool output, thinking, and compaction summaries are left out.
+- What the soul did is shown beside what it said: each tool call as one
+  line, with how it came out, for example
+  `[ran: Count banned words (rg -c face */test.json) → 0 matches]`. A read
+  or an edit says nothing of the file unless it failed. Never the output
+  itself (#27: without these lines, a check the soul ran looked like one it
+  never did).
+- Thinking and compaction summaries are left out.
 - Claude Code subagent and workflow transcripts are left out, and so are
   Antigravity subagents. In OptMem, a subagent never writes memory.
 - Harness records that arrive as user input are left out: notifications,

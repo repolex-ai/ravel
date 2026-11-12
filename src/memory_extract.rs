@@ -1,6 +1,7 @@
 //! What the memory reader reads: a soul's mirrors through the same adapters
-//! the graph uses (Claude Code, Antigravity, claude.ai), AUTHORED prose only
-//! (no tool output, no thinking), each turn labelled with who spoke it.
+//! the graph uses (Claude Code, Antigravity, claude.ai): AUTHORED prose, plus
+//! each tool call as one line with how it came out (#27), never the output
+//! itself and never thinking; each turn labelled with who spoke it.
 //!
 //! The model that writes the memory is in `writer`.
 
@@ -140,8 +141,44 @@ fn agy_request(t: &str) -> String {
     }
 }
 
+/// One tool call as the writer reads it, with how it came out (#27):
+/// `[ran: cargo test → test result: ok. 96 passed (+4 lines)]`. A read or an
+/// edit says nothing of its output unless it failed: the file's text is not
+/// news. One line, never the output itself.
+fn action_line(a: &crate::Action, o: Option<&crate::Outcome>) -> String {
+    use crate::ActionKind::*;
+    let verb = match a.kind {
+        Ran => "ran",
+        Read => "read",
+        Edited => "edited",
+        Searched => "searched",
+        Listed => "listed",
+        Subagent => "asked a subagent",
+        Fetched => "fetched",
+        Other => "used",
+    };
+    let result = match o {
+        Some(o) if o.failed => format!(" → failed: {}", o.first),
+        // Its answer arrives later, as a message; this is only the receipt.
+        Some(o) if a.kind == Subagent && o.first.starts_with("Async agent launched") => {
+            " → started in the background".into()
+        }
+        Some(_) if matches!(a.kind, Read | Edited | Listed) => String::new(),
+        Some(o) if o.first.is_empty() => " → no output".into(),
+        Some(o) if o.lines > 0 => format!(" → {} (+{} lines)", o.first, o.lines),
+        Some(o) => format!(" → {}", o.first),
+        None => String::new(),
+    };
+    format!("[{verb}: {}{result}]", a.target)
+}
+
 fn to_turns(events: &[crate::Event], source: &str) -> Vec<ProseTurn> {
-    events
+    let results: HashMap<&str, &crate::Outcome> = events
+        .iter()
+        .flat_map(|e| e.outcomes.iter())
+        .map(|o| (o.id.as_str(), o))
+        .collect();
+    let turns: Vec<ProseTurn> = events
         .iter()
         .filter_map(|e| {
             // One vocabulary for both harnesses. Antigravity says
@@ -166,6 +203,20 @@ fn to_turns(events: &[crate::Event], source: &str) -> Vec<ProseTurn> {
                     human_words(&t)
                 };
             }
+            // What the soul did, beside what it said: a check it ran is part
+            // of its life, and without this line the writer can only see the
+            // claim (#27).
+            if role == "assistant" && !e.actions.is_empty() {
+                let did: Vec<String> = e
+                    .actions
+                    .iter()
+                    .map(|a| action_line(a, results.get(a.id.as_str()).copied()))
+                    .collect();
+                if !t.trim().is_empty() {
+                    t.push('\n');
+                }
+                t.push_str(&did.join("\n"));
+            }
             Some(ProseTurn {
                 id: e.event_id.clone(),
                 ts: e.timestamp.clone()?,
@@ -174,7 +225,45 @@ fn to_turns(events: &[crate::Event], source: &str) -> Vec<ProseTurn> {
                 peer: None,
             })
         })
-        .collect()
+        .collect();
+    fold_actions(turns)
+}
+
+/// Claude Code writes each tool call as its own record, so a soul that says
+/// one thing and then runs ten commands makes eleven turns. Tool-call lines
+/// never make a turn of their own: they join the soul's turn of words just
+/// before them, or, when the human spoke last, the soul's next turn of words
+/// (its reply, after the work). With neither, they are dropped. So every turn
+/// keeps an id the memory has already seen: reading commands must never make
+/// a soul's past look unread and get relived (#27: a first build made 4,142 of
+/// lUX's old turns new).
+fn fold_actions(turns: Vec<ProseTurn>) -> Vec<ProseTurn> {
+    let mut out: Vec<ProseTurn> = Vec::new();
+    let mut waiting: Vec<String> = Vec::new();
+    for mut t in turns {
+        let only_actions = t.role == "assistant"
+            && !t.text.trim().is_empty()
+            && t.text.lines().all(|l| l.starts_with('[') && l.ends_with(']'));
+        if only_actions {
+            let last = out.iter_mut().rev().find(|x| !x.text.trim().is_empty());
+            match last {
+                Some(l) if l.role == "assistant" && waiting.is_empty() => {
+                    l.text.push('\n');
+                    l.text.push_str(&t.text);
+                }
+                _ => waiting.push(t.text),
+            }
+            continue;
+        }
+        if !t.text.trim().is_empty() {
+            if t.role == "assistant" && !waiting.is_empty() {
+                t.text = format!("{}\n{}", waiting.join("\n"), t.text);
+            }
+            waiting.clear();
+        }
+        out.push(t);
+    }
+    out
 }
 
 /// Every conversation in a soul's mirrors.
@@ -479,6 +568,87 @@ pub(crate) fn summary_schema() -> Value {
 mod tests {
     use super::*;
 
+    /// #27: a check the soul ran reaches the writer, as one line beside its
+    /// words, with how it came out; a read says nothing of the file unless
+    /// it failed; command-only records join the soul's turn.
+    #[test]
+    fn what_the_soul_ran_reaches_the_writer_in_one_line_each() {
+        let jsonl = [
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-11-10T22:00:00Z","message":{"role":"user","content":"are the prompts clean?"}}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-11-10T22:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Checking myself."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cd /x/films && rg -c 'face' */test.json","description":"Count banned words"}}]}}"#,
+            r#"{"type":"user","uuid":"u2","timestamp":"2026-11-10T22:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"0 matches\n"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","timestamp":"2026-11-10T22:00:03Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/x/plan.md"}}]}}"#,
+            r#"{"type":"user","uuid":"u3","timestamp":"2026-11-10T22:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"the whole plan, which is not news"}]}}"#,
+            r#"{"type":"assistant","uuid":"a3","timestamp":"2026-11-10T22:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Edit","input":{"file_path":"/x/b.rs"}}]}}"#,
+            r#"{"type":"user","uuid":"u4","timestamp":"2026-11-10T22:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","is_error":true,"content":"old_string not found"}]}}"#,
+            r#"{"type":"assistant","uuid":"a4","timestamp":"2026-11-10T22:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"Clean."}]}}"#,
+        ]
+        .join("\n");
+        let ev = crate::adapter::parse_transcript(&jsonl).unwrap();
+        let t: Vec<(String, String)> = to_turns(&ev, "claude-code")
+            .into_iter()
+            .filter(|t| !t.text.trim().is_empty())
+            .map(|t| (t.role, t.text))
+            .collect();
+        assert_eq!(
+            t,
+            vec![
+                ("user".into(), "are the prompts clean?".into()),
+                (
+                    "assistant".into(),
+                    "Checking myself.\n[ran: Count banned words (rg -c 'face' */test.json) → 0 matches]\n[read: /x/plan.md]\n[edited: /x/b.rs → failed: old_string not found]".into()
+                ),
+                ("assistant".into(), "Clean.".into()),
+            ]
+        );
+    }
+
+    /// Commands never make a turn of their own: ones the soul runs before it
+    /// says anything join its reply, so no turn id is new. A new id is a turn
+    /// the memory has never read, and raveld would relive the past for it.
+    #[test]
+    fn commands_before_the_reply_join_it_and_no_turn_id_is_new() {
+        let jsonl = [
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-11-10T22:00:00Z","message":{"role":"user","content":"run the tests"}}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-11-10T22:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","uuid":"u2","timestamp":"2026-11-10T22:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"test result: ok. 98 passed\nmore"}]}}"#,
+            r#"{"type":"assistant","uuid":"a2","timestamp":"2026-11-10T22:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"All pass."}]}}"#,
+            r#"{"type":"user","uuid":"u3","timestamp":"2026-11-10T22:00:04Z","message":{"role":"user","content":"and lint?"}}"#,
+            r#"{"type":"assistant","uuid":"a3","timestamp":"2026-11-10T22:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cargo clippy"}}]}}"#,
+        ]
+        .join("\n");
+        let ev = crate::adapter::parse_transcript(&jsonl).unwrap();
+        let t: Vec<(String, String)> = to_turns(&ev, "claude-code")
+            .into_iter()
+            .filter(|t| !t.text.trim().is_empty())
+            .map(|t| (t.id, t.text))
+            .collect();
+        assert_eq!(
+            t,
+            vec![
+                ("u1".into(), "run the tests".into()),
+                ("a2".into(), "[ran: cargo test → test result: ok. 98 passed (+1 lines)]\nAll pass.".into()),
+                ("u3".into(), "and lint?".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_antigravity_command_and_its_output_pair_in_order() {
+        let rows = [
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-10T22:00:01Z","content":"Checking.","tool_calls":[{"name":"run_command","args":{"CommandLine":"rg -c face test.json","toolSummary":"count"}}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-11-10T22:00:02Z","content":"Created At: 2026-11-10T22:00:02Z\nCompleted At: 2026-11-10T22:00:02Z\n\n\t\tThe command completed successfully.\n\t\tOutput:\n\t\t0\n"}"#,
+        ]
+        .join("\n");
+        let p = crate::agy::parse_transcript(&rows, "c1").unwrap();
+        let t: Vec<String> = to_turns(&p.events, "agy")
+            .into_iter()
+            .filter(|t| !t.text.trim().is_empty())
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(t, vec!["Checking.\n[ran: rg -c face test.json → 0]".to_string()]);
+    }
+
     #[test]
     fn a_long_turn_is_clipped_on_a_character_boundary() {
         let s = "é".repeat(5000);
@@ -584,6 +754,8 @@ mod tests {
             thinking: None,
             model: None,
             model_setting: None,
+            actions: Vec::new(),
+            outcomes: Vec::new(),
         };
         let t = to_turns(&[e], "claude-code");
         assert_eq!(t.len(), 1, "still marked read");
@@ -638,6 +810,8 @@ mod reader_tests {
             thinking: None,
             model: None,
             model_setting: None,
+            actions: Vec::new(),
+            outcomes: Vec::new(),
         };
         let t = to_turns(
             &[

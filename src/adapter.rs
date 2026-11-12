@@ -53,6 +53,8 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
             thinking: extract_thinking(o.get("message")),
             model: reported_model(o.get("message")),
             model_setting: None,
+            actions: extract_actions(o.get("message")),
+            outcomes: extract_outcomes(o.get("message")),
         });
     }
     Ok(events)
@@ -127,6 +129,53 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
     } else {
         (Some(out), spans)
     }
+}
+
+/// The `tool_use` blocks of a `message`: what the speaker did (#27). The
+/// input is machine JSON; only the argument that says what was done is kept.
+fn extract_actions(message: Option<&Value>) -> Vec<crate::Action> {
+    let Some(blocks) = message.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| {
+            let name = b.get("name").and_then(Value::as_str)?;
+            let input = b.get("input").cloned().unwrap_or(Value::Null);
+            Some(crate::Action {
+                id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                kind: crate::action_kind(name),
+                target: match crate::action_kind(name) {
+                    crate::ActionKind::Other => {
+                        let t = crate::action_target(&input);
+                        if t.is_empty() { name.to_string() } else { format!("{name} {t}") }
+                    }
+                    _ => crate::action_target(&input),
+                },
+            })
+        })
+        .collect()
+}
+
+/// The `tool_result` blocks of a `message`: each call's result, by its id.
+fn extract_outcomes(message: Option<&Value>) -> Vec<crate::Outcome> {
+    let Some(blocks) = message.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| {
+            let id = b.get("tool_use_id").and_then(Value::as_str)?;
+            let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            Some(crate::outcome_of(
+                id,
+                &extract_tool_result_text(b).unwrap_or_default(),
+                failed,
+            ))
+        })
+        .collect()
 }
 
 /// The model a reply reports it ran on: `message.model`, as the API wrote it.

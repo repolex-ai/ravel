@@ -147,6 +147,8 @@ mod tests {
             thinking: None,
             model: Some("claude-opus-5-5".into()),
             model_setting: Some("Gemini 4 Argon (Medium)".into()),
+            actions: Vec::new(),
+            outcomes: Vec::new(),
         };
         let nt = project_nt(&[e], "urn:test:").unwrap();
         let mut terms: Vec<String> = nt

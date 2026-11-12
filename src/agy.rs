@@ -150,9 +150,45 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
 
     let mut prev_idx: Option<u64> = None;
     let mut setting: Option<String> = None;
+    // Tool calls a PLANNER_RESPONSE made and no tool step has answered yet,
+    // in order: the steps that follow answer them in the same order (#27).
+    let mut pending: std::collections::VecDeque<String> = Default::default();
     for (idx, o) in &rows {
         let step_type = o.get("type").and_then(Value::as_str).unwrap_or("");
         let event_id = turn_id(conversation_id, *idx);
+        let mut actions = Vec::new();
+        let mut outcomes = Vec::new();
+        if let Some(calls) = o.get("tool_calls").and_then(Value::as_array) {
+            pending.clear();
+            for (k, c) in calls.iter().enumerate() {
+                let Some(name) = c.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let args = c.get("args").cloned().unwrap_or(Value::Null);
+                let id = format!("{event_id}:{k}");
+                let kind = crate::action_kind(name);
+                let target = crate::action_target(&args);
+                actions.push(crate::Action {
+                    id: id.clone(),
+                    kind,
+                    target: if kind == crate::ActionKind::Other {
+                        format!("{name} {target}").trim().to_string()
+                    } else {
+                        target
+                    },
+                });
+                pending.push_back(id);
+            }
+        } else if TOOL_OUTPUT_TYPES.contains(&step_type) || step_type == "READ_URL_CONTENT" {
+            if let Some(id) = pending.pop_front() {
+                let content = o.get("content").and_then(Value::as_str).unwrap_or("");
+                outcomes.push(crate::outcome_of(
+                    &id,
+                    agy_output(content),
+                    step_type == "ERROR_MESSAGE" || o.get("error").is_some_and(|e| !e.is_null()),
+                ));
+            }
+        }
 
         // Spine by adjacency only. A hole ends the chain; the next step starts
         // a new root rather than inheriting a parent it never had.
@@ -217,6 +253,8 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
                 .map(str::to_string),
             model: None,
             model_setting: setting.clone(),
+            actions,
+            outcomes,
         });
     }
 
@@ -318,6 +356,20 @@ pub fn derive_tool_calls(jsonl: &str) -> Result<Vec<ToolCall>> {
         }
     }
     Ok(calls)
+}
+
+
+/// A tool step's output without the harness's preamble: everything after
+/// `Output:` when the step says so, else after the `Created At / Completed
+/// At` lines.
+fn agy_output(content: &str) -> &str {
+    if let Some(i) = content.find("Output:") {
+        return &content[i + "Output:".len()..];
+    }
+    content
+        .split_once("\n\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or(content)
 }
 
 #[cfg(test)]

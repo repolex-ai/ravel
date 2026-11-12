@@ -364,6 +364,8 @@ mod tests {
             thinking: None,
             model: None,
             model_setting: None,
+            actions: Vec::new(),
+            outcomes: Vec::new(),
         }
     }
 
