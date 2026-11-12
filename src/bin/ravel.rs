@@ -75,6 +75,11 @@ USAGE:
   ravel query [<soul>] \"<sparql>\"
       Ask the transcript graph anything, in SPARQL. One row per line.
 
+  ravel query help
+      What can be queried and where it is stored: every class and property,
+      the graph layout a query must name, and three queries that work as
+      written. About 4,000 characters. Read it before a first query.
+
 <soul> = which soul: its six-character id (from `ravel souls`), or a path
 inside its folder. Leave it off for the soul whose folder you are in.
 
@@ -118,6 +123,17 @@ fn main() -> Result<()> {
         // ravel has no flags; `ravel optmem --help` must not be read as a
         // soul id (w3bl0rd, 2026-10-05).
         args if args.iter().any(|x| x.starts_with('-')) => usage(),
+        _ => {}
+    }
+    match a.as_slice() {
+        ["query"] => {
+            println!("ravel query [<soul>] \"<sparql>\": ask the transcript graph anything, in SPARQL.\n`ravel query help` shows what can be queried, where it is stored, and three queries that work as written.");
+            return Ok(());
+        }
+        ["query", "help"] => {
+            print!("{}", query_help()?);
+            return Ok(());
+        }
         _ => {}
     }
     let cfg = DaemonConfig::load()?;
@@ -742,6 +758,137 @@ fn query(client: &Client, id: &str, q: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ravel query help`: what a query can ask, read from the ontology built
+/// into this binary, so it can never drift from what ravel declares. The
+/// layout and the examples are what the ontology cannot say, and what a first
+/// query trips on: without `GRAPH`, nothing matches (goodlux, 2026-11-12).
+fn query_help() -> Result<String> {
+    use oxigraph::io::{RdfFormat, RdfParser};
+    use oxigraph::model::{Term, TermRef};
+    use std::collections::BTreeMap;
+    const TTL: &str = include_str!("../../ontology/ravel/ravel.ttl");
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
+    const DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
+    const RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
+    let ns = ravel::RAVEL_NS;
+    #[derive(Default)]
+    struct Term_ {
+        kind: String,
+        comment: String,
+        domain: String,
+        range: String,
+    }
+    let mut terms: BTreeMap<String, Term_> = BTreeMap::new();
+    let local = |t: &Term| -> String {
+        match t.as_ref() {
+            TermRef::NamedNode(n) => {
+                let s = n.as_str();
+                s.rsplit(['/', '#']).next().unwrap_or(s).to_string()
+            }
+            TermRef::Literal(l) => l.value().to_string(),
+            _ => String::new(),
+        }
+    };
+    for q in RdfParser::from_format(RdfFormat::Turtle).for_slice(TTL.as_bytes()) {
+        let q = q.context("ravel.ttl does not parse")?;
+        let oxigraph::model::NamedOrBlankNode::NamedNode(subj) = &q.subject else {
+            continue;
+        };
+        let Some(name) = subj.as_str().strip_prefix(ns) else {
+            continue;
+        };
+        let e = terms.entry(name.to_string()).or_default();
+        match q.predicate.as_str() {
+            RDF_TYPE => e.kind = local(&q.object),
+            COMMENT => e.comment = local(&q.object),
+            DOMAIN => e.domain = local(&q.object),
+            RANGE => e.range = local(&q.object),
+            _ => {}
+        }
+    }
+    // A comment's first sentence, which is its claim; the rest is detail.
+    // "e.g." and "i.e." are not the end of a sentence.
+    let first = |c: &str| -> String {
+        let mut from = 0;
+        while let Some(i) = c[from..].find(". ").map(|i| i + from) {
+            if !(c[..i].ends_with("e.g") || c[..i].ends_with("i.e")) {
+                return c[..=i].trim().to_string();
+            }
+            from = i + 2;
+        }
+        c.trim().to_string()
+    };
+    let mut out = String::from(
+        "ravel query help: what the transcript graph holds, and how to ask it.\n\n\
+         VOCABULARY (from ravel's ontology; prefix ravel: <https://repolex.ai/ontology/ravel/>)\n",
+    );
+    let classes: Vec<&String> = terms
+        .iter()
+        .filter(|(_, t)| t.kind == "Class")
+        .map(|(n, _)| n)
+        .collect();
+    let mut groups: Vec<(String, String)> = classes
+        .iter()
+        .map(|c| ((*c).clone(), format!("ravel:{c}: {}", first(&terms[*c].comment))))
+        .collect();
+    groups.push((
+        String::new(),
+        "Reader annotations: what a reader found in a turn, as W3C annotations (oa:, prov:)".into(),
+    ));
+    for (class, heading) in &groups {
+        out += &format!("\n  {heading}\n");
+        for (n, t) in &terms {
+            if !t.kind.ends_with("Property") || t.domain != *class {
+                continue;
+            }
+            if class.is_empty() && classes.contains(&&t.domain) {
+                continue;
+            }
+            out += &format!("    ravel:{n} ({}): {}\n", t.range, first(&t.comment));
+        }
+    }
+    out += r#"
+WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
+  Nothing is in the default graph: every pattern goes inside GRAPH, or the
+  query finds nothing.
+  - Each transcript is its own graph, so a query over every conversation
+    says GRAPH ?g { ... }.
+  - optmem is the graph <https://repolex.ai/ravel/NamedGraph/memory-v1>. A
+    note (memoryLevel 0) links to each turn it was written from, and a merge
+    to its two halves, with <https://repolex.ai/ontology/git-lex/relatedToId>.
+  - Instances are named under https://repolex.ai/ravel/<Class>/<id>, for
+    example <https://repolex.ai/ravel/Turn/<event id>>.
+
+THREE QUERIES THAT WORK AS WRITTEN
+  Which models answered this soul, and how often:
+    PREFIX ravel: <https://repolex.ai/ontology/ravel/>
+    SELECT ?model (COUNT(?t) AS ?turns)
+    WHERE { GRAPH ?g { ?t a ravel:Turn ; ravel:model ?model } }
+    GROUP BY ?model ORDER BY DESC(?turns)
+  (Antigravity turns carry ravel:modelSetting instead of ravel:model.)
+
+  One day's turns, in order:
+    PREFIX ravel: <https://repolex.ai/ontology/ravel/>
+    SELECT ?ts ?role (SUBSTR(?text, 1, 80) AS ?start)
+    WHERE { GRAPH ?g { ?t a ravel:Turn ; ravel:timestamp ?ts ;
+                         ravel:role ?role ; ravel:text ?text .
+                       FILTER(STRSTARTS(STR(?ts), "2026-11-11")) } }
+    ORDER BY ?ts LIMIT 50
+
+  An optmem note, with the turns it was written from (note #12):
+    PREFIX ravel: <https://repolex.ai/ontology/ravel/>
+    PREFIX lex: <https://repolex.ai/ontology/git-lex/>
+    SELECT ?note ?ts (SUBSTR(?said, 1, 80) AS ?start) WHERE {
+      GRAPH <https://repolex.ai/ravel/NamedGraph/memory-v1> {
+        ?m ravel:memoryLevel 0 ; ravel:logStart 12 ;
+           ravel:memoryText ?note ; lex:relatedToId ?t }
+      GRAPH ?g { ?t ravel:timestamp ?ts ; ravel:text ?said } }
+    ORDER BY ?ts
+"#;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -752,5 +899,22 @@ mod tests {
             "2025-12-30..2026-01-02"
         );
         assert_eq!(super::span("2026-04-03", "2026-04-03"), "2026-04-03");
+    }
+
+    #[test]
+    fn query_help_names_every_declared_property_with_its_description() {
+        let h = super::query_help().unwrap();
+        let ttl = include_str!("../../ontology/ravel/ravel.ttl");
+        for line in ttl.lines() {
+            let Some(rest) = line.strip_prefix("ravel:") else {
+                continue;
+            };
+            if line.contains("Property ;") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(h.contains(&format!("ravel:{name} (")), "{name} missing");
+            }
+        }
+        assert!(!h.contains("): \n"), "a property without a description");
+        assert!(h.contains("GRAPH ?g"));
     }
 }
