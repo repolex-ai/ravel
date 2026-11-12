@@ -7,8 +7,10 @@ agent's own repository, and projects the copy into an RDF 1.2 graph beside it.
 The bytes are canonical; the graph is a projection of them and can always be
 rebuilt.
 
-On top of the transcripts sits the agent's memory: [OptMem](https://github.com/VictorTaelin/OptMem)'s
-algorithm, exactly, kept as a graph. One-line notes of what the agent learned,
+On top of the transcripts sits the agent's autobiography: the story it wrote
+for itself. Its first section is optmem, ravel's adaptation of
+[OptMem](https://github.com/VictorTaelin/OptMem), the memory architecture by
+Victor Taelin, kept as a graph. One-line notes of what the agent learned,
 in the order it learned them, merged pairwise up OptMem's binary tree, so the
 agent wakes with its whole history in at most 96 lines and can open any line
 down to the conversation turns it rests on.
@@ -99,10 +101,15 @@ When you download an updated export later, ravel ingests the conversations that
 are new or have grown and skips the rest (the count in `(N already current)`). An
 older export imported after a newer one never rolls a conversation back.
 
-## The memory
+## The autobiography, and optmem
 
-A soul's memory is [OptMem](https://github.com/VictorTaelin/OptMem), exactly,
-as a graph. The full guide is [docs/2026_10_13_MEMORY.md](docs/2026_10_13_MEMORY.md).
+`ravel autobiography` is the story a soul wrote for itself, read at wake. It
+has one section per memory architecture ravel runs. Today that is optmem
+alone; other architectures, or a statistics section, can follow.
+
+optmem is ravel's adaptation of [OptMem](https://github.com/VictorTaelin/OptMem),
+the memory architecture by Victor Taelin, kept as a graph. It follows OptMem as
+closely as ravel can, but it is an adaptation, not OptMem itself. The full guide is [docs/2026_10_13_MEMORY.md](docs/2026_10_13_MEMORY.md).
 
 - **Notes.** One line each, at most 280 bytes. The soul notes something
   whenever it learns something new, or something worth keeping happens. That
@@ -123,13 +130,19 @@ as a graph. The full guide is [docs/2026_10_13_MEMORY.md](docs/2026_10_13_MEMORY
   all with `git-lex:relatedToId`.
 
 ```sh
-ravel memory                 # wake: the whole memory in at most 96 lines
-ravel memory open 16-31      # a merged block, opened into its two halves
-ravel memory open '#12'      # a note, with the turns it rests on
+ravel autobiography          # the whole story, read at wake: optmem's index today
+ravel optmem                 # what optmem is, where this soul's stands; short
+ravel optmem wake            # optmem's index alone, to get your bearings again
+ravel optmem open 16-31      # a merged block, opened into its two halves
+ravel optmem open '#12'      # a note, with the turns it rests on
+ravel optmem recall kohya    # where a word appears across the soul's life
 ```
 
 ```
-[ravel memory] d5af17: 42 notes, 39 blocks — `ravel memory open <#i or lo-hi>` opens a line
+# 4RX (d5af17): autobiography
+
+## optmem: ravel's adaptation of OptMem, the memory architecture by Victor Taelin (https://github.com/VictorTaelin/OptMem)
+42 notes, 39 merges. Open a line by its label: `ravel optmem open <label>`.
 #0-31 Kira: parser; me: forx+storage. IRI repolex.ai/r/{org}/{repo}/{phase}/{sha}. Repolex core never public-runner; …
 #32-39 …
 #40 2026-09-07 actix-web -> bytes 1,138 call edges, actix-web -> http 426, rlex -> actix-web 16, …
@@ -212,7 +225,7 @@ named in the config and refuse with what each one still needs
   sender's side: the sender's own transcript holds the `herdr agent prompt`
   that sent it. The senders are the other souls in `config.yml`.
 
-**`ravel memory check`** tests a soul's memory end to end, and exits 1 on any
+**`ravel optmem check`** tests a soul's optmem end to end, and exits 1 on any
 failure:
 
 - every line passes OptMem's limits;
@@ -221,23 +234,6 @@ failure:
 - the wake is OptMem's cover;
 - the graph projection loads;
 - every cited turn is a Turn in the soul's store.
-
-### Loading the memory when a session starts
-
-**`ravel hook <harness>`** prints the wake for the soul the hook runs in,
-in the form that harness's session-start hook expects. It is one line in
-the harness's own settings, with or without a soul repo:
-
-| Harness | Where the line goes | The line |
-|---|---|---|
-| Claude Code | a `SessionStart` hook in `.claude/settings.json` | `ravel hook claude-code` |
-| Antigravity | a `SessionStart` hook in `.agents/hooks.json` | `ravel hook antigravity` |
-| Codex, Gemini CLI, Hermes | planned | prints what it still needs |
-
-A hook never stops a session from starting. If the folder is not a soul
-raveld serves, or raveld cannot be reached, it says why on stderr and
-prints what the harness reads as nothing. The soul kit ships these lines
-for every soul.
 
 ## What lives where
 

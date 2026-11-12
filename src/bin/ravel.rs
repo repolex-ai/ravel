@@ -1,57 +1,101 @@
 //! ravel — the command line. A thin client of raveld; it never opens a store.
 //! When raveld is not running, any command here starts it first
-//! (goodlux, 2026-09-22).
-//!
-//!   ravel                            what raveld is doing, and every soul it serves
-//!   ravel status [<soul>]            one soul: its health check (exit 1 = attention),
-//!                                    its store's counts, and its memory
-//!   ravel souls                      the souls this machine's raveld serves
-//!   ravel sync   [<soul> [<sessions-dir>]]  a pass now (raveld does this on its own anyway);
-//!                                    <sessions-dir> reads another directory's session files
-//!                                    into this soul — how a sibling slug's history comes home
-//!   ravel import [<soul>] <export-dir>  copy a claude.ai data export into the soul
-//!                                    and ingest it; safe to repeat, and a newer
-//!                                    export later adds to it
-//!   ravel memory [<soul>]            OptMem's wake: the whole memory in at most 96
-//!                                    lines, recent notes word for word, older ones merged
-//!   ravel memory open [<soul>] <id>  one line opened, as OptMem's zoom: a block's two
-//!                                    halves (`16-31`), or a note's source turns (`#12`)
-//!   ravel memory recall <words>      one term across the whole history
-//!   ravel memory check [<soul>]      the memory checked end to end; exit 1 on any failure
-//!   ravel query  [<soul>] "<sparql>" rows, one per line
-//!   ravel hook   <harness>           the memory wake for a harness's session-start
-//!                                    hook, in that harness's format, for the soul
-//!                                    the hook runs in: claude-code, antigravity
-//!                                    (codex, gemini, hermes: planned, print nothing)
-//!
-//! `<soul>` is a six-character id (the start of the soul's genesis commit) or
-//! a path inside the soul repo; absent = the repo this command runs in.
-//! No flags.
+//! (goodlux, 2026-09-22). Every command is explained in [`HELP`], which
+//! `ravel --help` prints: what it does, what it reads, and when to use it
+//! (goodlux, 2026-11-12). No flags.
 
 use anyhow::{anyhow, Context, Result};
 use ravel::client::{ensure_running, Client};
 use ravel::daemon::config::DaemonConfig;
 use serde_json::Value;
 
+/// `ravel --help`. Each command says what it does, what it reads, and when
+/// to reach for it: a list of names alone told a reader nothing (goodlux,
+/// 2026-11-12).
+const HELP: &str = "\
+ravel {version}: keeps every conversation a soul has, in every harness, as a
+graph. Talks to raveld, the background daemon, and starts it if it is not
+running.
+
+USAGE:
+
+  ravel
+      What raveld is doing: whether it runs, which souls it serves, and each
+      one's backup and memory. The first look when something seems off.
+
+  ravel status [<soul>]
+      One soul in detail: its health check (exit 1 = needs attention), what
+      its store holds, and where its memory stands.
+
+  ravel souls
+      Every soul this machine's raveld serves, with its id and folder.
+
+  ravel sync [<soul> [<sessions-dir>]]
+      Back up and read in new conversations now. raveld does this every 30
+      seconds on its own; run it when you cannot wait. <sessions-dir> reads
+      session files from another folder into this soul.
+
+  ravel import [<soul>] <export-dir>
+      Bring in a claude.ai data export. Safe to repeat; a newer export adds
+      to what is there.
+
+  ravel autobiography [<soul>]
+      The story the soul wrote for itself: read it at wake. One section per
+      memory architecture ravel runs; today that is optmem alone. About
+      25,000 characters.
+
+  ravel optmem [<soul>]
+      What optmem is, where this soul's stands, and its commands. Short.
+      optmem is ravel's adaptation of OptMem, the memory architecture by
+      Victor Taelin (https://github.com/VictorTaelin/OptMem).
+
+  ravel optmem wake [<soul>]
+      optmem's whole index, about 96 lines and 25,000 characters, into your
+      context at once: the optmem section of `ravel autobiography`. Only to
+      get your bearings again, for example after a compaction lost what you
+      read at wake. If you know what you are looking for, use recall or open.
+
+  ravel optmem open [<soul>] <label>
+      Drill into one line of the index. A merged line (#0-1023) shows the two
+      lines it was made from; a note (#12) shows the note and the
+      conversation turns it was written from, each cut at 600 characters.
+
+  ravel optmem recall [<soul>] <words>
+      Where words appear across the soul's life, matched whole and ignoring
+      case: how many conversation turns said them and when (every harness,
+      from the graph), how many optmem notes recorded them and in which
+      months, the highest merged line that still names them, and the five
+      latest notes, with labels to open.
+
+  ravel optmem check [<soul>]
+      Test optmem end to end: every line within its limits, every note citing
+      real turns, the graph matching the record. Exit 1 on any failure.
+      Maintenance, not reading.
+
+  ravel query [<soul>] \"<sparql>\"
+      Ask the transcript graph anything, in SPARQL. One row per line.
+
+<soul> = which soul: its six-character id (from `ravel souls`), or a path
+inside its folder. Leave it off for the soul whose folder you are in.
+
+Config: {config}
+";
+
+fn help() -> String {
+    HELP.replace("{version}", env!("CARGO_PKG_VERSION")).replace(
+        "{config}",
+        &ravel::daemon::config::config_path().display().to_string(),
+    )
+}
+
+/// Asked for: the help on stdout. Misused: on stderr, exit 2.
 fn usage() -> ! {
-    eprintln!(
-        "ravel {} — talks to raveld (and starts it when it is not running)\n\n\
-         USAGE:\n  \
-           ravel\n  \
-           ravel status [<soul>]\n  \
-           ravel souls\n  \
-           ravel sync   [<soul> [<sessions-dir>]]\n  \
-           ravel import [<soul>] <export-dir>\n  \
-           ravel memory [<soul>] | memory open [<soul>] <id> | memory recall <words> | memory check [<soul>]\n  \
-           ravel query  [<soul>] \"<sparql>\"\n  \
-           ravel hook   <harness>\n\n\
-         <soul> = six-character id or a path inside the soul repo; absent = here.\n\
-         Config: {}",
-        env!("CARGO_PKG_VERSION"),
-        ravel::daemon::config::config_path().display()
-    );
+    eprint!("{}", help());
     std::process::exit(2);
 }
+
+/// What optmem's index starts with, wherever it is shown.
+const OPTMEM_IS: &str = "optmem: ravel's adaptation of OptMem, the memory architecture by Victor Taelin (https://github.com/VictorTaelin/OptMem)";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,14 +105,20 @@ fn main() -> Result<()> {
             println!("ravel {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        ["--help"] | ["-h"] | ["help"] => usage(),
-        // ravel has no flags; `ravel memory --help` must not be read as a
+        ["--help"] | ["-h"] | ["help"] => {
+            print!("{}", help());
+            return Ok(());
+        }
+        // `memory` became `autobiography` and `optmem` in 0.9.4 (goodlux,
+        // 2026-11-12: the word was too general for one of many memories).
+        ["memory", ..] => {
+            eprintln!("ravel memory is gone: the whole story is `ravel autobiography`, and its tools are `ravel optmem` (open, recall, check, wake). `ravel --help` explains each.");
+            std::process::exit(2);
+        }
+        // ravel has no flags; `ravel optmem --help` must not be read as a
         // soul id (w3bl0rd, 2026-10-05).
         args if args.iter().any(|x| x.starts_with('-')) => usage(),
         _ => {}
-    }
-    if let ["hook", h] = a.as_slice() {
-        return hook(h);
     }
     let cfg = DaemonConfig::load()?;
     let client = ensure_running(&cfg)?;
@@ -82,15 +132,28 @@ fn main() -> Result<()> {
         ["sync", s, dir] => sync(&client, &resolve(&client, Some(s))?, Some(dir)),
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
-        ["memory"] => memory(&client, &resolve(&client, None)?),
-        ["memory", "recall", words @ ..] if !words.is_empty() => {
-            memory_recall(&client, &resolve(&client, None)?, &words.join(" "))
+        ["autobiography"] => autobiography(&client, &resolve(&client, None)?),
+        ["autobiography", s] => autobiography(&client, &resolve(&client, Some(s))?),
+        ["optmem"] => optmem(&client, &resolve(&client, None)?),
+        ["optmem", "wake"] => optmem_wake(&client, &resolve(&client, None)?),
+        ["optmem", "wake", s] => optmem_wake(&client, &resolve(&client, Some(s))?),
+        ["optmem", "open", n] => optmem_open(&client, &resolve(&client, None)?, n),
+        ["optmem", "open", s, n] => optmem_open(&client, &resolve(&client, Some(s))?, n),
+        ["optmem", "recall", words @ ..] if !words.is_empty() => {
+            // A first word that names a soul is the soul; the rest are the
+            // words. A single word is always the words.
+            match words {
+                [s, rest @ ..] if !rest.is_empty() && names_soul(&client, s) => {
+                    optmem_recall(&client, &resolve(&client, Some(s))?, &rest.join(" "))
+                }
+                _ => optmem_recall(&client, &resolve(&client, None)?, &words.join(" ")),
+            }
         }
-        ["memory", "open", n] => memory_open(&client, &resolve(&client, None)?, n),
-        ["memory", "open", s, n] => memory_open(&client, &resolve(&client, Some(s))?, n),
-        ["memory", "check"] => memory_check(&client, &resolve(&client, None)?),
-        ["memory", "check", s] => memory_check(&client, &resolve(&client, Some(s))?),
-        ["memory", s] => memory(&client, &resolve(&client, Some(s))?),
+        ["optmem", "check"] => optmem_check(&client, &resolve(&client, None)?),
+        ["optmem", "check", s] => optmem_check(&client, &resolve(&client, Some(s))?),
+        ["optmem", s] if !["wake", "open", "recall", "check"].contains(s) => {
+            optmem(&client, &resolve(&client, Some(s))?)
+        }
         ["query", q] => query(&client, &resolve(&client, None)?, q),
         ["query", s, q] => query(&client, &resolve(&client, Some(s))?, q),
         _ => usage(),
@@ -113,6 +176,33 @@ fn resolve(client: &Client, given: Option<&str>) -> Result<String> {
     }
     let here = std::env::current_dir()?.canonicalize()?;
     by_path(&souls, &here).ok_or_else(|| not_registered(&here, &souls))
+}
+
+/// Whether `s` names a soul raveld serves, by id or by a path inside it.
+fn names_soul(client: &Client, s: &str) -> bool {
+    let Ok(souls) = client.get("/souls") else {
+        return false;
+    };
+    let souls = souls.as_array().cloned().unwrap_or_default();
+    souls.iter().any(|x| x["id"] == s)
+        || std::path::Path::new(s)
+            .canonicalize()
+            .is_ok_and(|p| by_path(&souls, &p).is_some())
+}
+
+/// A soul's name: its folder's.
+fn soul_name(client: &Client, id: &str) -> String {
+    client
+        .get("/souls")
+        .ok()
+        .and_then(|v| {
+            v.as_array()?.iter().find(|s| s["id"] == id).and_then(|s| {
+                std::path::Path::new(s["path"].as_str()?)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+        })
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn by_path(souls: &[Value], p: &std::path::Path) -> Option<String> {
@@ -225,22 +315,17 @@ fn short(ts: &str) -> String {
 /// Wake lines as OptMem prints them: `#i date text` and `#lo-hi text`.
 fn print_lines(lines: &[Value]) {
     for l in lines {
-        println!("{}", line_text(l));
-    }
-}
-
-/// One memory line as the wake shows it.
-fn line_text(l: &Value) -> String {
-    let label = l["label"].as_str().unwrap_or("");
-    let text = l["text"].as_str().unwrap_or("");
-    let date = l["date"].as_str().unwrap_or("");
-    if l["level"].as_u64().unwrap_or(0) == 0 {
-        format!("{label} {date} {text}")
-    } else {
-        format!(
-            "{label} {} {text}",
-            span(date, l["date_to"].as_str().unwrap_or(""))
-        )
+        let label = l["label"].as_str().unwrap_or("");
+        let text = l["text"].as_str().unwrap_or("");
+        let date = l["date"].as_str().unwrap_or("");
+        if l["level"].as_u64().unwrap_or(0) == 0 {
+            println!("{label} {date} {text}");
+        } else {
+            println!(
+                "{label} {} {text}",
+                span(date, l["date_to"].as_str().unwrap_or(""))
+            );
+        }
     }
 }
 
@@ -258,95 +343,70 @@ fn span(from: &str, to: &str) -> String {
     format!("{from}..{end}")
 }
 
-fn memory(client: &Client, id: &str) -> Result<()> {
-    print!("{}", wake(client, id)?);
-    Ok(())
+/// `ravel autobiography`: the story the soul wrote for itself, one section
+/// per memory architecture. Today optmem's index is the only section; a
+/// statistics section, or another architecture's, would follow it (goodlux,
+/// 2026-11-12).
+fn autobiography(client: &Client, id: &str) -> Result<()> {
+    println!("# {} ({id}): autobiography\n", soul_name(client, id));
+    optmem_wake(client, id)
 }
 
-/// The memory wake as text: what `ravel memory` prints, and what a
-/// session-start hook hands the harness.
-fn wake(client: &Client, id: &str) -> Result<String> {
+/// `ravel optmem wake`: optmem's whole index, as its section of the
+/// autobiography.
+fn optmem_wake(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory"))?;
+    println!("## {OPTMEM_IS}");
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
     if lines.is_empty() {
-        return Ok(format!("[ravel memory] {id}: no memories yet.\n"));
+        println!("No notes yet.");
+        return Ok(());
     }
-    let mut out = format!(
-        "[ravel memory] {id}: {} notes, {} blocks — `ravel memory open <#i or lo-hi>` opens a line\n",
+    println!(
+        "{} notes, {} merges. Open a line by its label: `ravel optmem open <label>`.",
         v["memories"], v["summaries"]
     );
     // A merge reads like a statement of fact, but it is how things stood over
     // its dates (selkie, 2026-11-01: an April rule had since changed).
-    out.push_str("Oldest first. Each line is how things stood over its dates; where two disagree, the later one is current.\n");
-    for l in &lines {
-        out.push_str(&line_text(l));
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-/// `ravel hook <harness>`: the wake, shaped for that harness's session-start
-/// hook, for the soul whose repo the hook runs in. The soul kit ships one
-/// line per harness that calls this, so what each harness needs lives here,
-/// in ravel, and a person without a soul repo can wire the same line into
-/// their own harness (goodlux, 2026-11-12).
-///
-/// A hook must never stop a session from starting: any failure is said on
-/// stderr, and stdout still carries what the harness accepts as "nothing".
-fn hook(harness: &str) -> Result<()> {
-    use ravel::writer::Harness;
-    let h = match Harness::parse(harness) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("ravel hook: {e}");
-            std::process::exit(2);
-        }
-    };
-    let text = || -> Result<String> {
-        let cfg = DaemonConfig::load()?;
-        let client = ensure_running(&cfg)?;
-        wake(&client, &resolve(&client, None)?)
-    };
-    match h {
-        // SessionStart: stdout is added to the session's context as is.
-        Harness::ClaudeCode => match text() {
-            Ok(t) => print!("{t}"),
-            Err(e) => eprintln!("ravel hook claude-code: no memory loaded — {e:#}"),
-        },
-        // SessionStart in .agents/hooks.json: stdout must be one JSON
-        // object, `{}` for nothing. A systemMessage step stays in the
-        // conversation's trajectory, so a resumed conversation keeps it.
-        Harness::Antigravity => {
-            let out = match text() {
-                Ok(t) => serde_json::json!({
-                    "injectSteps": [{"systemMessage": {"systemMessage": t}}]
-                }),
-                Err(e) => {
-                    eprintln!("ravel hook antigravity: no memory loaded — {e:#}");
-                    serde_json::json!({})
-                }
-            };
-            println!("{out}");
-        }
-        Harness::Codex | Harness::Gemini | Harness::Hermes => {
-            eprintln!("ravel hook {}: {}", h.name(), hook_plan(h));
-        }
-    }
+    println!("Oldest first. Each line is how things stood over its dates; where two disagree, the later one is current.");
+    print_lines(&lines);
     Ok(())
 }
 
-/// What a harness's memory hook still needs before `ravel hook` can serve it.
-fn hook_plan(h: ravel::writer::Harness) -> &'static str {
-    use ravel::writer::Harness;
-    match h {
-        Harness::ClaudeCode | Harness::Antigravity => "built",
-        Harness::Codex => "not built. Needs: Codex's session-start hook, and the form it takes extra context in. To check: whether Codex has hooks at all, or only AGENTS.md.",
-        Harness::Gemini => "not built. Needs: Gemini CLI's SessionStart hook in .gemini/settings.json, and its output form for added context.",
-        Harness::Hermes => "not built. Needs: Hermes Agent's hook or plugin point that runs at session start, and how it takes added context.",
+/// `ravel optmem`: a short page, never the index. What optmem is, where this
+/// soul's stands, and the commands, so a bare `ravel optmem` cannot pour
+/// 25,000 characters into a context (goodlux, 2026-11-12).
+fn optmem(client: &Client, id: &str) -> Result<()> {
+    let v = client.get(&format!("/souls/{id}/memory"))?;
+    println!("{OPTMEM_IS}.");
+    println!("raveld writes it every 10 minutes from new conversation turns.\n");
+    println!(
+        "{} ({id}): {} notes, {} merges.",
+        soul_name(client, id),
+        v["memories"],
+        v["summaries"]
+    );
+    let row = client.get("/souls").ok().and_then(|s| {
+        s.as_array()?
+            .iter()
+            .find(|x| x["id"] == id)
+            .and_then(|x| memory_line(&x["memory"]))
+    });
+    if let Some(l) = row {
+        println!("Last pass {l}");
     }
+    println!(
+        "\n  ravel optmem wake [<soul>]            the whole index, about 25,000 characters:\n\
+         \x20                                       only to get your bearings again\n\
+         \x20 ravel optmem open [<soul>] <label>    drill into one line\n\
+         \x20 ravel optmem recall [<soul>] <words>  where words appear across the soul's life\n\
+         \x20 ravel optmem check [<soul>]           test it end to end\n\n\
+         `ravel --help` says what each reads."
+    );
+    Ok(())
 }
 
-fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
+fn optmem_open(client: &Client, id: &str, node: &str) -> Result<()> {
     // `#12` is how a note is written, but `#` would end the URL path, so the
     // daemon would only ever see `/memory/` and answer 404.
     let node = node.trim_start_matches('#');
@@ -381,12 +441,12 @@ fn memory_open(client: &Client, id: &str, node: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ravel memory recall <words>`: a compact picture of one term across a
+/// `ravel optmem recall <words>`: a compact picture of one term across a
 /// soul's whole history, for the notes the wake has compressed away. How often
 /// it was said and when, how often it was noted and in which months, the
 /// highest merge that still names it, and the latest notes, with the ids
-/// `memory open` takes. Matched as a whole word or phrase, ignoring case.
-fn memory_recall(client: &Client, id: &str, term: &str) -> Result<()> {
+/// `optmem open` takes. Matched as a whole word or phrase, ignoring case.
+fn optmem_recall(client: &Client, id: &str, term: &str) -> Result<()> {
     const MEM: &str = "<https://repolex.ai/ravel/NamedGraph/memory-v1>";
     let ns = ravel::RAVEL_NS;
     let lower = term.to_lowercase();
@@ -621,12 +681,12 @@ fn soul_status(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ravel memory check`: every failure by name; exit 1 on any.
-fn memory_check(client: &Client, id: &str) -> Result<()> {
+/// `ravel optmem check`: every failure by name; exit 1 on any.
+fn optmem_check(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory-check"))?;
     let c = &v["check"];
     println!(
-        "[ravel memory check] {id}: {} notes, {} merges, {} turn links, {} wake lines",
+        "[ravel optmem check] {id}: {} notes, {} merges, {} turn links, {} wake lines",
         c["notes"], c["blocks"], c["turn_links"], c["wake_lines"]
     );
     let failures = c["failures"].as_array().cloned().unwrap_or_default();

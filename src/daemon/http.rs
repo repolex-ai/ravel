@@ -482,7 +482,7 @@ async fn soul_query(
     Ok(Json(v))
 }
 
-/// `ravel memory check`: the soul's memory against OptMem's rules and its
+/// `ravel optmem check`: the soul's memory against OptMem's rules and its
 /// own records — every line passes the checks, every block due is built,
 /// every note cites real turns, the wake is OptMem's cover.
 async fn memory_check(
