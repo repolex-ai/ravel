@@ -39,10 +39,10 @@ USAGE:
       Bring in a claude.ai data export. Safe to repeat; a newer export adds
       to what is there.
 
-  ravel autobiography [<soul>]
-      The story the soul wrote for itself: read it at wake. One section per
-      memory architecture ravel runs; today that is optmem alone. About
-      25,000 characters.
+  ravel biography [<soul>]
+      The soul's life so far: read it at wake. One section per memory
+      architecture ravel runs; today that is optmem alone, the story the
+      soul wrote for itself. About 25,000 characters.
 
   ravel optmem [<soul>]
       What optmem is, where this soul's stands, and its commands. Short.
@@ -51,7 +51,7 @@ USAGE:
 
   ravel optmem wake [<soul>]
       optmem's whole index, about 96 lines and 25,000 characters, into your
-      context at once: the optmem section of `ravel autobiography`. Only to
+      context at once: the optmem section of `ravel biography`. Only to
       get your bearings again, for example after a compaction lost what you
       read at wake. If you know what you are looking for, use recall or open.
 
@@ -109,10 +109,10 @@ fn main() -> Result<()> {
             print!("{}", help());
             return Ok(());
         }
-        // `memory` became `autobiography` and `optmem` in 0.9.4 (goodlux,
+        // `memory` became `biography` and `optmem` in 0.9.4-0.9.5 (goodlux,
         // 2026-11-12: the word was too general for one of many memories).
         ["memory", ..] => {
-            eprintln!("ravel memory is gone: the whole story is `ravel autobiography`, and its tools are `ravel optmem` (open, recall, check, wake). `ravel --help` explains each.");
+            eprintln!("ravel memory is gone: the whole story is `ravel biography`, and its tools are `ravel optmem` (open, recall, check, wake). `ravel --help` explains each.");
             std::process::exit(2);
         }
         // ravel has no flags; `ravel optmem --help` must not be read as a
@@ -132,8 +132,8 @@ fn main() -> Result<()> {
         ["sync", s, dir] => sync(&client, &resolve(&client, Some(s))?, Some(dir)),
         ["import", dir] => import(&client, &resolve(&client, None)?, dir),
         ["import", s, dir] => import(&client, &resolve(&client, Some(s))?, dir),
-        ["autobiography"] => autobiography(&client, &resolve(&client, None)?),
-        ["autobiography", s] => autobiography(&client, &resolve(&client, Some(s))?),
+        ["biography"] => biography(&client, &resolve(&client, None)?),
+        ["biography", s] => biography(&client, &resolve(&client, Some(s))?),
         ["optmem"] => optmem(&client, &resolve(&client, None)?),
         ["optmem", "wake"] => optmem_wake(&client, &resolve(&client, None)?),
         ["optmem", "wake", s] => optmem_wake(&client, &resolve(&client, Some(s))?),
@@ -343,17 +343,18 @@ fn span(from: &str, to: &str) -> String {
     format!("{from}..{end}")
 }
 
-/// `ravel autobiography`: the story the soul wrote for itself, one section
-/// per memory architecture. Today optmem's index is the only section; a
-/// statistics section, or another architecture's, would follow it (goodlux,
-/// 2026-11-12).
-fn autobiography(client: &Client, id: &str) -> Result<()> {
-    println!("# {} ({id}): autobiography\n", soul_name(client, id));
+/// `ravel biography`: the soul's life so far, one section per memory
+/// architecture. Today optmem's index, which the soul wrote for itself, is
+/// the only section; a statistics section, or another architecture's, would
+/// follow it. "biography", not "autobiography": not every section will be
+/// self-written (goodlux, 2026-11-12).
+fn biography(client: &Client, id: &str) -> Result<()> {
+    println!("# {} ({id}): biography\n", soul_name(client, id));
     optmem_wake(client, id)
 }
 
 /// `ravel optmem wake`: optmem's whole index, as its section of the
-/// autobiography.
+/// biography.
 fn optmem_wake(client: &Client, id: &str) -> Result<()> {
     let v = client.get(&format!("/souls/{id}/memory"))?;
     println!("## {OPTMEM_IS}");

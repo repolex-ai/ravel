@@ -26,7 +26,7 @@ souls:
 # turns. Optional; "human" otherwise.
 # human: Ada
 
-# Who keeps every soul's optmem (`ravel autobiography`) up to date. Optional: without
+# Who keeps every soul's optmem (`ravel biography`) up to date. Optional: without
 # this block raveld calls no model, and only shows the memory that is there.
 #
 # The writer is a harness's own command line, run on the subscription you are

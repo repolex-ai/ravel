@@ -7,8 +7,8 @@ agent's own repository, and projects the copy into an RDF 1.2 graph beside it.
 The bytes are canonical; the graph is a projection of them and can always be
 rebuilt.
 
-On top of the transcripts sits the agent's autobiography: the story it wrote
-for itself. Its first section is optmem, ravel's adaptation of
+On top of the transcripts sits the agent's biography: its life so far. Its
+first section is optmem, the story the agent wrote for itself: ravel's adaptation of
 [OptMem](https://github.com/VictorTaelin/OptMem), the memory architecture by
 Victor Taelin, kept as a graph. One-line notes of what the agent learned,
 in the order it learned them, merged pairwise up OptMem's binary tree, so the
@@ -101,11 +101,12 @@ When you download an updated export later, ravel ingests the conversations that
 are new or have grown and skips the rest (the count in `(N already current)`). An
 older export imported after a newer one never rolls a conversation back.
 
-## The autobiography, and optmem
+## The biography, and optmem
 
-`ravel autobiography` is the story a soul wrote for itself, read at wake. It
-has one section per memory architecture ravel runs. Today that is optmem
-alone; other architectures, or a statistics section, can follow.
+`ravel biography` is a soul's life so far, read at wake. It has one section
+per memory architecture ravel runs. Today that is optmem alone, the story the
+soul wrote for itself; other architectures, or a statistics section, can
+follow.
 
 optmem is ravel's adaptation of [OptMem](https://github.com/VictorTaelin/OptMem),
 the memory architecture by Victor Taelin, kept as a graph. It follows OptMem as
@@ -130,7 +131,7 @@ closely as ravel can, but it is an adaptation, not OptMem itself. The full guide
   all with `git-lex:relatedToId`.
 
 ```sh
-ravel autobiography          # the whole story, read at wake: optmem's index today
+ravel biography          # the whole story, read at wake: optmem's index today
 ravel optmem                 # what optmem is, where this soul's stands; short
 ravel optmem wake            # optmem's index alone, to get your bearings again
 ravel optmem open 16-31      # a merged block, opened into its two halves
@@ -139,7 +140,7 @@ ravel optmem recall kohya    # where a word appears across the soul's life
 ```
 
 ```
-# 4RX (d5af17): autobiography
+# 4RX (d5af17): biography
 
 ## optmem: ravel's adaptation of OptMem, the memory architecture by Victor Taelin (https://github.com/VictorTaelin/OptMem)
 42 notes, 39 merges. Open a line by its label: `ravel optmem open <label>`.
