@@ -263,7 +263,6 @@ impl Event {
 /// properties). Instance data never lives under this prefix.
 pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel/";
 
-/// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path,
-/// mirroring git-lex's `…/git-lex/SpoEvent/<id>` / `…/git-lex/NamedGraph/<name>`
-/// shape. Vocabulary and data must not share a prefix.
+/// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path
+/// (`…/ravel/<Class>/<id>`). Vocabulary and data must not share a prefix.
 pub const RAVEL_BASE: &str = "https://repolex.ai/ravel/";

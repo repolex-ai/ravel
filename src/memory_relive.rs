@@ -1015,7 +1015,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     mem.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
     let dangling = crate::graph::query_rows(
         &mem,
-        "SELECT (COUNT(*) AS ?n) WHERE { ?m <https://repolex.ai/ontology/git-lex/relatedToId> ?c . FILTER(STRSTARTS(STR(?c), \"https://repolex.ai/ravel/Memory/\")) FILTER NOT EXISTS { ?c a <https://repolex.ai/ontology/ravel/Memory> } }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?m <https://repolex.ai/ontology/ravel/relatedToId> ?c . FILTER(STRSTARTS(STR(?c), \"https://repolex.ai/ravel/Memory/\")) FILTER NOT EXISTS { ?c a <https://repolex.ai/ontology/ravel/Memory> } }",
     )?;
     let n: usize = dangling
         .first()

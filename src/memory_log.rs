@@ -374,7 +374,8 @@ pub fn zoom(memories: &[Memory], summaries: &HashMap<String, Summary>, b: Block)
 /// N-Triples for the whole memory, for the soul's `memory-v1` graph.
 ///
 /// One node per note and per built block, all `ravel:Memory`. Every edge is
-/// `git-lex:relatedToId` (goodlux, 2026-10-06): a note to the turns it rests
+/// `ravel:relatedToId` (equivalent to `subtexture:relatedToId`; goodlux,
+/// 2026-10-06 and 2026-11-16): a note to the turns it rests
 /// on, a block to its two halves — the tree OptMem's `zoom` walks.
 pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> String {
     use crate::{RAVEL_BASE, RAVEL_NS};
@@ -392,7 +393,7 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
     let dt = |s: &str| format!("{}^^<http://www.w3.org/2001/XMLSchema#dateTime>", lit(s));
     let int = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
     let ty = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
-    let related = "<https://repolex.ai/ontology/git-lex/relatedToId>";
+    let related = "<https://repolex.ai/ontology/ravel/relatedToId>";
     let node_iri = |(lo, hi): Block| {
         if hi - lo == 1 {
             iri(&memories[lo].id)
@@ -604,7 +605,7 @@ mod tests {
             s.insert(memory::block_id(b), sum(b, "x"));
         }
         let nt = project_nt(&ms, &s);
-        let rel = "<https://repolex.ai/ontology/git-lex/relatedToId>";
+        let rel = "<https://repolex.ai/ontology/ravel/relatedToId>";
         let m = |id: &str| format!("<https://repolex.ai/ravel/Memory/{id}>");
         assert!(nt.contains(&format!(
             "{} {rel} <https://repolex.ai/ravel/Turn/t0> .",
@@ -618,6 +619,46 @@ mod tests {
         store
             .load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())
             .unwrap();
+    }
+
+    /// ravel.ttl stands on the Subtexture base and on nothing of git-lex's:
+    /// every subtexture: term it names is declared in the copy of
+    /// subtexture.ttl shipped beside it.
+    #[test]
+    fn every_base_term_ravel_names_is_declared_in_the_shipped_subtexture_ttl() {
+        let ravel = include_str!("../ontology/ravel/ravel.ttl");
+        let base = include_str!("../ontology/subtexture/subtexture.ttl");
+        let store = oxigraph::store::Store::new().unwrap();
+        store
+            .load_from_reader(oxigraph::io::RdfFormat::Turtle, base.as_bytes())
+            .expect("subtexture.ttl parses");
+        let code: String = ravel
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("git-lex"), "ravel.ttl still names git-lex");
+        let mut terms: Vec<&str> = code
+            .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+            .filter_map(|w| w.strip_prefix("subtexture:"))
+            .filter(|w| !w.is_empty())
+            .collect();
+        terms.sort();
+        terms.dedup();
+        assert_eq!(terms, ["NamedGraph", "Thing", "relatedToId"]);
+        for t in terms {
+            let q = format!("ASK {{ <https://repolex.ai/ontology/subtexture/{t}> a ?k }}");
+            let ok = matches!(
+                oxigraph::sparql::SparqlEvaluator::new()
+                    .parse_query(&q)
+                    .unwrap()
+                    .on_store(&store)
+                    .execute()
+                    .unwrap(),
+                oxigraph::sparql::QueryResults::Boolean(true)
+            );
+            assert!(ok, "subtexture:{t} is named in ravel.ttl but not declared in subtexture.ttl");
+        }
     }
 
     /// The ontology declares what the projection emits, and nothing it

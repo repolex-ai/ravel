@@ -832,6 +832,12 @@ fn query_help() -> Result<String> {
         .iter()
         .map(|c| ((*c).clone(), format!("ravel:{c}: {}", first(&terms[*c].comment))))
         .collect();
+    // ravel:relatedToId lands on any Thing (it is Subtexture's one link
+    // property under ravel's own name), so it has no ravel class to sit under.
+    groups.push((
+        "Thing".into(),
+        "Links, on any ravel thing (the same property as subtexture:relatedToId)".into(),
+    ));
     groups.push((
         String::new(),
         "Reader annotations: what a reader found in a turn, as W3C annotations (oa:, prov:)".into(),
@@ -842,7 +848,7 @@ fn query_help() -> Result<String> {
             if !t.kind.ends_with("Property") || t.domain != *class {
                 continue;
             }
-            if class.is_empty() && classes.contains(&&t.domain) {
+            if class.is_empty() && (classes.contains(&&t.domain) || t.domain == "Thing") {
                 continue;
             }
             out += &format!("    ravel:{n} ({}): {}\n", t.range, first(&t.comment));
@@ -856,7 +862,7 @@ WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
     says GRAPH ?g { ... }.
   - optmem is the graph <https://repolex.ai/ravel/NamedGraph/memory-v1>. A
     note (memoryLevel 0) links to each turn it was written from, and a merge
-    to its two halves, with <https://repolex.ai/ontology/git-lex/relatedToId>.
+    to its two halves, with <https://repolex.ai/ontology/ravel/relatedToId>.
   - Instances are named under https://repolex.ai/ravel/<Class>/<id>, for
     example <https://repolex.ai/ravel/Turn/<event id>>.
 
@@ -878,11 +884,10 @@ THREE QUERIES THAT WORK AS WRITTEN
 
   An optmem note, with the turns it was written from (note #12):
     PREFIX ravel: <https://repolex.ai/ontology/ravel/>
-    PREFIX lex: <https://repolex.ai/ontology/git-lex/>
     SELECT ?note ?ts (SUBSTR(?said, 1, 80) AS ?start) WHERE {
       GRAPH <https://repolex.ai/ravel/NamedGraph/memory-v1> {
         ?m ravel:memoryLevel 0 ; ravel:logStart 12 ;
-           ravel:memoryText ?note ; lex:relatedToId ?t }
+           ravel:memoryText ?note ; ravel:relatedToId ?t }
       GRAPH ?g { ?t ravel:timestamp ?ts ; ravel:text ?said } }
     ORDER BY ?ts
 "#;

@@ -304,7 +304,12 @@ Queries filter; ingest never drops. That is why `ravel status` counts
 
 ## The ontology
 
-`ontology/ravel/ravel.ttl`. The copy shipped in
+`ontology/ravel/ravel.ttl`, built on the Subtexture base ontology, which ships
+beside it as `ontology/subtexture/subtexture.ttl`. Ravel keeps its own
+namespace in stored data and bridges to the base with `owl:equivalentProperty`;
+nothing in ravel refers to git-lex's vocabulary.
+
+Of `ravel.ttl`: the The copy shipped in
 [git-lex-kit-ravel](https://github.com/repolex-ai/git-lex-kit-ravel) must be
 byte-identical; CI checks it on every push, along with the six graph-only
 properties the kit checker would otherwise call errors.
@@ -317,7 +322,8 @@ The store partitions data into named graphs under `https://repolex.ai/ravel/Name
     `ravel:logStart` and `ravel:logEnd` (its positions in OptMem's log),
     `ravel:memoryText`, `ravel:windowStart` and `ravel:windowEnd` (the times of
     its first and last note), and `ravel:memoryModel`.
-  - Every link is `git-lex:relatedToId`: a note to each turn it rests on, a
+  - Every link is `ravel:relatedToId` (declared equivalent to
+    `subtexture:relatedToId`): a note to each turn it rests on, a
     block to its two halves.
 
 ## Health

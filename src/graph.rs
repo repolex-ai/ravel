@@ -32,7 +32,7 @@ use oxigraph::store::Store;
 use std::path::Path;
 
 /// The named graph for one transcript's annotations. Lives under the
-/// instance base (`…/ravel/NamedGraph/<id>`, git-lex's shape) — NOT the
+/// instance base (`…/ravel/NamedGraph/<id>`) — NOT the
 /// ontology namespace, which is vocabulary-only.
 pub fn transcript_graph_iri(transcript_id: &str) -> String {
     format!("{RAVEL_BASE}NamedGraph/{}", safe(transcript_id))
