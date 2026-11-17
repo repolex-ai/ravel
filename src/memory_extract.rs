@@ -243,7 +243,9 @@ fn fold_actions(turns: Vec<ProseTurn>) -> Vec<ProseTurn> {
     for mut t in turns {
         let only_actions = t.role == "assistant"
             && !t.text.trim().is_empty()
-            && t.text.lines().all(|l| l.starts_with('[') && l.ends_with(']'));
+            && t.text
+                .lines()
+                .all(|l| l.starts_with('[') && l.ends_with(']'));
         if only_actions {
             let last = out.iter_mut().rev().find(|x| !x.text.trim().is_empty());
             match last {
@@ -627,7 +629,10 @@ mod tests {
             t,
             vec![
                 ("u1".into(), "run the tests".into()),
-                ("a2".into(), "[ran: cargo test → test result: ok. 98 passed (+1 lines)]\nAll pass.".into()),
+                (
+                    "a2".into(),
+                    "[ran: cargo test → test result: ok. 98 passed (+1 lines)]\nAll pass.".into()
+                ),
                 ("u3".into(), "and lint?".into()),
             ]
         );
@@ -646,7 +651,10 @@ mod tests {
             .filter(|t| !t.text.trim().is_empty())
             .map(|t| t.text)
             .collect();
-        assert_eq!(t, vec!["Checking.\n[ran: rg -c face test.json → 0]".to_string()]);
+        assert_eq!(
+            t,
+            vec!["Checking.\n[ran: rg -c face test.json → 0]".to_string()]
+        );
     }
 
     #[test]

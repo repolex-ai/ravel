@@ -87,10 +87,11 @@ Config: {config}
 ";
 
 fn help() -> String {
-    HELP.replace("{version}", env!("CARGO_PKG_VERSION")).replace(
-        "{config}",
-        &ravel::daemon::config::config_path().display().to_string(),
-    )
+    HELP.replace("{version}", env!("CARGO_PKG_VERSION"))
+        .replace(
+            "{config}",
+            &ravel::daemon::config::config_path().display().to_string(),
+        )
 }
 
 /// Asked for: the help on stdout. Misused: on stderr, exit 2.
@@ -830,7 +831,12 @@ fn query_help() -> Result<String> {
         .collect();
     let mut groups: Vec<(String, String)> = classes
         .iter()
-        .map(|c| ((*c).clone(), format!("ravel:{c}: {}", first(&terms[*c].comment))))
+        .map(|c| {
+            (
+                (*c).clone(),
+                format!("ravel:{c}: {}", first(&terms[*c].comment)),
+            )
+        })
         .collect();
     // ravel:relatedToId lands on any Thing (it is Subtexture's one link
     // property under ravel's own name), so it has no ravel class to sit under.

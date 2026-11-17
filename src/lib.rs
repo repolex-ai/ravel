@@ -184,9 +184,21 @@ pub fn action_target(input: &serde_json::Value) -> String {
         };
     }
     const KEYS: &[&str] = &[
-        "command", "CommandLine", "file_path", "AbsolutePath", "TargetFile", "path",
-        "DirectoryPath", "pattern", "Query", "query", "url", "Url", "description",
-        "prompt", "skill",
+        "command",
+        "CommandLine",
+        "file_path",
+        "AbsolutePath",
+        "TargetFile",
+        "path",
+        "DirectoryPath",
+        "pattern",
+        "Query",
+        "query",
+        "url",
+        "Url",
+        "description",
+        "prompt",
+        "skill",
     ];
     for k in KEYS {
         if let Some(v) = input.get(k).and_then(serde_json::Value::as_str) {

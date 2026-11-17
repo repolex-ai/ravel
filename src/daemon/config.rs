@@ -130,7 +130,10 @@ pub fn cap_log(path: &std::path::Path, cap: u64, keep: u64) -> std::io::Result<b
     if len <= cap {
         return Ok(false);
     }
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     f.seek(SeekFrom::Start(len - keep.min(len)))?;
     let mut tail = Vec::new();
     f.read_to_end(&mut tail)?;
@@ -248,7 +251,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "line three\n");
         // The writer raveld already holds lands at the new end.
         writeln!(held, "line four").unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "line three\nline four\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "line three\nline four\n"
+        );
         assert!(!cap_log(&dir.join("absent.log"), 1, 1).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }

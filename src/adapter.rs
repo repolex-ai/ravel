@@ -134,7 +134,10 @@ fn extract_text(message: Option<&Value>) -> (Option<String>, Vec<TextSpan>) {
 /// The `tool_use` blocks of a `message`: what the speaker did (#27). The
 /// input is machine JSON; only the argument that says what was done is kept.
 fn extract_actions(message: Option<&Value>) -> Vec<crate::Action> {
-    let Some(blocks) = message.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+    let Some(blocks) = message
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
         return Vec::new();
     };
     blocks
@@ -144,12 +147,20 @@ fn extract_actions(message: Option<&Value>) -> Vec<crate::Action> {
             let name = b.get("name").and_then(Value::as_str)?;
             let input = b.get("input").cloned().unwrap_or(Value::Null);
             Some(crate::Action {
-                id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                id: b
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 kind: crate::action_kind(name),
                 target: match crate::action_kind(name) {
                     crate::ActionKind::Other => {
                         let t = crate::action_target(&input);
-                        if t.is_empty() { name.to_string() } else { format!("{name} {t}") }
+                        if t.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{name} {t}")
+                        }
                     }
                     _ => crate::action_target(&input),
                 },
@@ -160,7 +171,10 @@ fn extract_actions(message: Option<&Value>) -> Vec<crate::Action> {
 
 /// The `tool_result` blocks of a `message`: each call's result, by its id.
 fn extract_outcomes(message: Option<&Value>) -> Vec<crate::Outcome> {
-    let Some(blocks) = message.and_then(|m| m.get("content")).and_then(Value::as_array) else {
+    let Some(blocks) = message
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
         return Vec::new();
     };
     blocks

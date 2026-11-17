@@ -657,7 +657,10 @@ mod tests {
                     .unwrap(),
                 oxigraph::sparql::QueryResults::Boolean(true)
             );
-            assert!(ok, "subtexture:{t} is named in ravel.ttl but not declared in subtexture.ttl");
+            assert!(
+                ok,
+                "subtexture:{t} is named in ravel.ttl but not declared in subtexture.ttl"
+            );
         }
     }
 

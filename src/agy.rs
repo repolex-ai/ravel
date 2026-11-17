@@ -358,7 +358,6 @@ pub fn derive_tool_calls(jsonl: &str) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
-
 /// A tool step's output without the harness's preamble: everything after
 /// `Output:` when the step says so, else after the `Created At / Completed
 /// At` lines.
