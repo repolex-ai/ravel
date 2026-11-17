@@ -165,6 +165,12 @@ pub fn action_kind(tool: &str) -> ActionKind {
     }
 }
 
+/// How much of a shell command a reader is shown. At 100 a check's own
+/// arguments were cut off (the word list a soul grepped for, the files it ran
+/// over), and the memory writer could not tell the soul's check from a claim
+/// that one was run (#27, lUX's 2026-11-13 note).
+pub const COMMAND_CHARS: usize = 400;
+
 /// The argument that says what a tool call did, from its JSON input: the
 /// command, the path, the pattern, the request. Harness-neutral by key name.
 pub fn action_target(input: &serde_json::Value) -> String {
@@ -178,9 +184,9 @@ pub fn action_target(input: &serde_json::Value) -> String {
         let c = strip_cd(c);
         return match input.get("description").and_then(serde_json::Value::as_str) {
             Some(d) if !d.trim().is_empty() => {
-                format!("{} ({})", one_line(d, 80), one_line(c, 100))
+                format!("{} ({})", one_line(d, 80), one_line(c, COMMAND_CHARS))
             }
-            _ => one_line(c, 160),
+            _ => one_line(c, COMMAND_CHARS),
         };
     }
     const KEYS: &[&str] = &[
@@ -278,3 +284,33 @@ pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel/";
 /// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path
 /// (`…/ravel/<Class>/<id>`). Vocabulary and data must not share a prefix.
 pub const RAVEL_BASE: &str = "https://repolex.ai/ravel/";
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    /// A check's arguments are the evidence that it was a check: a command
+    /// under the limit is shown whole, with or without a description.
+    #[test]
+    fn a_command_keeps_its_arguments_up_to_the_limit() {
+        let words = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let cmd = format!("cd /x/films && rg -c '{words}' */test.json");
+        assert!(cmd.len() > 250 && cmd.len() < COMMAND_CHARS);
+        let described = action_target(
+            &serde_json::json!({ "command": cmd, "description": "Count banned words" }),
+        );
+        assert!(described.starts_with("Count banned words (rg -c"));
+        assert!(described.contains("word39") && described.ends_with("*/test.json)"));
+        let bare = action_target(&serde_json::json!({ "command": cmd }));
+        assert!(bare.ends_with("*/test.json"));
+        let long = action_target(&serde_json::json!({ "command": "x ".repeat(600) }));
+        assert_eq!(
+            long.chars().count(),
+            COMMAND_CHARS + 1,
+            "clipped, with the mark that says so"
+        );
+    }
+}

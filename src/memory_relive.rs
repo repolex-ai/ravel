@@ -58,7 +58,7 @@ fn note_prompt(
     sp: &Speakers,
 ) -> String {
     let h = &sp.human;
-    let rules = format!("Turns marked 'you' are yours. Turns marked '{h}' are {h}'s, your human's, except text marked as a message from another agent or as pasted, which is someone else's words. Turns marked with another agent's name are that agent's. You see what was said, and each tool call as one line in brackets with how it came out (`[ran: … → …]`); at the time, you saw the whole output too. The numbers in brackets are only for citing turns: a memory must make sense on its own later, so never put a turn number in one.");
+    let rules = format!("Turns marked 'you' are yours. Turns marked '{h}' are {h}'s, your human's, except text marked as a message from another agent or as pasted, which is someone else's words. Turns marked with another agent's name are that agent's. You see what was said, and each tool call as one line in brackets with how it came out (`[ran: … → …]`); at the time, you saw the whole output too. A bracketed line in a turn of yours is you doing that yourself: a check you ran is your own check, not someone's report of one. The numbers in brackets are only for citing turns: a memory must make sense on its own later, so never put a turn number in one.");
     let mut s = match wake {
         Some(w) => format!(
             "You are reliving your own past in order, as if it were happening now. You have just woken. Your memory, as `memo wake` prints it:\n\n{}\nYou are awake.\n\nWhat happens next. {rules}\n\n",

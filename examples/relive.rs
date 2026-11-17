@@ -18,6 +18,17 @@
 //!             notes in <out-dir>, beside the soul's own merge of the same notes and
 //!             the lines it was built from; plus every nth smaller merge, with its
 //!             sources. Markdown on stdout.
+//!   notes     <soul-repo> <out-dir> <from> <to> <model>
+//!             the notes for the turns in [from, to), written again by today's
+//!             reader into <out-dir>: a test of a change to what the writer is
+//!             shown or told. <out-dir> starts as the soul's memory as it stood
+//!             before <from> (its notes up to there, and their merges), so the
+//!             writer wakes as it did then. Run again to resume a stopped run.
+//!   notes-side <soul-repo> <out-dir> <from> <to> [key-file]
+//!             a judge's packet for `notes`: the soul's own notes for the range
+//!             beside the trial's. With a key file the two are A and B, and the
+//!             key says which is which. `dump` over the same range is the
+//!             transcript to judge them against. Markdown on stdout.
 //!
 //! `from` and `to` are RFC 3339 prefixes compared as strings ("2026-06-01").
 //! Peers are the souls in ravel's config, as raveld sees them.
@@ -173,6 +184,90 @@ fn main() -> Result<()> {
                 std::fs::write(k, key)?;
             }
         }
+        ["notes", repo, out, from, to, model] => {
+            let repo = PathBuf::from(repo);
+            let out = PathBuf::from(out);
+            if out.starts_with(repo.join(".ravel")) {
+                bail!("<out-dir> is inside the soul's .ravel: a trial never writes where raveld does");
+            }
+            let trial = MemoryLog::at(out.clone());
+            let seed_file = out.join("seed.json");
+            if !seed_file.exists() {
+                if out.join("memories.jsonl").exists() {
+                    bail!("{} holds a memory but no seed.json: not a `notes` trial folder", out.display());
+                }
+                // The soul's memory as it stood before <from>: its notes up to
+                // the first one from the range, and every merge of those notes.
+                let own = MemoryLog::for_soul(&repo);
+                let notes = own.memories()?;
+                let n = notes.iter().position(|m| m.ts.as_str() >= *from).unwrap_or(notes.len());
+                trial.append_chunk(&notes[..n], &[])?;
+                let mut sums: Vec<_> = own
+                    .summaries()?
+                    .into_values()
+                    .filter(|s| ravel::memory::parse_block(&s.block).is_some_and(|(_, hi)| hi <= n))
+                    .collect();
+                sums.sort_by(|a, b| a.block.cmp(&b.block));
+                for s in &sums {
+                    trial.append_summary(s)?;
+                }
+                std::fs::write(
+                    &seed_file,
+                    serde_json::json!({ "notes": n, "from": from, "to": to, "soul": repo }).to_string(),
+                )?;
+                eprintln!("seeded {} with {n} notes and {} merges from before {from}", out.display(), sums.len());
+            }
+            let sp = speakers(&repo, &cfg);
+            let convs = ravel::memory_relive::load(&repo, &sp, &peer_index(&cfg))?;
+            let llm = ClaudeCode::new(model)?;
+            let r = ravel::memory_relive::relive(
+                &repo,
+                &sp,
+                &llm,
+                &trial,
+                &convs,
+                from,
+                to,
+                usize::MAX,
+                ravel::daemon::memory::SESSION_TOKENS,
+                &std::sync::atomic::AtomicBool::new(false),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            if r.stopped.is_some() {
+                std::process::exit(2);
+            }
+        }
+        ["notes-side", repo, out, from, to, rest @ ..] => {
+            let out = PathBuf::from(out);
+            let seed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("seed.json"))?)?;
+            let n = seed["notes"].as_u64().unwrap_or(0) as usize;
+            let own: Vec<_> = MemoryLog::for_soul(&PathBuf::from(repo))
+                .memories()?
+                .into_iter()
+                .filter(|m| m.ts.as_str() >= *from && m.ts.as_str() < *to)
+                .collect();
+            let trial: Vec<_> = MemoryLog::at(out).memories()?.into_iter().skip(n).collect();
+            let list = |ms: &[ravel::memory_log::Memory]| {
+                ms.iter().map(|m| format!("- {} {}\n", &m.ts[..16.min(m.ts.len())], m.text)).collect::<String>()
+            };
+            println!("# Notes for {from} to {to}\n");
+            match rest {
+                [] => {
+                    println!("## The soul's memory now ({} notes)\n\n{}", own.len(), list(&own));
+                    println!("## Trial ({} notes)\n\n{}", trial.len(), list(&trial));
+                }
+                [key_file] => {
+                    use sha2::Digest;
+                    let flip = sha2::Sha256::digest(format!("{from}{to}").as_bytes())[0] & 1 == 1;
+                    let (a, a_name, b, b_name) =
+                        if flip { (&own, "current", &trial, "trial") } else { (&trial, "trial", &own, "current") };
+                    println!("## A ({} notes)\n\n{}", a.len(), list(a));
+                    println!("## B ({} notes)\n\n{}", b.len(), list(b));
+                    std::fs::write(key_file, format!("A={a_name}\tB={b_name}\n"))?;
+                }
+                _ => bail!("one optional argument after <to>: a file to write the A/B key to"),
+            }
+        }
         ["rebuild", repo, out, model, rest @ ..] => {
             let repo = PathBuf::from(repo);
             let out = PathBuf::from(out);
@@ -193,7 +288,7 @@ fn main() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: cargo run --release --example relive -- plan|dump <soul-repo> <from> <to> | subagents <soul-repo> | rebuild <soul-repo> <out-dir> <model> [extra.txt]"
+            "usage: cargo run --release --example relive -- plan|dump <soul-repo> <from> <to> | subagents|unread|pass <soul-repo> | notes <soul-repo> <out-dir> <from> <to> <model> | notes-side <soul-repo> <out-dir> <from> <to> [key-file] | rebuild <soul-repo> <out-dir> <model> [extra.txt] | side <soul-repo> <out-dir> <min-notes> [every-nth-small] [key-file]"
         ),
     }
     Ok(())
