@@ -23,6 +23,9 @@ pub const SOUL_ID_LEN: usize = 6;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Soul {
     pub id: String,
+    /// The whole first commit, 40 characters: what a caller's token is
+    /// matched against. The id above is its first six.
+    pub genesis: String,
     /// Canonical (symlinks resolved), because that is what Claude Code names
     /// the transcript directory after.
     pub path: PathBuf,
@@ -71,6 +74,7 @@ pub fn soul_for(repo: &Path) -> Result<Soul> {
     }
     Ok(Soul {
         id: sha[..SOUL_ID_LEN].to_string(),
+        genesis: sha,
         path,
     })
 }

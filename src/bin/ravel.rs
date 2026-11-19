@@ -723,6 +723,9 @@ fn query(client: &Client, id: &str, q: &str) -> Result<()> {
         &format!("/souls/{id}/query"),
         Some(serde_json::json!({ "query": q })),
     )?;
+    for n in v["notes"].as_array().into_iter().flatten() {
+        eprintln!("note: {}", n.as_str().unwrap_or(""));
+    }
     if let Some(b) = v["boolean"].as_bool() {
         println!("{b}");
         return Ok(());
@@ -862,10 +865,16 @@ fn query_help() -> Result<String> {
     }
     out += r#"
 WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
-  Nothing is in the default graph: every pattern goes inside GRAPH, or the
-  query finds nothing.
-  - Each transcript is its own graph, so a query over every conversation
-    says GRAPH ?g { ... }.
+  A pattern outside GRAPH sees every graph in the store at once. Write
+  GRAPH only to narrow a question to one graph, or to learn which graph a
+  thing is in (GRAPH ?g { ... }).
+  - Each transcript is its own graph.
+  - A name from the shared base works too: subtexture:Thing finds turns and
+    memory, subtexture:relatedToId finds ravel:relatedToId. A base name
+    inside FILTER is compared as written and matches nothing; ravel prints
+    a note when a query has one.
+  - A short address is read against https://repolex.ai/, so
+    <ravel/Turn/<event id>> and GRAPH <ravel/NamedGraph/memory-v1> work.
   - optmem is the graph <https://repolex.ai/ravel/NamedGraph/memory-v1>. A
     note (memoryLevel 0) links to each turn it was written from, and a merge
     to its two halves, with <https://repolex.ai/ontology/ravel/relatedToId>.
@@ -876,7 +885,7 @@ THREE QUERIES THAT WORK AS WRITTEN
   Which models answered this soul, and how often:
     PREFIX ravel: <https://repolex.ai/ontology/ravel/>
     SELECT ?model (COUNT(?t) AS ?turns)
-    WHERE { GRAPH ?g { ?t a ravel:Turn ; ravel:model ?model } }
+    WHERE { ?t a ravel:Turn ; ravel:model ?model }
     GROUP BY ?model ORDER BY DESC(?turns)
   (Antigravity turns carry ravel:modelSetting instead of ravel:model.)
 

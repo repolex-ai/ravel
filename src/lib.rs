@@ -23,6 +23,7 @@ pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;
 pub mod memory_relive;
+pub mod outside;
 pub mod peers;
 pub mod project;
 pub mod reader;

@@ -11,6 +11,34 @@ use std::time::{Duration, Instant};
 pub struct Client {
     base: String,
     http: reqwest::blocking::Client,
+    /// This session's token, when the folder `ravel` was run in is a bound
+    /// soul. Sent on every call, so raveld knows who is asking.
+    token: Option<String>,
+}
+
+/// The caller's token: `RAVEL_TOKEN` when set, otherwise what
+/// `git lex identity token` prints in the current folder. git-lex keeps the
+/// signed token on disk and re-signs it only when it is half used, so this
+/// is a file read, not a signature, on almost every call. No token is not an
+/// error here: raveld says what it needs when a route needs one.
+pub fn session_token() -> Option<String> {
+    if let Ok(t) = std::env::var("RAVEL_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let out = std::process::Command::new("git")
+        .args(["lex", "identity", "token"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // A token is three base64url parts; anything else is a message, not a token.
+    (t.split('.').count() == 3 && !t.contains(char::is_whitespace)).then_some(t)
 }
 
 impl Client {
@@ -22,6 +50,7 @@ impl Client {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("http client"),
+            token: session_token(),
         }
     }
 
@@ -49,7 +78,8 @@ impl Client {
     }
 
     pub fn get(&self, path: &str) -> Result<Value> {
-        Self::finish(self.http.get(format!("{}{path}", self.base)).send()?)
+        let req = self.http.get(format!("{}{path}", self.base));
+        Self::finish(self.auth(req).send()?)
     }
 
     pub fn post(&self, path: &str, body: Option<Value>) -> Result<Value> {
@@ -58,7 +88,14 @@ impl Client {
             Some(b) => req.json(&b),
             None => req,
         };
-        Self::finish(req.send()?)
+        Self::finish(self.auth(req).send()?)
+    }
+
+    fn auth(&self, req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
     }
 }
 

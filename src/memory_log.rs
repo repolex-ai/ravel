@@ -645,7 +645,19 @@ mod tests {
             .collect();
         terms.sort();
         terms.dedup();
-        assert_eq!(terms, ["NamedGraph", "Thing", "relatedToId"]);
+        assert_eq!(
+            terms,
+            [
+                "DefaultGraph",
+                "NamedGraph",
+                "Thing",
+                "VisibilityValue",
+                "owner",
+                "readableBy",
+                "relatedToId",
+                "visibility"
+            ]
+        );
         for t in terms {
             let q = format!("ASK {{ <https://repolex.ai/ontology/subtexture/{t}> a ?k }}");
             let ok = matches!(

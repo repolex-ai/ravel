@@ -11,6 +11,7 @@
 //! soul costs about a second. One pass at a time per soul; passes for
 //! different souls do not overlap either — this is a backup, not a race.
 
+pub mod gate;
 pub mod config;
 pub mod http;
 pub mod memory;
@@ -113,6 +114,16 @@ pub struct Daemon {
     /// Souls whose transcripts gained turns their memory has not read. All
     /// of them at start: a restart catches up.
     memory_dirty: Mutex<std::collections::HashSet<String>>,
+    /// The machine's key list, grants and owner (`~/.lex/identity/`), read
+    /// through tessera. Checked on every request by `gate`.
+    pub keys: tessera::HostKeys,
+}
+
+/// Where git-lex keeps this machine's identity records.
+pub fn identity_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".lex")
+        .join("identity")
 }
 
 pub fn log(msg: impl AsRef<str>) {
@@ -144,6 +155,7 @@ impl Daemon {
             stopping: std::sync::atomic::AtomicBool::new(false),
             memory: Mutex::new(memory::MemoryState::default()),
             memory_dirty: Mutex::new(dirty),
+            keys: tessera::HostKeys::new(identity_dir().join("jwks.json")),
         })
     }
 

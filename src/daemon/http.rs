@@ -7,6 +7,7 @@
 //!   GET  /souls/{id}/health           the read-only diagnostic (findings + attention flag)
 //!   GET  /souls/{id}/stats            counts: quads, graphs, turns, dated turns, claims, top predicates
 //!   POST /souls/{id}/query  {query}   SPARQL, W3C results JSON
+//!   POST /stores/{id}/sparql          the same, by the W3C SPARQL protocol (raw query body; n-triples on CONSTRUCT)
 //!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
 //!   GET  /souls/{id}/memory[?lines=N] the memory wake view: OptMem's cover (default 96 lines)
 //!   GET  /souls/{id}/memory/{node}    one node opened: a block's two halves (`16-31`), a note's turns
@@ -52,8 +53,10 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
-pub async fn serve(d: Shared) -> anyhow::Result<()> {
-    let app = Router::new()
+/// Every route, behind the gate. Separate from `serve` so a test can stand
+/// it up on a port of its own.
+pub fn router(d: Shared) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/souls", get(souls))
         .route("/sync", post(sync_all))
@@ -66,8 +69,14 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .route("/souls/{id}/health", get(soul_health))
         .route("/souls/{id}/stats", get(soul_stats))
         .route("/souls/{id}/query", post(soul_query))
+        .route("/stores/{id}/sparql", post(store_sparql))
         .route("/shutdown", post(shutdown))
-        .with_state(d.clone());
+        .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
+        .with_state(d)
+}
+
+pub async fn serve(d: Shared) -> anyhow::Result<()> {
+    let app = router(d.clone());
     let addr = format!("127.0.0.1:{}", d.cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     super::log(format!("listening on http://{addr}"));
@@ -76,6 +85,9 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => super::log("interrupted; stopping"),
+                // `raveld stop` from a soul's session ends here: /shutdown is
+                // the machine owner's, the process signal is the OS user's.
+                _ = terminated() => super::log("SIGTERM; stopping"),
                 _ = stop.shutdown.notified() => super::log("asked to stop; stopping"),
             }
             stop.stopping
@@ -83,6 +95,18 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// The key list as tessera sees it, and whether reads need a token yet.
+fn identity_status(d: &Daemon) -> Value {
+    let s = d.keys.status();
+    json!({
+        "keys_file": s.keys_file.display().to_string(),
+        "squaddies_with_a_key": s.squaddies_with_a_key,
+        "error": s.error,
+        "machine_owner_recorded": matches!(d.keys.owner(), Ok(Some(_))),
+        "reads_need_a_token": super::gate::READS_NEED_A_TOKEN,
+    })
 }
 
 async fn health(State(d): State<Shared>) -> Json<Value> {
@@ -100,6 +124,7 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
         "passes": d.passes.load(std::sync::atomic::Ordering::Relaxed),
         "memory": d.memory_status(),
         "memory_state": d.memory_state(),
+        "identity": identity_status(&d),
     }))
 }
 
@@ -436,50 +461,142 @@ fn term_json(t: &Term) -> Value {
     }
 }
 
+async fn terminated() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending().await,
+    }
+}
+
+/// What a query produced, before it is given a shape for the wire.
+enum Answer {
+    /// W3C SPARQL results JSON, for SELECT and ASK.
+    Results(Value),
+    /// The statements of a CONSTRUCT or DESCRIBE, one N-Triples line each.
+    Triples(Vec<String>),
+}
+
+/// Run an outside query: prepared by `crate::outside` (base, calamus,
+/// every graph in view), then evaluated on the soul's store, read-only.
+fn answer(soul: &super::registry::Soul, text: &str) -> anyhow::Result<(Answer, Vec<String>)> {
+    let store = open_store(soul)?;
+    let (results, report) = crate::outside::run(&store, text)?;
+    let notes = crate::outside::notes(&report);
+    let a = match results {
+        QueryResults::Solutions(sols) => {
+            let vars: Vec<String> = sols
+                .variables()
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect();
+            let mut rows = Vec::new();
+            for s in sols {
+                let s = s?;
+                let mut row = serde_json::Map::new();
+                for (v, t) in s.iter() {
+                    row.insert(v.as_str().to_string(), term_json(t));
+                }
+                rows.push(Value::Object(row));
+            }
+            Answer::Results(json!({ "head": { "vars": vars }, "results": { "bindings": rows } }))
+        }
+        QueryResults::Boolean(b) => Answer::Results(json!({ "head": {}, "boolean": b })),
+        QueryResults::Graph(triples) => {
+            let mut out = Vec::new();
+            for t in triples {
+                out.push(t?.to_string());
+            }
+            Answer::Triples(out)
+        }
+    };
+    Ok((a, notes))
+}
+
+/// ravel's own route, JSON in and JSON out. `notes` is present only when
+/// the query holds a name that was left as written and will likely match
+/// nothing; the answer itself cannot say so.
 async fn soul_query(
     State(d): State<Shared>,
     Path(id): Path<String>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, ApiError> {
     let soul = d.soul(&id).map_err(not_found)?.clone();
-    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let store = open_store(&soul)?;
-        let results = SparqlEvaluator::new()
-            .parse_query(&body.query)?
-            .on_store(&store)
-            .execute()?;
-        Ok(match results {
-            QueryResults::Solutions(sols) => {
-                let vars: Vec<String> = sols
-                    .variables()
-                    .iter()
-                    .map(|v| v.as_str().to_string())
-                    .collect();
-                let mut rows = Vec::new();
-                for s in sols {
-                    let s = s?;
-                    let mut row = serde_json::Map::new();
-                    for (v, t) in s.iter() {
-                        row.insert(v.as_str().to_string(), term_json(t));
-                    }
-                    rows.push(Value::Object(row));
-                }
-                json!({ "head": { "vars": vars }, "results": { "bindings": rows } })
-            }
-            QueryResults::Boolean(b) => json!({ "head": {}, "boolean": b }),
-            QueryResults::Graph(triples) => {
-                let mut out = Vec::new();
-                for t in triples {
-                    out.push(t?.to_string());
-                }
-                json!({ "triples": out })
-            }
-        })
-    })
-    .await
-    .map_err(internal)?
-    .map_err(bad)?;
+    let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &body.query))
+        .await
+        .map_err(internal)?
+        .map_err(bad)?;
+    let mut v = match a {
+        Answer::Results(v) => v,
+        Answer::Triples(t) => json!({ "triples": t }),
+    };
+    if !notes.is_empty() {
+        v["notes"] = json!(notes);
+    }
     Ok(Json(v))
+}
+
+/// The W3C SPARQL protocol route, the same shape gitlexd and pand answer
+/// on, so a standard client (and Syrinx) needs nothing ravel-specific.
+/// The query is the raw body (`application/sparql-query`) or `{"query"}`
+/// (`application/json`). SELECT and ASK answer
+/// `application/sparql-results+json`; CONSTRUCT answers
+/// `application/n-triples`.
+async fn store_sparql(
+    State(d): State<Shared>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<Response, ApiError> {
+    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let kind = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let text = match kind.as_str() {
+        "application/sparql-query" => body,
+        "application/json" => serde_json::from_str::<QueryBody>(&body).map_err(bad)?.query,
+        other => {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!(
+                    "Content-Type {other:?} is not read here; send the query as                      application/sparql-query, or {{\"query\": ...}} as application/json"
+                ),
+            ))
+        }
+    };
+    let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &text))
+        .await
+        .map_err(internal)?
+        .map_err(bad)?;
+    let (ctype, out) = match a {
+        Answer::Results(v) => ("application/sparql-results+json", v.to_string()),
+        Answer::Triples(t) => {
+            let mut s = String::new();
+            for line in t {
+                s.push_str(&line);
+                s.push_str(" .\n");
+            }
+            ("application/n-triples", s)
+        }
+    };
+    let mut resp = (StatusCode::OK, out).into_response();
+    let h = resp.headers_mut();
+    h.insert(axum::http::header::CONTENT_TYPE, ctype.parse().unwrap());
+    // A standard body has no room for a note, so it rides a header.
+    if !notes.is_empty() {
+        if let Ok(v) = notes.join(" | ").parse() {
+            h.insert("x-ravel-notes", v);
+        }
+    }
+    Ok(resp)
 }
 
 /// `ravel optmem check`: the soul's memory against OptMem's rules and its
@@ -504,4 +621,64 @@ async fn memory_check(
 async fn shutdown(State(d): State<Shared>) -> Json<Value> {
     d.shutdown.notify_one();
     Json(json!({ "ok": true, "stopping": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::config::DaemonConfig;
+
+    /// A raveld with no souls and an empty key list, on a port of its own.
+    async fn stand_up() -> String {
+        let dir = std::env::temp_dir().join(format!("ravel-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("jwks.json"), r#"{"keys":[]}"#).unwrap();
+        let cfg = DaemonConfig {
+            path: dir.join("config.yml"),
+            present: false,
+            port: 0,
+            interval_secs: 3600,
+            souls: vec![],
+            human: None,
+            memory: None,
+            warnings: vec![],
+        };
+        let mut d = Daemon::open(cfg).unwrap();
+        d.keys = tessera::HostKeys::new(dir.join("jwks.json"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(Arc::new(d))).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn status(req: reqwest::RequestBuilder) -> (u16, bool) {
+        let r = req.send().await.unwrap();
+        (r.status().as_u16(), r.headers().contains_key("www-authenticate"))
+    }
+
+    #[tokio::test]
+    async fn the_gate_stands_in_front_of_every_route() {
+        let base = stand_up().await;
+        let c = reqwest::Client::new();
+        // Open to anyone on the machine.
+        assert_eq!(status(c.get(format!("{base}/health"))).await.0, 200);
+        assert_eq!(status(c.get(format!("{base}/souls"))).await.0, 200);
+        // No token: stopping raveld and writing are refused, and say how to ask.
+        assert_eq!(status(c.post(format!("{base}/shutdown"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/sync"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/souls/9bdf2a/sync"))).await, (401, true));
+        // No token on a read passes the gate for now; no such soul, so 404.
+        assert_eq!(status(c.get(format!("{base}/souls/9bdf2a/stats"))).await.0, 404);
+        // A token that is sent and is not good is refused, reads included.
+        let bad = c.get(format!("{base}/souls/9bdf2a/stats")).bearer_auth("abc.def.ghi");
+        assert_eq!(status(bad).await, (401, true));
+        let basic = c
+            .get(format!("{base}/souls/9bdf2a/stats"))
+            .header("authorization", "Basic abc");
+        assert_eq!(status(basic).await.0, 401);
+        // /health still answers after all of that: nothing was stopped.
+        let h: Value = c.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(h["identity"]["reads_need_a_token"], false);
+        assert_eq!(h["identity"]["squaddies_with_a_key"], 0);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ravel"
-version = "0.9.11"
+version = "0.9.12"
 edition = "2021"
 description = "Transcript-graph engine: a transcript becomes a graph of meaning. git-lex / Pool sibling."
 license = "Apache-2.0"
@@ -37,3 +37,10 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_yaml = "0.9"
+# Outside queries are prepared by the stack's shared crate (m4xx's) before
+# the store sees them: ontology rewriting now, short addresses at the cutover.
+calamus = { git = "https://github.com/repolex-ai/calamus", features = ["turtle"] }
+# Who is asking, and whether they may: the stack's shared crate (tr1pl3x's).
+tessera = { git = "https://github.com/repolex-ai/tessera" }
+# The parsed-query type calamus and oxigraph share; oxigraph picks the 0.4.x.
+spargebra = { version = "0.4.6", features = ["sparql-12"] }
