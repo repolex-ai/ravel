@@ -528,7 +528,27 @@ pub fn agy_workspace_map(store_root: &Path) -> Result<Vec<(String, Vec<String>)>
 /// decision, not an oversight. Until then the ids are reported and the fix is
 /// one command, named in the message.
 pub fn agy_conversations_for(repo: &Path) -> Result<(Vec<AgyConversation>, Vec<String>)> {
-    let root = agy_store_root()?;
+    agy_conversations_in(&agy_store_root()?, repo)
+}
+
+/// [`agy_conversations_for`] against a named store root.
+///
+/// A conversation is this soul's on either of two grounds:
+///   - **by workspace**: `history.jsonl` records it under a folder that is
+///     this repo today;
+///   - **proven**: this repo's mirror already holds it, and every folder it
+///     is recorded under is gone. `history.jsonl` keeps the path a prompt was
+///     typed in, for good, so renaming a soul's folder leaves all its older
+///     conversations pointing at a folder that no longer exists. Without this
+///     they would belong to no soul and stop being read, with nothing said
+///     (found before TR1P.L3X was renamed, 2026-11-19). The mirror sits inside
+///     the repo and moves with it, and conversation ids are unique, so a copy
+///     already here is evidence, the same rule the claude-code side uses for
+///     a renamed session directory ([`sibling_slugs_for`]).
+///
+/// A conversation whose folder still exists somewhere else is never claimed
+/// this way: it has a live owner.
+fn agy_conversations_in(root: &Path, repo: &Path) -> Result<(Vec<AgyConversation>, Vec<String>)> {
     let brain = root.join("brain");
     if !brain.is_dir() {
         return Ok((Vec::new(), Vec::new()));
@@ -537,20 +557,32 @@ pub fn agy_conversations_for(repo: &Path) -> Result<(Vec<AgyConversation>, Vec<S
         .canonicalize()
         .with_context(|| format!("canonicalize soul repo {}", repo.display()))?;
 
-    let map = agy_workspace_map(&root)?;
+    let map = agy_workspace_map(root)?;
     let mut mine: Vec<AgyConversation> = Vec::new();
     let mut placed: std::collections::HashSet<String> = Default::default();
+    let mut taken: std::collections::HashSet<String> = Default::default();
+    // Conversations recorded under at least one folder that still exists.
+    let mut housed: std::collections::HashSet<String> = Default::default();
     for (ws, ids) in &map {
-        let same = Path::new(ws)
-            .canonicalize()
-            .map(|p| p == abs)
-            .unwrap_or(false);
+        let at = Path::new(ws).canonicalize().ok();
+        let same = at.as_ref() == Some(&abs);
         for id in ids {
             placed.insert(id.clone());
-            if same {
+            if at.is_some() {
+                housed.insert(id.clone());
+            }
+            if same && taken.insert(id.clone()) {
                 if let Some(c) = agy_transcript_for(&brain, id) {
                     mine.push(c);
                 }
+            }
+        }
+    }
+    let mirror = repo.join(AGY_TRANSCRIPTS_SUBDIR);
+    for id in placed.iter().filter(|id| !housed.contains(*id)) {
+        if mirror.join(format!("{id}.jsonl")).is_file() && taken.insert(id.clone()) {
+            if let Some(c) = agy_transcript_for(&brain, id) {
+                mine.push(c);
             }
         }
     }
@@ -734,9 +766,25 @@ fn sync_agy_one(
     Ok(())
 }
 
+/// A soul is a git repo. When its folder is renamed while raveld runs, the
+/// path raveld was started with is simply gone, and a pass that makes the
+/// folders it needs would build an empty soul at the old name and fill it
+/// with a second, partial store: that happened to lUX within a minute of its
+/// rename (2026-11-19). A pass never creates the soul it serves.
+fn refuse_a_folder_that_is_not_a_repo(repo: &Path) -> Result<()> {
+    if repo.join(".git").exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} is not a git repo (moved or renamed?); nothing was written there. Put its new path under souls: in the raveld config and run `raveld restart`",
+        repo.display()
+    )
+}
+
 /// Bring one soul's ravel fully up to date: mirror then ingest-the-mirror.
 /// `sessions_src` defaults to the Claude Code dir for this repo.
 pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> {
+    refuse_a_folder_that_is_not_a_repo(repo)?;
     migrate_legacy_layout(repo)?;
     let src = match sessions_src {
         Some(p) => p.to_path_buf(),
@@ -1752,6 +1800,11 @@ mod tests {
             ),
         )
         .unwrap();
+        // A pass never creates the soul it serves: no repo, nothing written.
+        let refused = sync_soul(&repo, Some(&src)).unwrap_err();
+        assert!(format!("{refused:#}").contains("is not a git repo"));
+        assert!(!repo.join(STORE_SUBDIR).exists());
+        fs::create_dir_all(repo.join(".git")).unwrap();
         sync_soul(&repo, Some(&src)).unwrap();
         let store = graph::open(repo.join(STORE_SUBDIR)).unwrap();
         let rows = graph::query_rows(&store, "SELECT (COUNT(*) AS ?n) (COUNT(DISTINCT ?t) AS ?d) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
@@ -2023,6 +2076,79 @@ mod tests {
     /// `history.jsonl` is the agy analogue of the claude path slug: rows carry
     /// `workspace` + `conversationId`, a conversation repeats across many rows,
     /// and the earliest rows have no conversation yet.
+    /// A soul's folder is renamed: its older conversations still name the old
+    /// path. The ones its mirror holds stay its own; a neighbour's do not move
+    /// in; one whose folder still exists elsewhere is left to its owner.
+    #[test]
+    fn agy_conversations_follow_a_renamed_soul_by_its_mirror() {
+        let base = std::env::temp_dir().join("ravel-agy-test-renamed");
+        fs::remove_dir_all(&base).ok();
+        let root = base.join("store");
+        let soul = base.join("tr1p-l3x");
+        let other = base.join("kira");
+        let gone = base.join("TR1P.L3X-was-here");
+        let gone_other = base.join("someone-else-was-here");
+        for d in [&soul, &other] {
+            fs::create_dir_all(d.join(AGY_TRANSCRIPTS_SUBDIR)).unwrap();
+        }
+        for id in [
+            "old-mine",
+            "new-mine",
+            "old-stranger",
+            "old-kira",
+            "moved-live",
+        ] {
+            let logs = root.join("brain").join(id).join(".system_generated/logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("transcript_full.jsonl"), "{}\n").unwrap();
+        }
+        let row = |ws: &Path, id: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"workspace": ws.to_string_lossy(), "conversationId": id})
+            )
+        };
+        fs::write(
+            root.join("history.jsonl"),
+            [
+                row(&gone, "old-mine"),
+                row(&soul, "new-mine"),
+                row(&gone_other, "old-stranger"),
+                row(&gone, "old-kira"),
+                row(&other, "moved-live"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        // This soul's mirror holds its own old conversation, and (as it can
+        // after a shared past) one that now lives in kira's folder.
+        for id in ["old-mine", "moved-live"] {
+            fs::write(
+                soul.join(AGY_TRANSCRIPTS_SUBDIR)
+                    .join(format!("{id}.jsonl")),
+                "{}\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            other.join(AGY_TRANSCRIPTS_SUBDIR).join("old-kira.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let ids = |repo: &Path| -> Vec<String> {
+            let (mine, unattributed) = agy_conversations_in(&root, repo).unwrap();
+            assert!(
+                unattributed.is_empty(),
+                "every conversation is in history.jsonl"
+            );
+            mine.into_iter().map(|c| c.id).collect()
+        };
+        assert_eq!(ids(&soul), ["new-mine", "old-mine"]);
+        assert_eq!(ids(&other), ["moved-live", "old-kira"]);
+        fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn agy_workspace_map_groups_and_dedupes() {
         let root = std::env::temp_dir().join("ravel-agy-test-history");
