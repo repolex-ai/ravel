@@ -18,6 +18,7 @@ pub mod claude_ai;
 pub mod client;
 pub mod daemon;
 pub mod graph;
+pub mod herdr;
 pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;

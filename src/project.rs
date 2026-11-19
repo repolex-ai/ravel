@@ -108,6 +108,21 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
         if let Some(m) = &e.model_setting {
             nt.push_str(&format!("<{s}> <{p_setting}> {} .\n", lit(m)));
         }
+        // A herdr sender line, on input only: what the sender says of itself.
+        if e.role == "user" {
+            if let Some(c) = e.text.as_deref().and_then(crate::herdr::sender_claim) {
+                for (name, v) in [
+                    ("claimedSender", c.from),
+                    ("claimedSenderPane", c.pane),
+                    ("claimedSenderSession", c.session),
+                    ("claimedSenderSoul", c.soul),
+                ] {
+                    if let Some(v) = v {
+                        nt.push_str(&format!("<{s}> <{RAVEL_NS}{name}> {} .\n", lit(&v)));
+                    }
+                }
+            }
+        }
     }
 
     Ok(nt)
@@ -150,7 +165,26 @@ mod tests {
             actions: Vec::new(),
             outcomes: Vec::new(),
         };
-        let nt = project_nt(&[e], "urn:test:").unwrap();
+        let said = Event {
+            event_id: "e2".into(),
+            role: "user".into(),
+            text: Some(
+                "--herdr v=1 from=th34 pane=w9:p1 session=80992ee3 soul=9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b--\nhello"
+                    .into(),
+            ),
+            ..e.clone()
+        };
+        // The same line in a reply is the soul quoting it, not a sender.
+        let quoted = Event {
+            event_id: "e3".into(),
+            role: "assistant".into(),
+            ..said.clone()
+        };
+        let nt = project_nt(&[quoted], "urn:test:").unwrap();
+        assert!(!nt.contains("claimedSender"));
+        let nt = project_nt(&[e, said], "urn:test:").unwrap();
+        assert!(nt.contains("claimedSender> \"th34\""));
+        assert!(nt.contains("claimedSenderSoul> \"9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b\""));
         let mut terms: Vec<String> = nt
             .split_whitespace()
             .filter_map(|w| w.strip_prefix(&format!("<{RAVEL_NS}")))
