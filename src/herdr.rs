@@ -5,7 +5,7 @@
 //! 2026-11-18) puts one fixed line first:
 //!
 //! ```text
-//! --herdr v=1 from=<name> pane=<pane-id> session=<harness-session-id> soul=<40 hex>--
+//! --herdr v=1 from=<name> pane=<pane-id> session=<harness-session-id> soul=<40 hex> user=<username>--
 //! ```
 //!
 //! alone on the first line, the body unchanged after it. Everything on it is
@@ -26,6 +26,21 @@ pub struct SenderClaim {
     /// The sender's first commit, all 40 characters. Dropped unless it is
     /// exactly 40 hex characters: a shortened id names more than one soul.
     pub soul: Option<String>,
+    /// The sender's permanent username (`soul.Soul.username`), added to the
+    /// line on 2026-11-19. Dropped unless it fits the stack's slug rule,
+    /// `^[a-z0-9]+(-[a-z0-9]+)*$`: it is the `{user}` part of an address.
+    pub user: Option<String>,
+}
+
+/// The stack's slug rule for a username.
+fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
 }
 
 /// Claude Code wraps a long pasted or typed-in input in this pair of lines;
@@ -54,6 +69,7 @@ pub fn sender_claim(text: &str) -> Option<SenderClaim> {
         pane: None,
         session: None,
         soul: None,
+        user: None,
     };
     for kv in keys {
         let (k, v) = kv.split_once('=')?;
@@ -68,6 +84,7 @@ pub fn sender_claim(text: &str) -> Option<SenderClaim> {
             "soul" => {
                 c.soul = v.filter(|s| s.len() == 40 && s.chars().all(|ch| ch.is_ascii_hexdigit()))
             }
+            "user" => c.user = v.filter(|s| is_slug(s)),
             _ => {}
         }
     }
@@ -77,6 +94,18 @@ pub fn sender_claim(text: &str) -> Option<SenderClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_username_is_kept_only_when_it_is_a_slug() {
+        let l = |u: &str| format!("--herdr v=1 from=m4xx soul={SOUL} user={u} id=ab--");
+        assert_eq!(sender_claim(&l("m4xx")).unwrap().user.as_deref(), Some("m4xx"));
+        assert_eq!(sender_claim(&l("tr1p-l3x")).unwrap().user.as_deref(), Some("tr1p-l3x"));
+        for bad in ["spaceGOAT", "a--b", "-a", "a-", "a/b", "a.b"] {
+            let c = sender_claim(&l(bad)).unwrap();
+            assert_eq!(c.user, None, "{bad}");
+            assert_eq!(c.from.as_deref(), Some("m4xx"), "the rest of the line still reads");
+        }
+    }
 
     const SOUL: &str = "9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b";
 
@@ -91,6 +120,7 @@ mod tests {
             pane: Some("w9:p1".into()),
             session: Some("80992ee3-b99f".into()),
             soul: Some(SOUL.into()),
+            user: None,
         };
         assert_eq!(
             sender_claim(&format!("{}\nhello", line())),
@@ -134,7 +164,8 @@ mod tests {
                 from: None,
                 pane: Some("w1:p1".into()),
                 session: None,
-                soul: None
+                soul: None,
+                user: None,
             }
         );
     }

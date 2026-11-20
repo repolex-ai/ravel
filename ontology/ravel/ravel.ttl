@@ -59,7 +59,7 @@
     a owl:Ontology ;
     rdfs:label "Ravel ontology" ;
     rdfs:comment "Transcript-graph vocabulary: conversational turns and the reader-annotation layer over them. Graph-only — no authored documents." ;
-    owl:versionInfo "0.9.0" .
+    owl:versionInfo "0.9.1" .
 
 # ─── The spine ───────────────────────────────────────────────────────────────
 
@@ -152,6 +152,12 @@ ravel:claimedSenderSession a owl:DatatypeProperty ;
 ravel:claimedSenderSoul a owl:DatatypeProperty ;
     rdfs:label "claimedSenderSoul" ;
     rdfs:comment "The first commit, all 40 characters, the sender of this turn gave as its soul. A claim, not proof; written only when it is exactly 40 hex characters." ;
+    rdfs:domain ravel:Turn ;
+    rdfs:range xsd:string .
+
+ravel:claimedSenderUser a owl:DatatypeProperty ;
+    rdfs:label "claimedSenderUser" ;
+    rdfs:comment "The username the sender of this turn gave for itself. A claim, not proof; written only when it fits the username rule (lowercase letters and digits, single dashes between)." ;
     rdfs:domain ravel:Turn ;
     rdfs:range xsd:string .
 

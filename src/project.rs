@@ -116,6 +116,7 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
                     ("claimedSenderPane", c.pane),
                     ("claimedSenderSession", c.session),
                     ("claimedSenderSoul", c.soul),
+                    ("claimedSenderUser", c.user),
                 ] {
                     if let Some(v) = v {
                         nt.push_str(&format!("<{s}> <{RAVEL_NS}{name}> {} .\n", lit(&v)));
