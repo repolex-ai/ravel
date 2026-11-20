@@ -159,9 +159,17 @@ impl Daemon {
         })
     }
 
-    /// A soul by its six-character id, or by a path inside it.
+    /// A soul by its six-character id, by its username (the name pand and
+    /// Syrinx use in a URL), or by a path inside it.
     pub fn soul(&self, id_or_path: &str) -> Result<&Soul> {
         if let Some(s) = self.souls.iter().find(|s| s.id == id_or_path) {
+            return Ok(s);
+        }
+        if let Some(s) = self.souls.iter().find(|s| {
+            crate::names::Names::for_soul(&s.path)
+                .ok()
+                .is_some_and(|n| n.username() == Some(id_or_path))
+        }) {
             return Ok(s);
         }
         if let Ok(p) = std::path::Path::new(id_or_path).canonicalize() {
