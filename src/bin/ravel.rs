@@ -180,11 +180,22 @@ fn main() -> Result<()> {
 /// Which soul: the id given, the soul whose repo contains the path given, or
 /// the soul whose repo contains the current directory.
 fn resolve(client: &Client, given: Option<&str>) -> Result<String> {
-    let souls = client.get("/souls")?;
+    let souls = client.get("/ravel/stores")?;
     let souls = souls.as_array().cloned().unwrap_or_default();
     if let Some(g) = given {
-        if souls.iter().any(|s| s["id"] == g) {
-            return Ok(g.to_string());
+        // A username, or squad/username when two squads share one.
+        let named: Vec<String> = souls
+            .iter()
+            .filter(|s| s["store"] == g || address(s).as_deref() == Some(g))
+            .filter_map(address)
+            .collect();
+        match named.as_slice() {
+            [one] => return Ok(one.clone()),
+            [] => {}
+            many => anyhow::bail!(
+                "{g:?} names more than one soul; say which: {}",
+                many.join(", ")
+            ),
         }
         let p = std::path::Path::new(g)
             .canonicalize()
@@ -197,11 +208,13 @@ fn resolve(client: &Client, given: Option<&str>) -> Result<String> {
 
 /// Whether `s` names a soul raveld serves, by id or by a path inside it.
 fn names_soul(client: &Client, s: &str) -> bool {
-    let Ok(souls) = client.get("/souls") else {
+    let Ok(souls) = client.get("/ravel/stores") else {
         return false;
     };
     let souls = souls.as_array().cloned().unwrap_or_default();
-    souls.iter().any(|x| x["id"] == s)
+    souls
+        .iter()
+        .any(|x| x["store"] == s || address(x).as_deref() == Some(s))
         || std::path::Path::new(s)
             .canonicalize()
             .is_ok_and(|p| by_path(&souls, &p).is_some())
@@ -210,10 +223,10 @@ fn names_soul(client: &Client, s: &str) -> bool {
 /// A soul's name: its folder's.
 fn soul_name(client: &Client, id: &str) -> String {
     client
-        .get("/souls")
+        .get("/ravel/stores")
         .ok()
         .and_then(|v| {
-            v.as_array()?.iter().find(|s| s["id"] == id).and_then(|s| {
+            v.as_array()?.iter().find(|s| address(s).as_deref() == Some(id)).and_then(|s| {
                 std::path::Path::new(s["path"].as_str()?)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -231,7 +244,13 @@ fn by_path(souls: &[Value], p: &std::path::Path) -> Option<String> {
                 .map(|sp| p.starts_with(sp))
                 .unwrap_or(false)
         })
-        .and_then(|s| s["id"].as_str().map(str::to_string))
+        .and_then(address)
+}
+
+/// How a soul is named to raveld: `squad/username`, the two path segments
+/// after `/ravel/`. None for a repo with no squad and username yet.
+fn address(s: &Value) -> Option<String> {
+    Some(format!("{}/{}", s["org"].as_str()?, s["store"].as_str()?))
 }
 
 fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
@@ -243,7 +262,7 @@ fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
             .map(|s| {
                 format!(
                     "    {}  {}",
-                    s["id"].as_str().unwrap_or("(no username yet)"),
+                    s["store"].as_str().unwrap_or("(no username yet)"),
                     s["path"].as_str().unwrap_or("?")
                 )
             })
@@ -252,7 +271,7 @@ fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
     };
     let eg = souls
         .first()
-        .and_then(|s| s["id"].as_str())
+        .and_then(|s| s["store"].as_str())
         .unwrap_or("<username>");
     anyhow!(
         "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by username or path:\n    ravel status {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
@@ -288,7 +307,7 @@ fn status(cfg: &DaemonConfig, client: &Client) -> Result<()> {
 }
 
 fn souls(client: &Client) -> Result<()> {
-    let souls = client.get("/souls")?;
+    let souls = client.get("/ravel/stores")?;
     let rows = souls.as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
         println!("  (no souls registered)");
@@ -297,7 +316,7 @@ fn souls(client: &Client) -> Result<()> {
         let last = &s["last"];
         println!(
             "  {}  {}\n      last pass {}  {}",
-            s["id"].as_str().unwrap_or("(no username yet)"),
+            address(&s).as_deref().unwrap_or("(no username yet)"),
             s["path"].as_str().unwrap_or("?"),
             s["last_sync"].as_str().unwrap_or("never"),
             match s["last_error"].as_str() {
@@ -378,7 +397,7 @@ fn biography(client: &Client, id: &str) -> Result<()> {
 /// `ravel optmem wake`: optmem's whole index, as its section of the
 /// biography.
 fn optmem_wake(client: &Client, id: &str) -> Result<()> {
-    let v = client.get(&format!("/souls/{id}/memory"))?;
+    let v = client.get(&format!("/ravel/{id}/memory"))?;
     println!("## {OPTMEM_IS}");
     let lines = v["lines"].as_array().cloned().unwrap_or_default();
     if lines.is_empty() {
@@ -400,7 +419,7 @@ fn optmem_wake(client: &Client, id: &str) -> Result<()> {
 /// soul's stands, and the commands, so a bare `ravel optmem` cannot pour
 /// 25,000 characters into a context (goodlux, 2026-11-12).
 fn optmem(client: &Client, id: &str) -> Result<()> {
-    let v = client.get(&format!("/souls/{id}/memory"))?;
+    let v = client.get(&format!("/ravel/{id}/memory"))?;
     println!("{OPTMEM_IS}.");
     println!("raveld writes it every 10 minutes from new conversation turns.\n");
     println!(
@@ -409,10 +428,10 @@ fn optmem(client: &Client, id: &str) -> Result<()> {
         v["memories"],
         v["summaries"]
     );
-    let row = client.get("/souls").ok().and_then(|s| {
+    let row = client.get("/ravel/stores").ok().and_then(|s| {
         s.as_array()?
             .iter()
-            .find(|x| x["id"] == id)
+            .find(|x| address(x).as_deref() == Some(id))
             .and_then(|x| memory_line(&x["memory"]))
     });
     if let Some(l) = row {
@@ -433,7 +452,7 @@ fn optmem_open(client: &Client, id: &str, node: &str) -> Result<()> {
     // `#12` is how a note is written, but `#` would end the URL path, so the
     // daemon would only ever see `/memory/` and answer 404.
     let node = node.trim_start_matches('#');
-    let v = client.get(&format!("/souls/{id}/memory/{node}"))?;
+    let v = client.get(&format!("/ravel/{id}/memory/{node}"))?;
     if v["kind"] == "block" {
         print_lines(v["children"].as_array().map(Vec::as_slice).unwrap_or(&[]));
         return Ok(());
@@ -481,7 +500,7 @@ fn optmem_recall(client: &Client, id: &str, term: &str) -> Result<()> {
         |var: &str| format!("FILTER(CONTAINS(LCASE({var}), {lit}) && REGEX({var}, {re}, \"i\"))");
     let q = |sparql: String| -> Result<Vec<Value>> {
         let v = client.post(
-            &format!("/souls/{id}/query"),
+            &format!("/ravel/{id}/query"),
             Some(serde_json::json!({ "query": format!("PREFIX ravel: <{ns}>\n{sparql}") })),
         )?;
         Ok(v["results"]["bindings"]
@@ -563,7 +582,7 @@ fn import(client: &Client, id: &str, dir: &str) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("{dir} does not exist"))?;
     let v = client.post(
-        &format!("/souls/{id}/import"),
+        &format!("/ravel/{id}/import"),
         Some(serde_json::json!({ "path": abs.display().to_string() })),
     )?;
     let s = &v["summary"];
@@ -597,7 +616,7 @@ fn sync(client: &Client, id: &str, sessions_dir: Option<&str>) -> Result<()> {
             .unwrap_or_else(|_| d.to_string());
         serde_json::json!({ "sessions_dir": abs })
     });
-    let v = client.post(&format!("/souls/{id}/sync"), body)?;
+    let v = client.post(&format!("/ravel/{id}/sync"), body)?;
     let s = &v["summary"];
     println!(
         "[ravel sync] {id} claude-code: mirrored {} (unchanged {}) → ingested {} session(s) ({} skipped unchanged), {} turns, {} emojikeys",
@@ -651,7 +670,7 @@ fn memory_line(m: &Value) -> Option<String> {
 /// `ravel status <soul>`: the health check, the store's counts and the
 /// memory, in one place. Exit 1 when the health check wants attention.
 fn soul_status(client: &Client, id: &str) -> Result<()> {
-    let v = client.get(&format!("/souls/{id}/health"))?;
+    let v = client.get(&format!("/ravel/{id}/health"))?;
     println!("[ravel status] {id} {}", v["path"].as_str().unwrap_or("?"));
     for f in v["findings"].as_array().unwrap_or(&Vec::new()) {
         println!(
@@ -665,7 +684,7 @@ fn soul_status(client: &Client, id: &str) -> Result<()> {
         );
     }
     let attention = v["attention"].as_bool().unwrap_or(false);
-    if let Ok(st) = client.get(&format!("/souls/{id}/stats")) {
+    if let Ok(st) = client.get(&format!("/ravel/{id}/stats")) {
         println!(
             "  store: {} turns ({} dated, {} to {}), {} quads in {} graphs, {} unasserted claims",
             st["turns"],
@@ -677,16 +696,16 @@ fn soul_status(client: &Client, id: &str) -> Result<()> {
             st["claims"]
         );
     }
-    if let Ok(p) = client.get(&format!("/souls/{id}/memory-progress")) {
+    if let Ok(p) = client.get(&format!("/ravel/{id}/memory-progress")) {
         println!(
             "  memory: {} notes, {} merges ({} due), {} of {} turns read",
             p["memories"], p["blocks"], p["pending_blocks"], p["turns_read"], p["turns"]
         );
     }
-    let souls = client.get("/souls")?;
+    let souls = client.get("/ravel/stores")?;
     if let Some(m) = souls
         .as_array()
-        .and_then(|a| a.iter().find(|s| s["id"] == id))
+        .and_then(|a| a.iter().find(|s| address(s).as_deref() == Some(id)))
         .and_then(|s| memory_line(&s["memory"]))
     {
         println!("  last memory pass {m}");
@@ -707,7 +726,7 @@ fn soul_status(client: &Client, id: &str) -> Result<()> {
 
 /// `ravel optmem check`: every failure by name; exit 1 on any.
 fn optmem_check(client: &Client, id: &str) -> Result<()> {
-    let v = client.get(&format!("/souls/{id}/memory-check"))?;
+    let v = client.get(&format!("/ravel/{id}/memory-check"))?;
     let c = &v["check"];
     println!(
         "[ravel optmem check] {id}: {} notes, {} merges, {} turn links, {} wake lines",
@@ -726,7 +745,7 @@ fn optmem_check(client: &Client, id: &str) -> Result<()> {
 
 fn query(client: &Client, id: &str, q: &str) -> Result<()> {
     let v = client.post(
-        &format!("/souls/{id}/query"),
+        &format!("/ravel/{id}/query"),
         Some(serde_json::json!({ "query": q })),
     )?;
     for n in v["notes"].as_array().into_iter().flatten() {

@@ -159,40 +159,35 @@ impl Daemon {
         })
     }
 
-    /// A soul as a caller names it in a URL: by its username, or by a path
-    /// inside its repo. Never by a hash: the six-character id is refused
-    /// here like any other unknown name, with the names that do work
-    /// (goodlux, 2026-11-20: usernames across the board, one way to say who).
-    pub fn soul_named(&self, name_or_path: &str) -> Result<&Soul> {
+    /// A soul as a URL names it: `/ravel/{org}/{store}/...`, org its squad
+    /// and store its username. Never a hash: an id here is refused like any
+    /// other unknown name, with the names that do work (goodlux,
+    /// 2026-11-20: usernames across the board, one way to say who).
+    pub fn soul_named(&self, org: &str, store: &str) -> Result<&Soul> {
+        let want = format!("{org}/{store}");
         if let Some(s) = self
             .souls
             .iter()
-            .find(|s| s.name().as_deref() == Some(name_or_path))
+            .find(|s| s.address().as_deref() == Some(want.as_str()))
         {
             return Ok(s);
         }
-        if name_or_path.contains('/') {
-            if let Ok(p) = std::path::Path::new(name_or_path).canonicalize() {
-                if let Some(s) = self.souls.iter().find(|s| p.starts_with(&s.path)) {
-                    return Ok(s);
-                }
-            }
-        }
-        let mut names: Vec<String> = self.souls.iter().filter_map(|s| s.name()).collect();
+        let mut names: Vec<String> = self.souls.iter().filter_map(|s| s.address()).collect();
         names.sort();
         let nameless: Vec<String> = self
             .souls
             .iter()
-            .filter(|s| s.name().is_none())
+            .filter(|s| s.address().is_none())
             .map(|s| s.path.display().to_string())
             .collect();
         let mut msg = format!(
-            "no soul named {name_or_path:?}. A soul is named by its username: {}",
+            "raveld has no store {want:?}. A store is /ravel/{{squad}}/{{username}}: {}",
             names.join(", ")
         );
         if !nameless.is_empty() {
             msg += &format!(
-                ". {} served repo(s) have no username in .lex/repo.yml and cannot be named                  until `git lex kit-update` writes one: {}",
+                ". {} served repo(s) have no squad and username in .lex/repo.yml and cannot be \
+                 named until `git lex kit-update` writes them: {}",
                 nameless.len(),
                 nameless.join(", ")
             );

@@ -98,7 +98,7 @@ fn refuse_if_already_running() {
 fn stop_all() {
     // Ask nicely first, so an in-flight sync pass finishes its write.
     if let Ok(cfg) = DaemonConfig::load() {
-        let _ = Client::new(&cfg).post("/shutdown", None);
+        let _ = Client::new(&cfg).post("/ravel/shutdown", None);
     }
     let pids = client::other_daemons();
     if pids.is_empty() {
@@ -183,7 +183,7 @@ fn status() -> Result<()> {
             println!(
                 "  serving {} for {} soul(s); {} pass(es) since start; config {}{}",
                 cfg.base_url(),
-                h["souls"].as_array().map(|a| a.len()).unwrap_or(0),
+                h["served"].as_u64().unwrap_or(0),
                 h["passes"].as_u64().unwrap_or(0),
                 h["config"].as_str().unwrap_or("?"),
                 if h["config_present"].as_bool().unwrap_or(false) {
@@ -197,12 +197,12 @@ fn status() -> Result<()> {
                     println!("  CONFIG PROBLEM: {}", p.as_str().unwrap_or("?"));
                 }
             }
-            if let Ok(souls) = client.get("/souls") {
+            if let Ok(souls) = client.get("/ravel/stores") {
                 for s in souls.as_array().unwrap_or(&Vec::new()) {
                     let last = &s["last"];
                     println!(
                         "  {}  {}  last pass {}  {}",
-                        s["id"].as_str().unwrap_or("?"),
+                        s["store"].as_str().unwrap_or("(no username yet)"),
                         s["path"].as_str().unwrap_or("?"),
                         s["last_sync"].as_str().unwrap_or("never"),
                         match s["last_error"].as_str() {

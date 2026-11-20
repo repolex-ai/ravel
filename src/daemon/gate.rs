@@ -7,10 +7,10 @@
 //!
 //! | Route | Needs |
 //! |---|---|
-//! | `GET /health`, `GET /souls` | nothing: gitlexd, pand and Syrinx leave the same two open, and Syrinx finds stores through `/souls` |
+//! | `GET /ravel/health`, `GET /ravel/stores` | nothing: gitlexd, pand and Syrinx leave the same two open, and Syrinx finds stores through `/ravel/stores` |
 //! | every read of a soul | a token is not required YET; one that is sent must be good, and a service's grant must say `ravel:read` |
-//! | `POST /souls/{id}/sync`, `/import` | that soul, or the machine owner; a service also needs `ravel:write` |
-//! | `POST /sync`, `POST /shutdown` | the machine owner |
+//! | `POST /ravel/{org}/{store}/sync`, `/import` | that soul, or the machine owner; a service also needs `ravel:write` |
+//! | `POST /ravel/sync`, `POST /ravel/shutdown` | the machine owner |
 //!
 //! "Not required yet" is the stack's Phase 4 state (goodlux, 2026-11-19):
 //! reads identify the caller and refuse a bad token, and the day raveld,
@@ -43,8 +43,8 @@ pub const WRITE: &str = "ravel:write";
 pub enum Needs<'a> {
     Nothing,
     Read,
-    /// Write to the soul with this route id (six characters).
-    WriteSoul(&'a str),
+    /// Write to the store this route names: its org and its store.
+    WriteSoul(&'a str, &'a str),
     MachineOwner,
 }
 
@@ -52,11 +52,14 @@ pub enum Needs<'a> {
 pub fn needs<'a>(method: &Method, path: &'a str) -> Needs<'a> {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
-        (&Method::GET, ["health"]) | (&Method::GET, ["souls"]) => Needs::Nothing,
-        (&Method::POST, ["sync"]) | (&Method::POST, ["shutdown"]) => Needs::MachineOwner,
-        (&Method::POST, ["souls", id, "sync"]) | (&Method::POST, ["souls", id, "import"]) => {
-            Needs::WriteSoul(id)
+        (&Method::GET, ["ravel", "health"]) | (&Method::GET, ["ravel", "stores"]) => {
+            Needs::Nothing
         }
+        (&Method::POST, ["ravel", "sync"]) | (&Method::POST, ["ravel", "shutdown"]) => {
+            Needs::MachineOwner
+        }
+        (&Method::POST, ["ravel", org, store, "sync"])
+        | (&Method::POST, ["ravel", org, store, "import"]) => Needs::WriteSoul(org, store),
         _ => Needs::Read,
     }
 }
@@ -115,7 +118,7 @@ pub fn decide(
             None => Ok(()),
             Some(c) => scope(c, READ),
         },
-        Needs::WriteSoul(id) => {
+        Needs::WriteSoul(org, store) => {
             let Some(c) = caller else {
                 return Err(no_token("Writing to a soul's store"));
             };
@@ -126,7 +129,7 @@ pub fn decide(
                 Ok(())
             } else {
                 Err(forbidden(format!(
-                    "soul {id} may be written by itself or by this machine's owner; \
+                    "{org}/{store} may be written by itself or by this machine's owner; \
                      this token speaks for {}",
                     c.subject
                 )))
@@ -206,7 +209,7 @@ pub async fn check(State(d): State<Arc<Daemon>>, req: Request, next: Next) -> Re
         }
     };
     let soul = match &needs {
-        Needs::WriteSoul(id) => d.soul_named(id).ok(),
+        Needs::WriteSoul(org, store) => d.soul_named(org, store).ok(),
         _ => None,
     };
     match decide(&needs, caller.as_ref(), soul, owner.as_ref(), READS_NEED_A_TOKEN) {
@@ -267,25 +270,25 @@ mod tests {
         println!("genesis {} username {:?} squad {:?} actor {:?}", c.genesis, c.username, c.squad, c.actor);
         println!("machine owner recorded: {}, caller is owner: {}", owner.is_some(), owner.as_ref().is_some_and(|o| o.matches(&c)));
         let me = Soul { id: c.genesis[..6].into(), genesis: c.genesis.clone(), path: "/x".into() };
-        assert!(decide(&Needs::WriteSoul(&me.id), Some(&c), Some(&me), owner.as_ref(), false).is_ok());
+        assert!(decide(&Needs::WriteSoul("7r1pl3f0rc3", "me"), Some(&c), Some(&me), owner.as_ref(), false).is_ok());
         assert_eq!(decide(&Needs::MachineOwner, Some(&c), None, owner.as_ref(), false).unwrap_err().status, 403);
     }
 
     #[test]
     fn the_route_table() {
-        assert_eq!(needs(&Method::GET, "/health"), Needs::Nothing);
-        assert_eq!(needs(&Method::GET, "/souls"), Needs::Nothing);
-        assert_eq!(needs(&Method::POST, "/sync"), Needs::MachineOwner);
-        assert_eq!(needs(&Method::POST, "/shutdown"), Needs::MachineOwner);
-        assert_eq!(needs(&Method::POST, "/souls/9bdf2a/sync"), Needs::WriteSoul("9bdf2a"));
-        assert_eq!(needs(&Method::POST, "/souls/9bdf2a/import"), Needs::WriteSoul("9bdf2a"));
-        assert_eq!(needs(&Method::POST, "/souls/9bdf2a/query"), Needs::Read);
-        assert_eq!(needs(&Method::POST, "/stores/9bdf2a/sparql"), Needs::Read);
-        assert_eq!(needs(&Method::GET, "/souls/9bdf2a/memory"), Needs::Read);
+        assert_eq!(needs(&Method::GET, "/ravel/health"), Needs::Nothing);
+        assert_eq!(needs(&Method::GET, "/ravel/stores"), Needs::Nothing);
+        assert_eq!(needs(&Method::POST, "/ravel/sync"), Needs::MachineOwner);
+        assert_eq!(needs(&Method::POST, "/ravel/shutdown"), Needs::MachineOwner);
+        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/sync"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
+        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/import"), Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"));
+        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/query"), Needs::Read);
+        assert_eq!(needs(&Method::POST, "/ravel/7r1pl3f0rc3/spacegoat/sparql"), Needs::Read);
+        assert_eq!(needs(&Method::GET, "/ravel/7r1pl3f0rc3/spacegoat/memory"), Needs::Read);
         // A route added later and not listed is held as a read, never open.
-        assert_eq!(needs(&Method::GET, "/souls/9bdf2a/anything-new"), Needs::Read);
+        assert_eq!(needs(&Method::GET, "/ravel/7r1pl3f0rc3/spacegoat/anything-new"), Needs::Read);
         // GET on a write path is not a write, and is not open either.
-        assert_eq!(needs(&Method::GET, "/shutdown"), Needs::Read);
+        assert_eq!(needs(&Method::GET, "/ravel/shutdown"), Needs::Read);
     }
 
     #[test]
@@ -304,23 +307,23 @@ mod tests {
 
     #[test]
     fn a_soul_writes_to_itself_and_to_no_other() {
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), None), Err(401));
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(caller(ME))), Ok(()));
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(caller(OTHER))), Err(403));
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(caller(BOSS))), Ok(()));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), None), Err(401));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(caller(ME))), Ok(()));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(caller(OTHER))), Err(403));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(caller(BOSS))), Ok(()));
     }
 
     #[test]
     fn a_soul_is_matched_by_first_commit_whatever_its_address() {
         let mut c = caller(ME);
         c.subject = "https://repolex.ai/7r1pl3f0rc3/spacegoat/soul/Soul/spacegoat".into();
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(c)), Ok(()));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(c)), Ok(()));
     }
 
     #[test]
     fn a_service_writes_only_with_the_write_scope() {
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(service(ME, &[WRITE]))), Ok(()));
-        assert_eq!(go(Needs::WriteSoul("9bdf2a"), Some(service(ME, &[READ]))), Err(403));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(service(ME, &[WRITE]))), Ok(()));
+        assert_eq!(go(Needs::WriteSoul("7r1pl3f0rc3", "spacegoat"), Some(service(ME, &[READ]))), Err(403));
     }
 
     #[test]

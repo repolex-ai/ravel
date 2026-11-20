@@ -36,6 +36,11 @@ impl Soul {
     /// in a URL (goodlux, 2026-11-20). `id` and `genesis` are for raveld's
     /// own bookkeeping and for matching a caller's token; neither is an
     /// address. None when the repo has no username yet.
+    pub fn address(&self) -> Option<String> {
+        let n = crate::names::Names::for_soul(&self.path).ok()?;
+        Some(format!("{}/{}", n.squad()?, n.username()?))
+    }
+
     pub fn name(&self) -> Option<String> {
         crate::names::Names::for_soul(&self.path)
             .ok()

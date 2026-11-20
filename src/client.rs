@@ -54,13 +54,13 @@ impl Client {
         }
     }
 
-    /// `/health`, or the reason it did not answer. Short timeout: this is the
+    /// `/ravel/health`, or the reason it did not answer. Short timeout: this is the
     /// question "is anyone there".
     pub fn health(&self) -> Result<Value> {
         let quick = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()?;
-        let r = quick.get(format!("{}/health", self.base)).send()?;
+        let r = quick.get(format!("{}/ravel/health", self.base)).send()?;
         Ok(r.error_for_status()?.json()?)
     }
 

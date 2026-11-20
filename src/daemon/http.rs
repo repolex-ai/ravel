@@ -1,19 +1,19 @@
 //! raveld's HTTP surface, on 127.0.0.1 only. `ravel` is its client.
 //!
-//!   GET  /health                      the daemon: version, uptime, souls, config problems
-//!   GET  /souls                       every soul: id, path, last pass, last numbers
-//!   POST /sync                        a pass over every soul, now
-//!   POST /souls/{id}/sync             a pass over one soul, now
-//!   GET  /souls/{id}/health           the read-only diagnostic (findings + attention flag)
-//!   GET  /souls/{id}/stats            counts: quads, graphs, turns, dated turns, claims, top predicates
-//!   POST /souls/{id}/query  {query}   SPARQL, W3C results JSON
-//!   POST /stores/{id}/sparql          the same, by the W3C SPARQL protocol (raw query body; n-triples on CONSTRUCT)
-//!   POST /souls/{id}/import  {path}   copy a claude.ai export into the soul, then a pass
-//!   GET  /souls/{id}/memory[?lines=N] the memory wake view: OptMem's cover (default 96 lines)
-//!   GET  /souls/{id}/memory/{node}    one node opened: a block's two halves (`16-31`), a note's turns
-//!   GET  /souls/{id}/memory-progress  turns, turns read, notes, blocks, blocks pending, done
-//!   GET  /souls/{id}/memory-check     the memory checked end to end; `failures` empty = good
-//!   POST /shutdown                    stop, after answering
+//!   GET  /ravel/health                      the daemon: version, uptime, souls, config problems
+//!   GET  /ravel/stores                       every soul: id, path, last pass, last numbers
+//!   POST /ravel/sync                        a pass over every soul, now
+//!   POST /ravel/{org}/{store}/sync             a pass over one soul, now
+//!   GET  /ravel/{org}/{store}/health           the read-only diagnostic (findings + attention flag)
+//!   GET  /ravel/{org}/{store}/stats            counts: quads, graphs, turns, dated turns, claims, top predicates
+//!   POST /ravel/{org}/{store}/query  {query}   SPARQL, W3C results JSON
+//!   POST /ravel/{org}/{store}/sparql          the same, by the W3C SPARQL protocol (raw query body; n-triples on CONSTRUCT)
+//!   POST /ravel/{org}/{store}/import  {path}   copy a claude.ai export into the soul, then a pass
+//!   GET  /ravel/{org}/{store}/memory[?lines=N] the memory wake view: OptMem's cover (default 96 lines)
+//!   GET  /ravel/{org}/{store}/memory/{node}    one node opened: a block's two halves (`16-31`), a note's turns
+//!   GET  /ravel/{org}/{store}/memory-progress  turns, turns read, notes, blocks, blocks pending, done
+//!   GET  /ravel/{org}/{store}/memory-check     the memory checked end to end; `failures` empty = good
+//!   POST /ravel/shutdown                    stop, after answering
 //!
 //! Reads open the store read-only; only the sync pass writes.
 
@@ -57,20 +57,24 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// it up on a port of its own.
 pub fn router(d: Shared) -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/souls", get(souls))
-        .route("/sync", post(sync_all))
-        .route("/souls/{id}/sync", post(sync_one))
-        .route("/souls/{id}/import", post(import_one))
-        .route("/souls/{id}/memory", get(memory_view))
-        .route("/souls/{id}/memory-progress", get(memory_progress))
-        .route("/souls/{id}/memory-check", get(memory_check))
-        .route("/souls/{id}/memory/{node}", get(memory_open))
-        .route("/souls/{id}/health", get(soul_health))
-        .route("/souls/{id}/stats", get(soul_stats))
-        .route("/souls/{id}/query", post(soul_query))
-        .route("/stores/{id}/sparql", post(store_sparql))
-        .route("/shutdown", post(shutdown))
+        // The stack's one URL shape (goodlux, 2026-11-20):
+        // /{daemon}/{org}/{store}/..., org = squad, store = username. The
+        // path reads the way the store's addresses do. Calls that name no
+        // store sit directly under /ravel.
+        .route("/ravel/health", get(health))
+        .route("/ravel/stores", get(souls))
+        .route("/ravel/sync", post(sync_all))
+        .route("/ravel/shutdown", post(shutdown))
+        .route("/ravel/{org}/{store}/sparql", post(store_sparql))
+        .route("/ravel/{org}/{store}/query", post(soul_query))
+        .route("/ravel/{org}/{store}/sync", post(sync_one))
+        .route("/ravel/{org}/{store}/import", post(import_one))
+        .route("/ravel/{org}/{store}/memory", get(memory_view))
+        .route("/ravel/{org}/{store}/memory-progress", get(memory_progress))
+        .route("/ravel/{org}/{store}/memory-check", get(memory_check))
+        .route("/ravel/{org}/{store}/memory/{node}", get(memory_open))
+        .route("/ravel/{org}/{store}/health", get(soul_health))
+        .route("/ravel/{org}/{store}/stats", get(soul_stats))
         .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
         .with_state(d)
 }
@@ -120,7 +124,9 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
         "config": d.cfg.path.display().to_string(),
         "config_present": d.cfg.present,
         "config_problems": d.problems,
-        "souls": d.souls.iter().filter_map(|s| s.name()).collect::<Vec<_>>(),
+        "stores": d.souls.iter().filter_map(|s| s.address()).collect::<Vec<_>>(),
+        // Every repo raveld backs up, named or not.
+        "served": d.souls.len(),
         "passes": d.passes.load(std::sync::atomic::Ordering::Relaxed),
         "memory": d.memory_status(),
         "memory_state": d.memory_state(),
@@ -149,7 +155,11 @@ async fn souls(State(d): State<Shared>) -> Json<Value> {
             json!({
                 // The name a caller uses in a URL. Null for a repo with no
                 // username: it is backed up, and cannot be asked for yet.
-                "id": username,
+                // org and store are what a URL takes: /ravel/{org}/{store}/...
+                // Null for a repo with no squad and username: it is backed
+                // up, and cannot be asked for yet.
+                "org": squad,
+                "store": username,
                 "genesis": s.genesis,
                 "root": root,
                 "squad": squad,
@@ -188,10 +198,10 @@ struct SyncBody {
 
 async fn sync_one(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
     body: Option<Json<SyncBody>>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let src = body
         .and_then(|Json(b)| b.sessions_dir)
         .map(std::path::PathBuf::from);
@@ -205,7 +215,7 @@ async fn sync_one(
     }
     let s = d.sync_one(&soul.id, src).await.map_err(internal)?;
     Ok(Json(
-        json!({ "id": soul.name(), "path": soul.path.display().to_string(), "summary": s }),
+        json!({ "store": soul.name(), "path": soul.path.display().to_string(), "summary": s }),
     ))
 }
 
@@ -216,10 +226,10 @@ struct ImportBody {
 
 async fn import_one(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
     Json(b): Json<ImportBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let src = std::path::PathBuf::from(&b.path);
     if !src.is_dir() {
         return Err(bad(format!("{} is not a directory", src.display())));
@@ -230,7 +240,7 @@ async fn import_one(
         crate::sync::ImportOutcome::AlreadyImported { name } => ("already imported", name, 0, 0),
     };
     Ok(Json(json!({
-        "id": soul.name(),
+        "store": soul.name(),
         "status": status,
         "export": name,
         "files": files,
@@ -246,17 +256,17 @@ struct MemoryViewQuery {
 
 async fn memory_view(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
     Query(q): Query<MemoryViewQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let lines = q.lines.unwrap_or(crate::memory::WAKE_LINES).max(1);
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let ms = log.memories()?;
         let sums = log.summaries()?;
         let view = crate::memory_log::wake_view(&ms, &sums, ms.len(), lines);
-        Ok(json!({ "id": soul.name(), "memories": ms.len(), "summaries": sums.len(), "lines": view }))
+        Ok(json!({ "store": soul.name(), "memories": ms.len(), "summaries": sums.len(), "lines": view }))
     })
     .await
     .map_err(internal)?
@@ -266,9 +276,9 @@ async fn memory_view(
 
 async fn memory_open(
     State(d): State<Shared>,
-    Path((id, node)): Path<(String, String)>,
+    Path((org, store, node)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::{zoom, MemoryLog};
         let log = MemoryLog::for_soul(&soul.path);
@@ -316,9 +326,9 @@ async fn memory_open(
 /// read; `pending_blocks` are OptMem merges due and not written.
 async fn memory_progress(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::MemoryLog;
         let log = MemoryLog::for_soul(&soul.path);
@@ -330,7 +340,7 @@ async fn memory_progress(
         // count includes tool output and subagents, which are never read.
         let (turns, counted) = log.stream_size().unwrap_or((0, String::new()));
         Ok(json!({
-            "id": soul.name(),
+            "store": soul.name(),
             "turns": turns,
             "turns_counted": counted,
             "turns_read": read,
@@ -348,9 +358,9 @@ async fn memory_progress(
 
 async fn soul_health(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let path = soul.path.clone();
     let findings = tokio::task::spawn_blocking(move || sync::diagnose(&path, None))
         .await
@@ -362,7 +372,7 @@ async fn soul_health(
         .map(|f| json!({ "attention": f.attention, "line": f.line }))
         .collect();
     Ok(Json(json!({
-        "id": soul.name(),
+        "store": soul.name(),
         "path": soul.path.display().to_string(),
         "attention": attention,
         "findings": rows,
@@ -411,9 +421,9 @@ fn scalar(store: &Store, q: &str) -> anyhow::Result<String> {
 
 async fn soul_stats(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let store = open_store(&soul)?;
         let g = "GRAPH ?g { ?s ?p ?o }";
@@ -442,7 +452,7 @@ async fn soul_stats(
         }
         let num = |s: &str| s.parse::<u64>().unwrap_or(0);
         Ok(json!({
-            "id": soul.name(),
+            "store": soul.name(),
             "path": soul.path.display().to_string(),
             "quads": num(&quads),
             "graphs": num(&graphs),
@@ -543,10 +553,10 @@ fn answer(soul: &super::registry::Soul, text: &str) -> anyhow::Result<(Answer, V
 /// nothing; the answer itself cannot say so.
 async fn soul_query(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &body.query))
         .await
         .map_err(internal)?
@@ -569,11 +579,11 @@ async fn soul_query(
 /// `application/n-triples`.
 async fn store_sparql(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Response, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let kind = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -627,13 +637,13 @@ async fn store_sparql(
 /// every note cites real turns, the wake is OptMem's cover.
 async fn memory_check(
     State(d): State<Shared>,
-    Path(id): Path<String>,
+    Path((org, store)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul_named(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let v = crate::memory_relive::verify(&soul.path, &log)?;
-        Ok(json!({ "id": soul.name(), "check": v }))
+        Ok(json!({ "store": soul.name(), "check": v }))
     })
     .await
     .map_err(internal)?
@@ -684,23 +694,23 @@ mod tests {
         let base = stand_up().await;
         let c = reqwest::Client::new();
         // Open to anyone on the machine.
-        assert_eq!(status(c.get(format!("{base}/health"))).await.0, 200);
-        assert_eq!(status(c.get(format!("{base}/souls"))).await.0, 200);
+        assert_eq!(status(c.get(format!("{base}/ravel/health"))).await.0, 200);
+        assert_eq!(status(c.get(format!("{base}/ravel/stores"))).await.0, 200);
         // No token: stopping raveld and writing are refused, and say how to ask.
-        assert_eq!(status(c.post(format!("{base}/shutdown"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/sync"))).await, (401, true));
-        assert_eq!(status(c.post(format!("{base}/souls/9bdf2a/sync"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/ravel/shutdown"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/ravel/sync"))).await, (401, true));
+        assert_eq!(status(c.post(format!("{base}/ravel/7r1pl3f0rc3/nobody/sync"))).await, (401, true));
         // No token on a read passes the gate for now; no such soul, so 404.
-        assert_eq!(status(c.get(format!("{base}/souls/9bdf2a/stats"))).await.0, 404);
+        assert_eq!(status(c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))).await.0, 404);
         // A token that is sent and is not good is refused, reads included.
-        let bad = c.get(format!("{base}/souls/9bdf2a/stats")).bearer_auth("abc.def.ghi");
+        let bad = c.get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats")).bearer_auth("abc.def.ghi");
         assert_eq!(status(bad).await, (401, true));
         let basic = c
-            .get(format!("{base}/souls/9bdf2a/stats"))
+            .get(format!("{base}/ravel/7r1pl3f0rc3/nobody/stats"))
             .header("authorization", "Basic abc");
         assert_eq!(status(basic).await.0, 401);
         // /health still answers after all of that: nothing was stopped.
-        let h: Value = c.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+        let h: Value = c.get(format!("{base}/ravel/health")).send().await.unwrap().json().await.unwrap();
         assert_eq!(h["identity"]["reads_need_a_token"], false);
         assert_eq!(h["identity"]["squaddies_with_a_key"], 0);
     }
