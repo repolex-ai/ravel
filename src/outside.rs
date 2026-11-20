@@ -23,11 +23,10 @@ use oxigraph::store::Store;
 use spargebra::{Query, SparqlParser};
 use std::sync::OnceLock;
 
-/// The base an outside query is read against. Every address ravel stores
-/// starts here today (`https://repolex.ai/ravel/Turn/<id>`), so
-/// `<ravel/Turn/x>` resolves to what is stored. It moves to the store's own
-/// `{squad}/{user}/` root in the build that moves the stored addresses.
-pub const BASE: &str = "https://repolex.ai/";
+// The base an outside query is read against is the root of the store being
+// asked, `https://repolex.ai/{squad}/{user}/` (`Names::root`). So
+// `<ravel/Turn/x>` and `GRAPH <ravel/NamedGraph/optmem>` mean that store's
+// own, and one saved query works on every soul.
 
 /// The prefix of the names no store holds; calamus drops them from answers.
 pub const ABSTRACT: &str = "https://repolex.ai/ontology/subtexture/";
@@ -46,10 +45,10 @@ pub fn index() -> &'static Index {
 
 /// Parse and rewrite. Any error means the query is refused, never run
 /// half-prepared.
-pub fn prepare(text: &str) -> Result<(Query, Report)> {
+pub fn prepare(text: &str, base: &str) -> Result<(Query, Report)> {
     let mut query = SparqlParser::new()
-        .with_base_iri(BASE)
-        .map_err(|e| anyhow!("base {BASE}: {e}"))?
+        .with_base_iri(base)
+        .map_err(|e| anyhow!("base {base}: {e}"))?
         .parse_query(text)
         .map_err(|e| anyhow!("{e}"))?;
     // ravel keeps no ontology graph in a store, so nothing is exempt.
@@ -59,8 +58,12 @@ pub fn prepare(text: &str) -> Result<(Query, Report)> {
 }
 
 /// Prepare and run. The results borrow nothing from the query.
-pub fn run<'a>(store: &'a Store, text: &str) -> Result<(QueryResults<'a>, Report)> {
-    let (query, report) = prepare(text)?;
+pub fn run<'a>(
+    store: &'a Store,
+    text: &str,
+    base: &str,
+) -> Result<(QueryResults<'a>, Report)> {
+    let (query, report) = prepare(text, base)?;
     let mut prepared = SparqlEvaluator::new().for_query(query);
     // FROM / FROM NAMED written by the caller is kept as written.
     if prepared.dataset().is_default_dataset() {
@@ -104,7 +107,7 @@ mod tests {
     }
 
     fn count(store: &Store, q: &str) -> usize {
-        match run(store, q).unwrap().0 {
+        match run(store, q, crate::names::BARE_ROOT).unwrap().0 {
             QueryResults::Solutions(s) => s.map(|r| r.unwrap()).count(),
             _ => panic!("expected rows"),
         }
@@ -155,7 +158,7 @@ mod tests {
     fn a_fanned_out_name_keeps_its_graph() {
         let s = store();
         let q = format!("{P} SELECT ?g ?t WHERE {{ GRAPH ?g {{ ?t a subtexture:Thing }} }}");
-        let QueryResults::Solutions(sols) = run(&s, &q).unwrap().0 else {
+        let QueryResults::Solutions(sols) = run(&s, &q, crate::names::BARE_ROOT).unwrap().0 else {
             panic!("expected rows")
         };
         let rows: Vec<_> = sols.map(|r| r.unwrap()).collect();
@@ -166,13 +169,13 @@ mod tests {
     #[test]
     fn a_name_inside_a_filter_is_reported() {
         let q = format!("{P} SELECT ?s WHERE {{ ?s ?p ?o FILTER(?p = subtexture:relatedToId) }}");
-        let (_, report) = prepare(&q).unwrap();
+        let (_, report) = prepare(&q, crate::names::BARE_ROOT).unwrap();
         assert_eq!(notes(&report).len(), 1);
     }
 
     #[test]
     fn a_query_that_does_not_parse_is_refused() {
-        assert!(prepare("SELECT WHERE").is_err());
+        assert!(prepare("SELECT WHERE", crate::names::BARE_ROOT).is_err());
     }
 
     /// Not a test of correctness: the price of the union view and the
@@ -192,7 +195,7 @@ mod tests {
             ("relatedToId base name", format!("{P} SELECT (COUNT(*) AS ?n) WHERE {{ ?m subtexture:relatedToId ?t }}")),
         ] {
             let t = std::time::Instant::now();
-            let (r, _) = run(&s, &q).unwrap();
+            let (r, _) = run(&s, &q, crate::names::BARE_ROOT).unwrap();
             let out = match r {
                 QueryResults::Solutions(sols) => {
                     let rows: Vec<_> = sols.map(|r| r.unwrap()).collect();

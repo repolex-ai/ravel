@@ -23,10 +23,13 @@
 use crate::annotate::annotation_nt;
 use crate::project::project_nt;
 use crate::reader::Annotation;
-use crate::{Event, RAVEL_BASE, RAVEL_NS};
+use crate::names::Names;
+use crate::{Event, RAVEL_NS};
 use anyhow::{Context, Result};
 use oxigraph::io::{RdfFormat, RdfParser};
-use oxigraph::model::{GraphNameRef, NamedNode};
+use oxigraph::model::{
+    GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad,
+};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
 use std::path::Path;
@@ -34,8 +37,92 @@ use std::path::Path;
 /// The named graph for one transcript's annotations. Lives under the
 /// instance base (`…/ravel/NamedGraph/<id>`) — NOT the
 /// ontology namespace, which is vocabulary-only.
-pub fn transcript_graph_iri(transcript_id: &str) -> String {
-    format!("{RAVEL_BASE}NamedGraph/{}", safe(transcript_id))
+pub fn transcript_graph_iri(names: &Names, transcript_id: &str) -> String {
+    names.graph(&safe(transcript_id))
+}
+
+/// What a named graph is, said in the store's unnamed graph (named-graph
+/// spec section 12.2). ravel's two classes both sit under
+/// `subtexture:DefaultGraph`, which is why a question with no GRAPH sees
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphKind {
+    Transcript,
+    Memory,
+}
+
+impl GraphKind {
+    pub fn class(self) -> String {
+        match self {
+            GraphKind::Transcript => format!("{RAVEL_NS}TranscriptGraph"),
+            GraphKind::Memory => format!("{RAVEL_NS}MemoryGraph"),
+        }
+    }
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// The statements that describe one graph: its class, its owner when the
+/// store has one, and `private`. The subject is the graph's own address.
+/// Every graph says its owner, so a reader that checks access never has to
+/// guess whose a transcript is.
+pub fn description(names: &Names, graph: &NamedNode, kind: GraphKind) -> Vec<Quad> {
+    let s = NamedOrBlankNode::NamedNode(graph.clone());
+    let p = |name: &str| NamedNode::new_unchecked(format!("{RAVEL_NS}{name}"));
+    let mut out = vec![
+        Quad::new(
+            s.clone(),
+            NamedNode::new_unchecked(RDF_TYPE),
+            NamedNode::new_unchecked(kind.class()),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            s.clone(),
+            p("visibility"),
+            Literal::new_simple_literal("private"),
+            GraphName::DefaultGraph,
+        ),
+    ];
+    if let Some(owner) = names.owner() {
+        out.push(Quad::new(
+            s,
+            p("owner"),
+            NamedNode::new_unchecked(owner),
+            GraphName::DefaultGraph,
+        ));
+    }
+    out
+}
+
+/// Write a graph's description. Safe to repeat.
+pub fn describe_graph(
+    store: &Store,
+    names: &Names,
+    graph: &NamedNode,
+    kind: GraphKind,
+) -> Result<()> {
+    for q in description(names, graph, kind) {
+        store.insert(&q)?;
+    }
+    Ok(())
+}
+
+/// Empty a graph and take its description away with it: a graph that holds
+/// nothing must not still be announced.
+pub fn drop_graph(store: &Store, graph: &NamedNode) -> Result<()> {
+    store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
+    let said: Vec<Quad> = store
+        .quads_for_pattern(
+            Some(NamedOrBlankNodeRef::NamedNode(graph.as_ref())),
+            None,
+            None,
+            Some(GraphNameRef::DefaultGraph),
+        )
+        .collect::<Result<_, _>>()?;
+    for q in &said {
+        store.remove(q)?;
+    }
+    Ok(())
 }
 
 /// Open (or create) the persistent store at `path`. Read-WRITE — takes the
@@ -93,10 +180,11 @@ pub fn ingest_annotations(
     events: &[Event],
     anns: &[Annotation],
     transcript_id: &str,
-    partition: &str,
+    names: &Names,
 ) -> Result<usize> {
-    let graph_iri = transcript_graph_iri(transcript_id);
+    let graph_iri = transcript_graph_iri(names, transcript_id);
     let graph = NamedNode::new(&graph_iri).context("transcript graph IRI")?;
+    let partition = names.turn_partition();
 
     // (1)+(2): wipe this transcript's graph so re-ingest is a clean replace.
     store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
@@ -112,10 +200,11 @@ pub fn ingest_annotations(
         .cloned()
         .collect();
 
-    let mut nt = project_nt(&anchor_events, partition)?;
-    nt.push_str(&annotation_nt(anns, transcript_id, partition)?);
+    let mut nt = project_nt(&anchor_events, &partition)?;
+    nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
+    describe_graph(store, names, &graph, GraphKind::Transcript)?;
     store.flush()?;
 
     // count what's in this graph now
@@ -149,19 +238,21 @@ pub fn ingest_transcript(
     events: &[Event],
     anns: &[Annotation],
     transcript_id: &str,
-    partition: &str,
+    names: &Names,
 ) -> Result<usize> {
-    let graph_iri = transcript_graph_iri(transcript_id);
+    let graph_iri = transcript_graph_iri(names, transcript_id);
     let graph = NamedNode::new(&graph_iri).context("transcript graph IRI")?;
+    let partition = names.turn_partition();
 
     // clean replace (gotchas #1 + #2, as in ingest_annotations)
     store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
 
     // FULL spine: project EVERY event, not just the annotation-referenced ones.
-    let mut nt = project_nt(events, partition)?;
-    nt.push_str(&annotation_nt(anns, transcript_id, partition)?);
+    let mut nt = project_nt(events, &partition)?;
+    nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
+    describe_graph(store, names, &graph, GraphKind::Transcript)?;
     store.flush()?;
 
     Ok(store
@@ -251,13 +342,16 @@ pub fn query_emojikeys(store: &Store, only_source_kind: Option<&str>) -> Result<
     let QueryResults::Solutions(solutions) = results else {
         anyhow::bail!("expected SELECT solutions");
     };
-    let prefix = format!("{RAVEL_BASE}NamedGraph/");
     let mut hits = Vec::new();
     for sol in solutions {
         let sol = sol?;
         let get = |k: &str| sol.get(k).map(term_value).unwrap_or_default();
         let g = get("g");
-        let transcript = g.strip_prefix(&prefix).unwrap_or(&g).to_string();
+        // Whatever root the store is under, the transcript id is what follows.
+        let transcript = g
+            .rsplit_once("/NamedGraph/")
+            .map_or(g.as_str(), |(_, id)| id)
+            .to_string();
         hits.push(EmojikeyHit {
             transcript,
             source_kind: get("sk"),
@@ -322,7 +416,6 @@ mod tests {
     #[test]
     fn triple_term_survives_named_graph_and_reingest_is_idempotent() {
         let store = Store::new().unwrap(); // in-memory is the same API as on-disk
-        let part = "https://repolex.ai/ravel/Turn/";
         let evs = vec![ev(
             "e1",
             "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]",
@@ -332,8 +425,8 @@ mod tests {
         assert_eq!(anns.len(), 1);
 
         // ingest twice — idempotent: triple count stable, no duplication.
-        let n1 = ingest_annotations(&store, &evs, &anns, "sess-A", part).unwrap();
-        let n2 = ingest_annotations(&store, &evs, &anns, "sess-A", part).unwrap();
+        let n1 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare()).unwrap();
+        let n2 = ingest_annotations(&store, &evs, &anns, "sess-A", &crate::names::Names::bare()).unwrap();
         assert!(n1 > 0);
         assert_eq!(n1, n2, "re-ingest must not change the graph (idempotent)");
 
@@ -379,7 +472,6 @@ mod tests {
     #[test]
     fn two_sessions_accumulate_and_are_separable() {
         let store = Store::new().unwrap();
-        let part = "https://repolex.ai/ravel/Turn/";
         let eva = vec![ev("e1", "[ME|a]~[CONTENT|b]~[YOU|c]", SourceKind::Authored)];
         let evb = vec![ev(
             "e2",
@@ -388,8 +480,8 @@ mod tests {
         )];
         let a = emojikey_read(&eva);
         let b = emojikey_read(&evb);
-        ingest_annotations(&store, &eva, &a, "sess-A", part).unwrap();
-        ingest_annotations(&store, &evb, &b, "sess-B", part).unwrap();
+        ingest_annotations(&store, &eva, &a, "sess-A", &crate::names::Names::bare()).unwrap();
+        ingest_annotations(&store, &evb, &b, "sess-B", &crate::names::Names::bare()).unwrap();
 
         let all = query_emojikeys(&store, None).unwrap();
         assert_eq!(all.len(), 2, "two sessions accumulate in one store");
@@ -407,7 +499,6 @@ mod tests {
         // three turns carry no emojikey — annotation-scoped ingest would drop
         // them; full-spine keeps all three.
         let store = Store::new().unwrap();
-        let part = "https://repolex.ai/ravel/Turn/";
         let evs = vec![
             ev("e1", "just some prose, no key here", SourceKind::Authored),
             ev("e2", "[ME|🧠]~[CONTENT|💻]~[YOU|🎓]", SourceKind::Authored),
@@ -416,7 +507,7 @@ mod tests {
         let anns = emojikey_read(&evs);
         assert_eq!(anns.len(), 1, "only the middle turn has an emojikey");
 
-        ingest_transcript(&store, &evs, &anns, "sess-full", part).unwrap();
+        ingest_transcript(&store, &evs, &anns, "sess-full", &crate::names::Names::bare()).unwrap();
 
         // ALL THREE turns are present as spine nodes (not just the annotated one).
         let count_q = format!(
@@ -439,5 +530,33 @@ mod tests {
 
         // and the emojikey annotation still rides on top — spine + belief coexist.
         assert_eq!(query_emojikeys(&store, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_graph_is_described_while_it_holds_something_and_not_after() {
+        let store = Store::new().unwrap();
+        let names = Names::new("7r1pl3f0rc3", "spacegoat").unwrap();
+        let evs = vec![ev("only", "hello", SourceKind::Authored)];
+        ingest_transcript(&store, &evs, &[], "sess-1", &names).unwrap();
+        ingest_transcript(&store, &evs, &[], "sess-1", &names).unwrap();
+        let said = |store: &Store| {
+            query_rows(store, "SELECT ?g ?p ?o WHERE { ?g ?p ?o } ORDER BY ?p").unwrap()
+        };
+        // Three statements in the unnamed graph, once, however often it is ingested.
+        let rows = said(&store);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let g = "https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/NamedGraph/sess-1";
+        assert!(rows.iter().all(|r| r["g"] == g));
+        let objects: Vec<&str> = rows.iter().map(|r| r["o"].as_str()).collect();
+        assert!(objects.contains(&"https://repolex.ai/ontology/ravel/TranscriptGraph"));
+        assert!(objects.contains(&"private"));
+        assert!(objects.contains(&"https://repolex.ai/7r1pl3f0rc3/spacegoat/soul/Soul/spacegoat"));
+        // The turn is under the soul's own root.
+        let t = query_rows(&store, "SELECT ?t WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
+        assert_eq!(t[0]["t"], "https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/only");
+
+        drop_graph(&store, &NamedNode::new(g).unwrap()).unwrap();
+        assert!(said(&store).is_empty(), "a dropped graph is no longer announced");
+        assert_eq!(store.len().unwrap(), 0);
     }
 }

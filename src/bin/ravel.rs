@@ -309,6 +309,11 @@ fn souls(client: &Client) -> Result<()> {
                 ),
             }
         );
+        match (s["root"].as_str(), s["names_error"].as_str()) {
+            (Some(root), _) => println!("      addresses start {root}ravel/"),
+            (None, Some(e)) => println!("      ADDRESSES: {e}"),
+            (None, None) => {}
+        }
         if let Some(m) = memory_line(&s["memory"]) {
             println!("      memory {m}");
         }
@@ -465,7 +470,8 @@ fn optmem_open(client: &Client, id: &str, node: &str) -> Result<()> {
 /// highest merge that still names it, and the latest notes, with the ids
 /// `optmem open` takes. Matched as a whole word or phrase, ignoring case.
 fn optmem_recall(client: &Client, id: &str, term: &str) -> Result<()> {
-    const MEM: &str = "<https://repolex.ai/ravel/NamedGraph/memory-v1>";
+    // Read against the soul's own root by raveld, so it is that soul's graph.
+    const MEM: &str = "<ravel/NamedGraph/optmem>";
     let ns = ravel::RAVEL_NS;
     let lower = term.to_lowercase();
     let lit = serde_json::to_string(&lower)?;
@@ -873,13 +879,19 @@ WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
     memory, subtexture:relatedToId finds ravel:relatedToId. A base name
     inside FILTER is compared as written and matches nothing; ravel prints
     a note when a query has one.
-  - A short address is read against https://repolex.ai/, so
-    <ravel/Turn/<event id>> and GRAPH <ravel/NamedGraph/memory-v1> work.
-  - optmem is the graph <https://repolex.ai/ravel/NamedGraph/memory-v1>. A
-    note (memoryLevel 0) links to each turn it was written from, and a merge
-    to its two halves, with <https://repolex.ai/ontology/ravel/relatedToId>.
-  - Instances are named under https://repolex.ai/ravel/<Class>/<id>, for
-    example <https://repolex.ai/ravel/Turn/<event id>>.
+  - Every address starts with the soul's own root,
+    https://repolex.ai/<squad>/<username>/ (`ravel souls` prints it), and
+    ravel's things sit under ravel/<Class>/<id> below it, for example
+    https://repolex.ai/7r1pl3f0rc3/spacegoat/ravel/Turn/<event id>.
+  - A short address is read against that root, so <ravel/Turn/<event id>>
+    and GRAPH <ravel/NamedGraph/optmem> work on any soul as written.
+  - optmem is the graph <ravel/NamedGraph/optmem>. A note (memoryLevel 0)
+    links to each turn it was written from, and a merge to its two halves,
+    with <https://repolex.ai/ontology/ravel/relatedToId>.
+  - Each graph is described in the store's unnamed graph: its class
+    (ravel:TranscriptGraph or ravel:MemoryGraph), ravel:owner and
+    ravel:visibility. `SELECT ?g WHERE { ?g a subtexture:NamedGraph }`
+    lists them.
 
 THREE QUERIES THAT WORK AS WRITTEN
   Which models answered this soul, and how often:
@@ -900,7 +912,7 @@ THREE QUERIES THAT WORK AS WRITTEN
   An optmem note, with the turns it was written from (note #12):
     PREFIX ravel: <https://repolex.ai/ontology/ravel/>
     SELECT ?note ?ts (SUBSTR(?said, 1, 80) AS ?start) WHERE {
-      GRAPH <https://repolex.ai/ravel/NamedGraph/memory-v1> {
+      GRAPH <ravel/NamedGraph/optmem> {
         ?m ravel:memoryLevel 0 ; ravel:logStart 12 ;
            ravel:memoryText ?note ; ravel:relatedToId ?t }
       GRAPH ?g { ?t ravel:timestamp ?ts ; ravel:text ?said } }

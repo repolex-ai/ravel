@@ -26,7 +26,7 @@
 //!
 //! This module owns the `.ravel/` layout; nothing else may hardcode it.
 
-use crate::{adapter, agy, graph, reader, soul};
+use crate::{adapter, agy, graph, reader};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -316,16 +316,17 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
 /// of ownership is kept.
 fn owned_here(
     store: &oxigraph::store::Store,
+    names: &crate::names::Names,
     id: &str,
     events: Vec<crate::Event>,
 ) -> Result<Vec<crate::Event>> {
     use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNodeRef, TermRef};
-    let here = NamedNode::new(graph::transcript_graph_iri(id))?;
+    let here = NamedNode::new(graph::transcript_graph_iri(names, id))?;
     let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")?;
     let turn = NamedNode::new(format!("{}Turn", crate::RAVEL_NS))?;
     let mut out = Vec::with_capacity(events.len());
     for e in events {
-        let s = NamedNode::new(crate::project::event_iri(soul::TURN_PARTITION, &e.event_id))?;
+        let s = NamedNode::new(names.turn(&e.event_id))?;
         let elsewhere = store
             .quads_for_pattern(
                 Some(NamedOrBlankNodeRef::from(s.as_ref())),
@@ -669,11 +670,12 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     std::fs::create_dir_all(&mirror)
         .with_context(|| format!("create agy mirror dir {}", mirror.display()))?;
 
-    let store = graph::open(repo.join(STORE_SUBDIR))?;
+    let names = crate::names::Names::for_soul(repo)?;
+    let store = crate::readdress::open_current(repo, &names)?;
     let mut manifest = read_agy_manifest(repo);
 
     for c in &convs {
-        if let Err(e) = sync_agy_one(c, &mirror, &store, &mut manifest, &mut st) {
+        if let Err(e) = sync_agy_one(c, &mirror, &store, &names, &mut manifest, &mut st) {
             eprintln!(
                 "[raveld] agy {}: SKIPPED this pass — {e:#}",
                 &c.id[..8.min(c.id.len())]
@@ -691,6 +693,7 @@ fn sync_agy_one(
     c: &AgyConversation,
     mirror: &Path,
     store: &oxigraph::store::Store,
+    names: &crate::names::Names,
     manifest: &mut std::collections::HashMap<String, String>,
     st: &mut AgyStats,
 ) -> Result<()> {
@@ -758,7 +761,7 @@ fn sync_agy_one(
         &parsed.events,
         &anns,
         &transcript_id,
-        soul::TURN_PARTITION,
+        names,
     )?;
     manifest.insert(c.id.clone(), src_hash);
     st.sessions += 1;
@@ -811,7 +814,8 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
 
     if mirror.is_dir() {
         let fresh = tsv_is_stale(&repo.join(INGEST_MANIFEST));
-        let store = graph::open(repo.join(STORE_SUBDIR))?;
+        let names = crate::names::Names::for_soul(repo)?;
+    let store = crate::readdress::open_current(repo, &names)?;
         let mut manifest = read_manifest(repo);
         // Owners first: a turn belongs to the first file that brings it in,
         // so sessions load before their subagents, and older before newer,
@@ -833,8 +837,8 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                     continue;
                 };
                 let id = rel.to_string_lossy().trim_end_matches(".jsonl").to_string();
-                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&id))?;
-                store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+                let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&names, &id))?;
+                graph::drop_graph(&store, &g)?;
             }
         }
         for path in paths {
@@ -858,8 +862,8 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
             if manifest.get(&name) != Some(&len) {
                 if let Some(current) = superseded_by(&path) {
                     let id = name.trim_end_matches(".jsonl");
-                    let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(id))?;
-                    store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+                    let g = oxigraph::model::NamedNode::new(graph::transcript_graph_iri(&names, id))?;
+                    graph::drop_graph(&store, &g)?;
                     eprintln!(
                         "[raveld] {name}: an older copy of {}, left out of the store",
                         current.display()
@@ -900,9 +904,9 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 continue;
             }
             let transcript_id = name.trim_end_matches(".jsonl");
-            let events = owned_here(&store, transcript_id, events)?;
+            let events = owned_here(&store, &names, transcript_id, events)?;
             let anns = reader::emojikey_read(&events);
-            graph::ingest_transcript(&store, &events, &anns, transcript_id, soul::TURN_PARTITION)?;
+            graph::ingest_transcript(&store, &events, &anns, transcript_id, &names)?;
             manifest.insert(name.clone(), len);
             stats.sessions += 1;
             stats.turns += events.len();
@@ -1132,7 +1136,8 @@ pub fn sync_claude_ai(repo: &Path) -> Result<ClaudeAiStats> {
         }
     }
 
-    let store = graph::open(repo.join(STORE_SUBDIR))?;
+    let names = crate::names::Names::for_soul(repo)?;
+    let store = crate::readdress::open_current(repo, &names)?;
     let mut ids: Vec<&String> = best.keys().collect();
     ids.sort();
     for id in ids {
@@ -1146,7 +1151,7 @@ pub fn sync_claude_ai(repo: &Path) -> Result<ClaudeAiStats> {
             let anns = reader::emojikey_read(&events);
             let graph_id = format!("claude-ai-{id}");
             if let Err(err) =
-                graph::ingest_transcript(&store, &events, &anns, &graph_id, soul::TURN_PARTITION)
+                graph::ingest_transcript(&store, &events, &anns, &graph_id, &names)
             {
                 st.failed.push(format!("{id}: {err:#}"));
                 continue;

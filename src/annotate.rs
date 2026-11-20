@@ -31,7 +31,8 @@
 //! w4r3z idempotency discipline, carried into the annotation IRIs.
 
 use crate::reader::Annotation;
-use crate::{RAVEL_BASE, RAVEL_NS};
+use crate::names::Names;
+use crate::RAVEL_NS;
 use anyhow::Result;
 use oxigraph::store::Store;
 use sha2::{Digest, Sha256};
@@ -80,10 +81,10 @@ fn ann_hash(transcript_id: &str, a: &Annotation) -> String {
 pub fn project_annotations(
     anns: &[Annotation],
     transcript_id: &str,
-    partition: &str,
+    names: &Names,
 ) -> Result<Store> {
     let store = Store::new()?;
-    let nt = annotation_nt(anns, transcript_id, partition)?;
+    let nt = annotation_nt(anns, transcript_id, names)?;
     store.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
     Ok(store)
 }
@@ -91,8 +92,10 @@ pub fn project_annotations(
 /// Build the N-Triples for a set of annotations (no store). Split out so the
 /// persistent-graph arm can retarget these into a per-transcript NAMED graph via
 /// `RdfParser::with_default_graph` — same triples, different graph home.
-pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) -> Result<String> {
+pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, names: &Names) -> Result<String> {
     let mut nt = String::new();
+    let base = names.base();
+    let partition = names.turn_partition();
 
     let a_type = format!("{RDF}type");
     for ann in anns {
@@ -113,15 +116,15 @@ pub fn annotation_nt(anns: &[Annotation], transcript_id: &str, partition: &str) 
             )
         })?;
         let h = ann_hash(transcript_id, ann);
-        let ann_iri = format!("{RAVEL_BASE}Annotation/{h}");
-        let claim_iri = format!("{RAVEL_BASE}Claim/{h}");
-        let detector_iri = format!("{RAVEL_BASE}Detector/{}", safe(&ann.reader));
-        let transcript_iri = format!("{RAVEL_BASE}Transcript/{}", safe(transcript_id));
+        let ann_iri = format!("{base}Annotation/{h}");
+        let claim_iri = format!("{base}Claim/{h}");
+        let detector_iri = format!("{base}Detector/{}", safe(&ann.reader));
+        let transcript_iri = format!("{base}Transcript/{}", safe(transcript_id));
         let target_iri = format!("{ann_iri}/target");
         let selector_iri = format!("{ann_iri}/selector");
         let body_iri = format!("{ann_iri}/body");
         // the event this anchors to = the turn node the projector emitted
-        let event_iri = crate::project::event_iri(partition, &ann.event_id);
+        let event_iri = crate::project::event_iri(&partition, &ann.event_id);
 
         // --- detector as a prov:SoftwareAgent ---
         triple(
@@ -376,7 +379,7 @@ mod tests {
         // prefix. Healthy annotations continue to project fine.
         let mut anns = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         anns[0].event_id = "  ".into();
-        let Err(e) = project_annotations(&anns, "t", "https://repolex.ai/ravel/Turn/") else {
+        let Err(e) = project_annotations(&anns, "t", &crate::names::Names::bare()) else {
             panic!("empty event_id must refuse to project");
         };
         assert!(e.to_string().contains("empty event_id"));
@@ -385,7 +388,7 @@ mod tests {
         // collide two distinct ids into one IRI)
         let mut bad = emojikey_read(&[ev("e1", "[ME|🐐]~[CONTENT|⚙️]~[YOU|🤝]")]);
         bad[0].event_id = "e 1<".into();
-        let Err(e2) = project_annotations(&bad, "t", "https://repolex.ai/ravel/Turn/") else {
+        let Err(e2) = project_annotations(&bad, "t", &crate::names::Names::bare()) else {
             panic!("malformed event_id must refuse to project");
         };
         assert!(e2.to_string().contains("malformed event_id"));
@@ -399,10 +402,9 @@ mod tests {
 
     #[test]
     fn projects_and_reads_back_through_triple_term() {
-        let part = "https://repolex.ai/ravel/Turn/";
         let anns = emojikey_read(&[ev("e1", "key [ME|🧠]~[CONTENT|💻]~[YOU|🎓] here")]);
         assert_eq!(anns.len(), 1);
-        let store = project_annotations(&anns, "trans-1", part).unwrap();
+        let store = project_annotations(&anns, "trans-1", &crate::names::Names::bare()).unwrap();
         assert!(store.len().unwrap() > 0);
 
         // round-trip through a fresh store, reading back THROUGH the triple term
@@ -475,7 +477,7 @@ mod tests {
         };
         let anns = vec![mk(3), mk(8)];
         let store =
-            project_annotations(&anns, "trans-num", "https://repolex.ai/ravel/Turn/").unwrap();
+            project_annotations(&anns, "trans-num", &crate::names::Names::bare()).unwrap();
 
         // NUMERIC filter: legs projected as plain strings would compare
         // lexically ("8" < "3" is false but "10" < "3" is TRUE lexically) — a

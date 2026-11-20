@@ -8,7 +8,7 @@
 //! Engine/adapter line (locked w/ w4r3z): the ENGINE knows `Event`/`Turn` and a
 //! generic `partition` string. It does NOT know what a "soul" is. The
 //! claude-code ADAPTER (`adapter` mod) parses the dialect and supplies the
-//! partition (`soul::TURN_PARTITION`, a resolvable https prefix carrying no
+//! partition (`names::Names::turn_partition`, a resolvable https prefix carrying no
 //! soul identity — see `soul.rs`). The engine is invariant under it.
 
 pub mod adapter;
@@ -23,9 +23,11 @@ pub mod memory;
 pub mod memory_extract;
 pub mod memory_log;
 pub mod memory_relive;
+pub mod names;
 pub mod outside;
 pub mod peers;
 pub mod project;
+pub mod readdress;
 pub mod reader;
 pub mod soul;
 pub mod sync;
@@ -283,9 +285,8 @@ impl Event {
 /// properties). Instance data never lives under this prefix.
 pub const RAVEL_NS: &str = "https://repolex.ai/ontology/ravel/";
 
-/// The base for ravel INSTANCE IRIs (turns, named graphs) — the product path
-/// (`…/ravel/<Class>/<id>`). Vocabulary and data must not share a prefix.
-pub const RAVEL_BASE: &str = "https://repolex.ai/ravel/";
+// Instance addresses (turns, named graphs, memories) are per soul and come
+// from [`names::Names`]. Vocabulary and data never share a prefix.
 
 #[cfg(test)]
 mod action_tests {

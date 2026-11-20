@@ -377,9 +377,13 @@ pub fn zoom(memories: &[Memory], summaries: &HashMap<String, Summary>, b: Block)
 /// `ravel:relatedToId` (equivalent to `subtexture:relatedToId`; goodlux,
 /// 2026-10-06 and 2026-11-16): a note to the turns it rests
 /// on, a block to its two halves — the tree OptMem's `zoom` walks.
-pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> String {
-    use crate::{RAVEL_BASE, RAVEL_NS};
-    let iri = |id: &str| format!("<{RAVEL_BASE}Memory/{id}>");
+pub fn project_nt(
+    names: &crate::names::Names,
+    memories: &[Memory],
+    summaries: &HashMap<String, Summary>,
+) -> String {
+    use crate::RAVEL_NS;
+    let iri = |id: &str| format!("<{}>", names.memory(id));
     let p = |name: &str| format!("<{RAVEL_NS}{name}>");
     let lit = |s: &str| {
         format!(
@@ -414,7 +418,7 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
         nt += &format!("{s} {} {} .\n", p("windowEnd"), dt(&m.ts));
         nt += &format!("{s} {} {} .\n", p("memoryModel"), lit(&m.model));
         for t in &m.turns {
-            nt += &format!("{s} {related} <{RAVEL_BASE}Turn/{t}> .\n");
+            nt += &format!("{s} {related} <{}> .\n", names.turn(t));
         }
     }
     let mut blocks: Vec<(&String, &Summary)> = summaries.iter().collect();
@@ -448,32 +452,44 @@ pub fn project_nt(memories: &[Memory], summaries: &HashMap<String, Summary>) -> 
     nt
 }
 
-/// The named graph the memory projects into.
-pub const MEMORY_GRAPH: &str = "memory-v1";
-
-/// Replace the soul's `memory-v1` graph with a fresh projection of its logs.
-/// A soul with no memory yet gets an empty graph: an older projection (the
+/// Replace the soul's memory graph with a fresh projection of its logs.
+/// A soul with no memory yet gets no graph: an older projection (the
 /// clock-window index before 0.7.0) must not stand in for a memory that is
 /// not there. A no-op when the soul has no store yet. The caller holds the
 /// daemon's gate: this opens the store read-write.
 pub fn project_into_store(repo: &Path) -> Result<()> {
-    let log = MemoryLog::for_soul(repo);
-    let memories = log.memories()?;
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
     if !store_dir.join("CURRENT").exists() {
         return Ok(());
     }
+    let names = crate::names::Names::for_soul(repo)?;
+    let store = crate::readdress::open_current(repo, &names)?;
+    project_into(&store, repo, &names)
+}
+
+/// The same, into a store the caller already has open.
+pub fn project_into(
+    store: &oxigraph::store::Store,
+    repo: &Path,
+    names: &crate::names::Names,
+) -> Result<()> {
+    use crate::graph::{describe_graph, drop_graph, GraphKind};
+    use oxigraph::model::NamedNode;
+    let log = MemoryLog::for_soul(repo);
+    let memories = log.memories()?;
     let summaries = log.summaries()?;
-    let store = crate::graph::open(&store_dir)?;
-    let g = oxigraph::model::NamedNode::new(crate::graph::transcript_graph_iri(MEMORY_GRAPH))?;
-    store.clear_graph(oxigraph::model::GraphNameRef::NamedNode(g.as_ref()))?;
+    // The graph was called `memory-v1` until 0.10.0; that one goes for good.
+    drop_graph(store, &NamedNode::new(names.graph(crate::names::OLD_MEMORY_GRAPH))?)?;
+    let g = NamedNode::new(names.memory_graph())?;
+    drop_graph(store, &g)?;
     if memories.is_empty() {
         store.flush()?;
         return Ok(());
     }
     let parser = oxigraph::io::RdfParser::from_format(oxigraph::io::RdfFormat::NTriples)
-        .with_default_graph(g);
-    store.load_from_reader(parser, project_nt(&memories, &summaries).as_bytes())?;
+        .with_default_graph(g.clone());
+    store.load_from_reader(parser, project_nt(names, &memories, &summaries).as_bytes())?;
+    describe_graph(store, names, &g, GraphKind::Memory)?;
     store.flush()?;
     Ok(())
 }
@@ -604,7 +620,7 @@ mod tests {
         for b in [(0, 2), (2, 4), (0, 4)] {
             s.insert(memory::block_id(b), sum(b, "x"));
         }
-        let nt = project_nt(&ms, &s);
+        let nt = project_nt(&crate::names::Names::bare(), &ms, &s);
         let rel = "<https://repolex.ai/ontology/ravel/relatedToId>";
         let m = |id: &str| format!("<https://repolex.ai/ravel/Memory/{id}>");
         assert!(nt.contains(&format!(
@@ -688,7 +704,7 @@ mod tests {
         let ms: Vec<Memory> = (0..2).map(mem).collect();
         let mut s = HashMap::new();
         s.insert("0-1".to_string(), sum((0, 2), "x"));
-        let nt = project_nt(&ms, &s);
+        let nt = project_nt(&crate::names::Names::bare(), &ms, &s);
         let ns = crate::RAVEL_NS;
         let mut terms: Vec<String> = nt
             .split_whitespace()

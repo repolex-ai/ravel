@@ -1009,13 +1009,17 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
             .push(format!("wake line {} has no merge", l.label));
     }
     // The projection loads, and its edges land on real nodes.
-    let nt = memory_log::project_nt(&ms, &sums);
+    let names = crate::names::Names::for_soul(repo)?;
+    let nt = memory_log::project_nt(&names, &ms, &sums);
     v.nt_triples = nt.lines().count();
     let mem = oxigraph::store::Store::new()?;
     mem.load_from_reader(oxigraph::io::RdfFormat::NTriples, nt.as_bytes())?;
     let dangling = crate::graph::query_rows(
         &mem,
-        "SELECT (COUNT(*) AS ?n) WHERE { ?m <https://repolex.ai/ontology/ravel/relatedToId> ?c . FILTER(STRSTARTS(STR(?c), \"https://repolex.ai/ravel/Memory/\")) FILTER NOT EXISTS { ?c a <https://repolex.ai/ontology/ravel/Memory> } }",
+        &format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?m <https://repolex.ai/ontology/ravel/relatedToId> ?c . FILTER(STRSTARTS(STR(?c), \"{}\")) FILTER NOT EXISTS {{ ?c a <https://repolex.ai/ontology/ravel/Memory> }} }}",
+            names.memory("")
+        ),
     )?;
     let n: usize = dangling
         .first()
@@ -1036,7 +1040,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
         for chunk in cited.chunks(200) {
             let values: String = chunk
                 .iter()
-                .map(|t| format!("<{}Turn/{t}> ", crate::RAVEL_BASE))
+                .map(|t| format!("<{}> ", names.turn(t)))
                 .collect();
             let q = format!(
                 "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE {{ VALUES ?t {{ {values} }} GRAPH ?g {{ ?t a <https://repolex.ai/ontology/ravel/Turn> }} }}"

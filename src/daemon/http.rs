@@ -134,8 +134,25 @@ async fn souls(State(d): State<Shared>) -> Json<Value> {
         .iter()
         .map(|s| {
             let st = d.state_of(&s.id);
+            // The same three fields gitlexd reports for this soul. A repo
+            // whose .lex/repo.yml cannot be read as a root says why.
+            let names = crate::names::Names::for_soul(&s.path);
+            let (root, squad, username, names_error) = match &names {
+                Ok(n) => (
+                    Some(n.root().to_string()),
+                    n.squad().map(str::to_string),
+                    n.username().map(str::to_string),
+                    None,
+                ),
+                Err(e) => (None, None, None, Some(format!("{e:#}"))),
+            };
             json!({
                 "id": s.id,
+                "genesis": s.genesis,
+                "root": root,
+                "squad": squad,
+                "username": username,
+                "names_error": names_error,
                 "path": s.path.display().to_string(),
                 "last_sync": st.last_sync,
                 "last_error": st.last_error,
@@ -268,10 +285,12 @@ async fn memory_open(
             .find(|(i, m)| m.id == node || node.trim_start_matches('#') == i.to_string())
             .ok_or_else(|| anyhow::anyhow!("no note or block {node:?} in {}", soul.id))?;
         let store = open_store(&soul)?;
+        let names = crate::names::Names::for_soul(&soul.path)?;
         let mut turns = Vec::new();
         for t in &m.turns {
+            let turn = names.turn(t);
             let q = format!(
-                "SELECT ?ts ?role ?text WHERE {{ GRAPH ?g {{ <https://repolex.ai/ravel/Turn/{t}> <https://repolex.ai/ontology/ravel/timestamp> ?ts ; <https://repolex.ai/ontology/ravel/role> ?role . OPTIONAL {{ <https://repolex.ai/ravel/Turn/{t}> <https://repolex.ai/ontology/ravel/text> ?text }} }} }} LIMIT 1"
+                "SELECT ?ts ?role ?text WHERE {{ GRAPH ?g {{ <{turn}> <https://repolex.ai/ontology/ravel/timestamp> ?ts ; <https://repolex.ai/ontology/ravel/role> ?role . OPTIONAL {{ <{turn}> <https://repolex.ai/ontology/ravel/text> ?text }} }} }} LIMIT 1"
             );
             let row = graph::query_rows(&store, &q)?.into_iter().next().unwrap_or_default();
             turns.push(json!({
@@ -399,7 +418,8 @@ async fn soul_stats(
         let quads = scalar(&store, &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {g} }}"))?;
         let graphs = scalar(&store, &format!("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE {{ {g} }}"))?;
         let subjects = scalar(&store, &format!("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {g} }}"))?;
-        let turns = scalar(&store, "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?s), \"https://repolex.ai/ravel/Turn/\")) }")?;
+        let turn_prefix = crate::names::Names::for_soul(&soul.path)?.turn_partition();
+        let turns = scalar(&store, &format!("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} FILTER(STRSTARTS(STR(?s), \"{turn_prefix}\")) }}"))?;
         let dt = "FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime>)";
         let dated = scalar(&store, &format!("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?ts ?t }} {dt} }}"))?;
         let earliest = scalar(&store, &format!("SELECT (MIN(?t) AS ?m) WHERE {{ GRAPH ?g {{ ?s ?p ?t }} {dt} }}"))?;
@@ -483,7 +503,8 @@ enum Answer {
 /// every graph in view), then evaluated on the soul's store, read-only.
 fn answer(soul: &super::registry::Soul, text: &str) -> anyhow::Result<(Answer, Vec<String>)> {
     let store = open_store(soul)?;
-    let (results, report) = crate::outside::run(&store, text)?;
+    let names = crate::names::Names::for_soul(&soul.path)?;
+    let (results, report) = crate::outside::run(&store, text, names.root())?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
