@@ -532,6 +532,27 @@ mod tests {
         assert_eq!(query_emojikeys(&store, None).unwrap().len(), 1);
     }
 
+    /// Two souls' stores once held exactly 2,500 transcript graphs each
+    /// (goodlux asked, 2026-11-20, whether that was a ceiling). It is not:
+    /// a store on disk takes 2,600 and reports every one.
+    #[test]
+    fn a_store_has_no_ceiling_at_2500_graphs() {
+        let dir = std::env::temp_dir().join(format!("ravel-2600-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = open(&dir).unwrap();
+        let names = Names::new("7r1pl3f0rc3", "spacegoat").unwrap();
+        for i in 0..2600 {
+            let evs = vec![ev(&format!("t{i}"), "hello", SourceKind::Authored)];
+            ingest_transcript(&store, &evs, &[], &format!("sess-{i}"), &names).unwrap();
+        }
+        let n = |q: &str| query_rows(&store, q).unwrap()[0]["n"].clone();
+        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "2600");
+        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { ?g <https://repolex.ai/ontology/ravel/visibility> ?v }"), "2600");
+        assert_eq!(store.named_graphs().count(), 2600);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_graph_is_described_while_it_holds_something_and_not_after() {
         let store = Store::new().unwrap();
