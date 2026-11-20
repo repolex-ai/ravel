@@ -159,17 +159,51 @@ impl Daemon {
         })
     }
 
-    /// A soul by its six-character id, by its username (the name pand and
-    /// Syrinx use in a URL), or by a path inside it.
-    pub fn soul(&self, id_or_path: &str) -> Result<&Soul> {
-        if let Some(s) = self.souls.iter().find(|s| s.id == id_or_path) {
+    /// A soul as a caller names it in a URL: by its username, or by a path
+    /// inside its repo. Never by a hash: the six-character id is refused
+    /// here like any other unknown name, with the names that do work
+    /// (goodlux, 2026-11-20: usernames across the board, one way to say who).
+    pub fn soul_named(&self, name_or_path: &str) -> Result<&Soul> {
+        if let Some(s) = self
+            .souls
+            .iter()
+            .find(|s| s.name().as_deref() == Some(name_or_path))
+        {
             return Ok(s);
         }
-        if let Some(s) = self.souls.iter().find(|s| {
-            crate::names::Names::for_soul(&s.path)
-                .ok()
-                .is_some_and(|n| n.username() == Some(id_or_path))
-        }) {
+        if name_or_path.contains('/') {
+            if let Ok(p) = std::path::Path::new(name_or_path).canonicalize() {
+                if let Some(s) = self.souls.iter().find(|s| p.starts_with(&s.path)) {
+                    return Ok(s);
+                }
+            }
+        }
+        let mut names: Vec<String> = self.souls.iter().filter_map(|s| s.name()).collect();
+        names.sort();
+        let nameless: Vec<String> = self
+            .souls
+            .iter()
+            .filter(|s| s.name().is_none())
+            .map(|s| s.path.display().to_string())
+            .collect();
+        let mut msg = format!(
+            "no soul named {name_or_path:?}. A soul is named by its username: {}",
+            names.join(", ")
+        );
+        if !nameless.is_empty() {
+            msg += &format!(
+                ". {} served repo(s) have no username in .lex/repo.yml and cannot be named                  until `git lex kit-update` writes one: {}",
+                nameless.len(),
+                nameless.join(", ")
+            );
+        }
+        Err(anyhow!(msg))
+    }
+
+    /// A soul by raveld's own six-character id. For raveld's own code only;
+    /// no route takes this from a caller.
+    pub fn soul(&self, id_or_path: &str) -> Result<&Soul> {
+        if let Some(s) = self.souls.iter().find(|s| s.id == id_or_path) {
             return Ok(s);
         }
         if let Ok(p) = std::path::Path::new(id_or_path).canonicalize() {

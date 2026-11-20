@@ -206,7 +206,7 @@ pub async fn check(State(d): State<Arc<Daemon>>, req: Request, next: Next) -> Re
         }
     };
     let soul = match &needs {
-        Needs::WriteSoul(id) => d.soul(id).ok(),
+        Needs::WriteSoul(id) => d.soul_named(id).ok(),
         _ => None,
     };
     match decide(&needs, caller.as_ref(), soul, owner.as_ref(), READS_NEED_A_TOKEN) {

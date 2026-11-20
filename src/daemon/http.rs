@@ -120,7 +120,7 @@ async fn health(State(d): State<Shared>) -> Json<Value> {
         "config": d.cfg.path.display().to_string(),
         "config_present": d.cfg.present,
         "config_problems": d.problems,
-        "souls": d.souls.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        "souls": d.souls.iter().filter_map(|s| s.name()).collect::<Vec<_>>(),
         "passes": d.passes.load(std::sync::atomic::Ordering::Relaxed),
         "memory": d.memory_status(),
         "memory_state": d.memory_state(),
@@ -147,7 +147,9 @@ async fn souls(State(d): State<Shared>) -> Json<Value> {
                 Err(e) => (None, None, None, Some(format!("{e:#}"))),
             };
             json!({
-                "id": s.id,
+                // The name a caller uses in a URL. Null for a repo with no
+                // username: it is backed up, and cannot be asked for yet.
+                "id": username,
                 "genesis": s.genesis,
                 "root": root,
                 "squad": squad,
@@ -189,7 +191,7 @@ async fn sync_one(
     Path(id): Path<String>,
     body: Option<Json<SyncBody>>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let src = body
         .and_then(|Json(b)| b.sessions_dir)
         .map(std::path::PathBuf::from);
@@ -203,7 +205,7 @@ async fn sync_one(
     }
     let s = d.sync_one(&soul.id, src).await.map_err(internal)?;
     Ok(Json(
-        json!({ "id": soul.id, "path": soul.path.display().to_string(), "summary": s }),
+        json!({ "id": soul.name(), "path": soul.path.display().to_string(), "summary": s }),
     ))
 }
 
@@ -217,7 +219,7 @@ async fn import_one(
     Path(id): Path<String>,
     Json(b): Json<ImportBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let src = std::path::PathBuf::from(&b.path);
     if !src.is_dir() {
         return Err(bad(format!("{} is not a directory", src.display())));
@@ -228,7 +230,7 @@ async fn import_one(
         crate::sync::ImportOutcome::AlreadyImported { name } => ("already imported", name, 0, 0),
     };
     Ok(Json(json!({
-        "id": soul.id,
+        "id": soul.name(),
         "status": status,
         "export": name,
         "files": files,
@@ -247,14 +249,14 @@ async fn memory_view(
     Path(id): Path<String>,
     Query(q): Query<MemoryViewQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let lines = q.lines.unwrap_or(crate::memory::WAKE_LINES).max(1);
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let ms = log.memories()?;
         let sums = log.summaries()?;
         let view = crate::memory_log::wake_view(&ms, &sums, ms.len(), lines);
-        Ok(json!({ "id": soul.id, "memories": ms.len(), "summaries": sums.len(), "lines": view }))
+        Ok(json!({ "id": soul.name(), "memories": ms.len(), "summaries": sums.len(), "lines": view }))
     })
     .await
     .map_err(internal)?
@@ -266,7 +268,7 @@ async fn memory_open(
     State(d): State<Shared>,
     Path((id, node)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::{zoom, MemoryLog};
         let log = MemoryLog::for_soul(&soul.path);
@@ -283,7 +285,7 @@ async fn memory_open(
             .iter()
             .enumerate()
             .find(|(i, m)| m.id == node || node.trim_start_matches('#') == i.to_string())
-            .ok_or_else(|| anyhow::anyhow!("no note or block {node:?} in {}", soul.id))?;
+            .ok_or_else(|| anyhow::anyhow!("no note or block {node:?} in {}", soul.path.display()))?;
         let store = open_store(&soul)?;
         let names = crate::names::Names::for_soul(&soul.path)?;
         let mut turns = Vec::new();
@@ -316,7 +318,7 @@ async fn memory_progress(
     State(d): State<Shared>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         use crate::memory_log::MemoryLog;
         let log = MemoryLog::for_soul(&soul.path);
@@ -328,7 +330,7 @@ async fn memory_progress(
         // count includes tool output and subagents, which are never read.
         let (turns, counted) = log.stream_size().unwrap_or((0, String::new()));
         Ok(json!({
-            "id": soul.id,
+            "id": soul.name(),
             "turns": turns,
             "turns_counted": counted,
             "turns_read": read,
@@ -348,7 +350,7 @@ async fn soul_health(
     State(d): State<Shared>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let path = soul.path.clone();
     let findings = tokio::task::spawn_blocking(move || sync::diagnose(&path, None))
         .await
@@ -360,7 +362,7 @@ async fn soul_health(
         .map(|f| json!({ "attention": f.attention, "line": f.line }))
         .collect();
     Ok(Json(json!({
-        "id": soul.id,
+        "id": soul.name(),
         "path": soul.path.display().to_string(),
         "attention": attention,
         "findings": rows,
@@ -374,7 +376,7 @@ fn open_store(soul: &super::registry::Soul) -> anyhow::Result<Store> {
     if !dir.join("CURRENT").exists() {
         anyhow::bail!(
             "{} has no store yet at {} — nothing has been synced",
-            soul.id,
+            soul.path.display(),
             dir.display()
         );
     }
@@ -411,7 +413,7 @@ async fn soul_stats(
     State(d): State<Shared>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let store = open_store(&soul)?;
         let g = "GRAPH ?g { ?s ?p ?o }";
@@ -440,7 +442,7 @@ async fn soul_stats(
         }
         let num = |s: &str| s.parse::<u64>().unwrap_or(0);
         Ok(json!({
-            "id": soul.id,
+            "id": soul.name(),
             "path": soul.path.display().to_string(),
             "quads": num(&quads),
             "graphs": num(&graphs),
@@ -544,7 +546,7 @@ async fn soul_query(
     Path(id): Path<String>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &body.query))
         .await
         .map_err(internal)?
@@ -571,7 +573,7 @@ async fn store_sparql(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Response, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let kind = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -627,11 +629,11 @@ async fn memory_check(
     State(d): State<Shared>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let soul = d.soul(&id).map_err(not_found)?.clone();
+    let soul = d.soul_named(&id).map_err(not_found)?.clone();
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let log = crate::memory_log::MemoryLog::for_soul(&soul.path);
         let v = crate::memory_relive::verify(&soul.path, &log)?;
-        Ok(json!({ "id": soul.id, "check": v }))
+        Ok(json!({ "id": soul.name(), "check": v }))
     })
     .await
     .map_err(internal)?

@@ -31,6 +31,18 @@ pub struct Soul {
     pub path: PathBuf,
 }
 
+impl Soul {
+    /// The soul's username, from `.lex/repo.yml`: the only name a soul has
+    /// in a URL (goodlux, 2026-11-20). `id` and `genesis` are for raveld's
+    /// own bookkeeping and for matching a caller's token; neither is an
+    /// address. None when the repo has no username yet.
+    pub fn name(&self) -> Option<String> {
+        crate::names::Names::for_soul(&self.path)
+            .ok()
+            .and_then(|n| n.username().map(str::to_string))
+    }
+}
+
 /// The full genesis SHA of a repo.
 pub fn genesis_sha(repo: &Path) -> Result<String> {
     let repo_yml = repo.join(".lex").join("repo.yml");

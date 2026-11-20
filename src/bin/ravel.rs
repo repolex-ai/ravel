@@ -188,7 +188,7 @@ fn resolve(client: &Client, given: Option<&str>) -> Result<String> {
         }
         let p = std::path::Path::new(g)
             .canonicalize()
-            .with_context(|| format!("{g:?} is neither a registered soul id nor a path"))?;
+            .with_context(|| format!("{g:?} is neither a soul's username nor a path"))?;
         return by_path(&souls, &p).ok_or_else(|| not_registered(&p, &souls));
     }
     let here = std::env::current_dir()?.canonicalize()?;
@@ -243,7 +243,7 @@ fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
             .map(|s| {
                 format!(
                     "    {}  {}",
-                    s["id"].as_str().unwrap_or("?"),
+                    s["id"].as_str().unwrap_or("(no username yet)"),
                     s["path"].as_str().unwrap_or("?")
                 )
             })
@@ -253,9 +253,9 @@ fn not_registered(p: &std::path::Path, souls: &[Value]) -> anyhow::Error {
     let eg = souls
         .first()
         .and_then(|s| s["id"].as_str())
-        .unwrap_or("<id>");
+        .unwrap_or("<username>");
     anyhow!(
-        "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by id or path:\n    ravel status {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
+        "{} is not inside a registered soul.\n  Run the command inside a soul repo, or name the soul right after the command, by username or path:\n    ravel status {eg}\n    ravel import {eg} ~/Downloads/<export-folder>\n  Registered souls:\n{list}\n  To add this repo as a soul: put it under souls: in {} and run `raveld restart`.",
         p.display(),
         ravel::daemon::config::config_path().display()
     )
@@ -297,7 +297,7 @@ fn souls(client: &Client) -> Result<()> {
         let last = &s["last"];
         println!(
             "  {}  {}\n      last pass {}  {}",
-            s["id"].as_str().unwrap_or("?"),
+            s["id"].as_str().unwrap_or("(no username yet)"),
             s["path"].as_str().unwrap_or("?"),
             s["last_sync"].as_str().unwrap_or("never"),
             match s["last_error"].as_str() {
