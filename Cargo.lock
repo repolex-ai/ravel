@@ -1313,12 +1313,13 @@ dependencies = [
 
 [[package]]
 name = "ravel"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "axum",
  "calamus",
  "chrono",
+ "libc",
  "oxigraph",
  "reqwest",
  "serde",

@@ -1,6 +1,6 @@
 [package]
 name = "ravel"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2021"
 description = "Transcript-graph engine: a transcript becomes a graph of meaning. git-lex / Pool sibling."
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ anyhow = "1"
 sha2 = "0.10"
 # The daemon's HTTP surface and its clock; the same crates pan uses.
 axum = "0.8"
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_yaml = "0.9"

@@ -85,6 +85,7 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     super::log(format!("listening on http://{addr}"));
     tokio::spawn(name_every_other_signal());
+    std::thread::spawn(watch_own_memory);
     let stop = d.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -425,6 +426,26 @@ async fn soul_stats(
     Path((org, store)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
+    // One count at a time per store, and its answer stands for
+    // STATS_STAND_FOR: every caller that arrives meanwhile waits for that one
+    // count instead of starting its own. The count reads every statement
+    // nine times (27 s and over 1 GB on a 454,000-turn store), is not
+    // stopped by a hang-up, and before 0.11.4 a page that asked on a timer
+    // could start any number of them side by side.
+    let slot = {
+        let mut all = stats_kept().lock().unwrap();
+        all.entry(soul.path.clone()).or_default().clone()
+    };
+    let mut kept = slot.lock().await;
+    if let Some((when, v)) = kept.as_ref() {
+        if when.elapsed() < STATS_STAND_FOR {
+            let mut v = v.clone();
+            v["counted_secs_ago"] = json!(when.elapsed().as_secs());
+            return Ok(Json(v));
+        }
+    }
+    let began = std::time::Instant::now();
+    let shown = soul.address().unwrap_or_else(|| soul.path.display().to_string());
     let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let store = open_store(&soul)?;
         let g = "GRAPH ?g { ?s ?p ?o }";
@@ -469,7 +490,30 @@ async fn soul_stats(
     .await
     .map_err(internal)?
     .map_err(bad)?;
+    if began.elapsed() >= QUERY_IS_SLOW {
+        super::log(format!(
+            "stats on {shown} took {:.1}s; the answer stands for {} min",
+            began.elapsed().as_secs_f64(),
+            STATS_STAND_FOR.as_secs() / 60
+        ));
+    }
+    *kept = Some((std::time::Instant::now(), v.clone()));
+    let mut v = v;
+    v["counted_secs_ago"] = json!(0);
     Ok(Json(v))
+}
+
+/// How long one store's stats answer is given again before it is recounted.
+const STATS_STAND_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+type StatsSlot = Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>;
+
+fn stats_kept() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, StatsSlot>>,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
 }
 
 #[derive(Deserialize)]
@@ -625,6 +669,124 @@ impl Drop for Seat {
     }
 }
 
+/// raveld stops every running query when it holds this much memory.
+const MEMORY_STOPS_QUERIES: u64 = 6 << 30;
+/// raveld ends itself when it holds this much: a daemon that is down is
+/// found in a minute, one that fills swap freezes the whole machine
+/// (2026-11-21: 84 GB held, 75 of 76 GB of swap used).
+const MEMORY_ENDS_RAVELD: u64 = 12 << 30;
+
+/// A running query, as the memory watch needs to see it.
+struct Active {
+    store: String,
+    text: String,
+    began: std::time::Instant,
+    stop: oxigraph::sparql::CancellationToken,
+}
+
+fn active() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Active>> {
+    static A: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Active>>> =
+        std::sync::OnceLock::new();
+    A.get_or_init(Default::default)
+}
+
+/// Removes its query from [`active`] when the work ends.
+struct Listed(u64);
+
+impl Listed {
+    fn add(a: Active) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        active().lock().unwrap().insert(id, a);
+        Self(id)
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        active().lock().unwrap().remove(&self.0);
+    }
+}
+
+/// The memory this process holds as macOS counts it against the machine:
+/// resident plus compressed. `ps` RSS misses the compressed part, which on
+/// 2026-11-21 was 82 of the 84 GB.
+#[cfg(target_os = "macos")]
+fn memory_held() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: the buffer is a rusage_info_v2, the flavor asked for.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr() as *mut libc::rusage_info_t,
+        )
+    };
+    // SAFETY: the kernel filled it when rc is 0.
+    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_held() -> Option<u64> {
+    None
+}
+
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Every two seconds: past [`MEMORY_STOPS_QUERIES`], name and stop every
+/// running query; past [`MEMORY_ENDS_RAVELD`], say so and end the process.
+fn watch_own_memory() {
+    if memory_held().is_none() {
+        super::log("cannot read this process's memory; the memory watch is off");
+        return;
+    }
+    let mut warned = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let Some(held) = memory_held() else { continue };
+        if held < MEMORY_STOPS_QUERIES {
+            warned = false;
+            continue;
+        }
+        let running: Vec<String> = {
+            let a = active().lock().unwrap();
+            a.values()
+                .map(|q| {
+                    q.stop.cancel();
+                    format!(
+                        "  {} for {:.0}s: {}",
+                        q.store,
+                        q.began.elapsed().as_secs_f64(),
+                        q.text
+                    )
+                })
+                .collect()
+        };
+        if !warned || held >= MEMORY_ENDS_RAVELD {
+            super::log(format!(
+                "MEMORY: raveld holds {:.1} GB (queries are stopped at {:.0} GB, raveld ends at {:.0} GB); \
+                 {} running, all told to stop:\n{}",
+                gb(held),
+                gb(MEMORY_STOPS_QUERIES),
+                gb(MEMORY_ENDS_RAVELD),
+                running.len(),
+                running.join("\n")
+            ));
+            warned = true;
+        }
+        if held >= MEMORY_ENDS_RAVELD {
+            super::log(format!(
+                "MEMORY: {:.1} GB held; raveld is ending itself so the machine stays usable. \
+                 Any `ravel` command starts it again",
+                gb(held)
+            ));
+            std::process::exit(3);
+        }
+    }
+}
+
 /// Stops the work when the handler is dropped, which is what happens when
 /// the caller hangs up before the answer.
 struct StopWhenDropped(oxigraph::sparql::CancellationToken);
@@ -669,8 +831,14 @@ async fn ask(
     let hung_up = StopWhenDropped(stop.clone());
     let (for_work, shown, began) = (stop.clone(), one_line(&text), std::time::Instant::now());
     let who = name.clone();
+    let listed = Listed::add(Active {
+        store: name.clone(),
+        text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+        began,
+        stop: stop.clone(),
+    });
     let mut work = tokio::task::spawn_blocking(move || {
-        let _seat = seat;
+        let (_seat, _listed) = (seat, listed);
         let out = answer(&soul, &text, for_work.clone());
         let took = began.elapsed();
         if for_work.is_cancelled() {
