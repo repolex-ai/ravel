@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "ravel"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1789,8 +1789,8 @@ dependencies = [
 
 [[package]]
 name = "tessera"
-version = "0.1.0"
-source = "git+https://github.com/repolex-ai/tessera#7839d0e05ac8dee5b7fdd12ab882aadb293136a5"
+version = "0.1.1"
+source = "git+https://github.com/repolex-ai/tessera?rev=1142eb66066624ebfa405b7679b3731e72b8fc4f#1142eb66066624ebfa405b7679b3731e72b8fc4f"
 dependencies = [
  "base64",
  "ed25519-dalek",

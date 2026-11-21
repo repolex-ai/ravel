@@ -1,6 +1,6 @@
 [package]
 name = "ravel"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 description = "Transcript-graph engine: a transcript becomes a graph of meaning. git-lex / Pool sibling."
 license = "Apache-2.0"
@@ -41,6 +41,6 @@ serde_yaml = "0.9"
 # the store sees them: ontology rewriting now, short addresses at the cutover.
 calamus = { git = "https://github.com/repolex-ai/calamus", features = ["turtle"] }
 # Who is asking, and whether they may: the stack's shared crate (tr1pl3x's).
-tessera = { git = "https://github.com/repolex-ai/tessera" }
+tessera = { git = "https://github.com/repolex-ai/tessera", rev = "1142eb66066624ebfa405b7679b3731e72b8fc4f" }
 # The parsed-query type calamus and oxigraph share; oxigraph picks the 0.4.x.
 spargebra = { version = "0.4.6", features = ["sparql-12"] }
