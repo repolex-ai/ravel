@@ -468,6 +468,7 @@ pub fn project_into_store(repo: &Path) -> Result<()> {
     // 0.11.7 every soul's whole memory graph was dropped and loaded again
     // every ten minutes, changed or not (13 s and 1.2 GB for 36,000 records,
     // twenty souls in a row with sync waiting behind them).
+    let _alone = crate::graph::writing(&store_dir);
     let stamp_file = repo.join(MEMORY_SUBDIR).join("projected.stamp");
     let stamp = projection_stamp(repo, &names);
     let store = crate::readdress::open_current(repo, &names)?;

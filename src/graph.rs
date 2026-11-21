@@ -132,6 +132,99 @@ pub fn open(path: impl AsRef<Path>) -> Result<Store> {
         .with_context(|| format!("open oxigraph store at {}", path.as_ref().display()))
 }
 
+// ───────────────── readers and the writer never overlap ─────────────────
+//
+// A read-only handle is a second RocksDB instance over the directory the
+// writer is changing, with no snapshot. When the writer flushes or compacts,
+// a file the reader is iterating can vanish; the iterator then reports an
+// error on EVERY later call and never ends
+// (oxigraph 0.5.9 storage/rocksdb.rs: `if let Err(e) = self.iter.status()
+// { return Some(Err(e)) }`), and spareval's joins push each error onto a
+// Vec and keep reading (spareval 0.2.6 eval.rs, `errors.push`). One query
+// caught that way grows by gigabytes until the process is killed: raveld,
+// 2026-11-21, 84 GB and then 12.4 GB. Reproduced by
+// `outside::tests::real_reader_beside_writer`; mechanism found with
+// tr1pl3x.
+//
+// Until raveld keeps one shared Store per soul, every reader in this process
+// holds [`reading`] for as long as its handle is open, and every writer
+// holds [`writing`]: many readers together, or one writer alone.
+
+#[derive(Default)]
+struct Turnstile {
+    state: std::sync::Mutex<TurnstileState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TurnstileState {
+    readers: usize,
+    writing: bool,
+    writers_waiting: usize,
+}
+
+fn turnstile(dir: &Path) -> std::sync::Arc<Turnstile> {
+    static ALL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<Turnstile>>>,
+    > = std::sync::OnceLock::new();
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    ALL.get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+/// Held by a reader of the store at `dir`; released when dropped.
+pub struct Reading(std::sync::Arc<Turnstile>);
+/// Held by the writer of the store at `dir`; released when dropped.
+pub struct Writing(std::sync::Arc<Turnstile>);
+
+/// Wait until no writer has the store at `dir` (or is waiting for it), then
+/// hold it for reading alongside any other readers.
+pub fn reading(dir: &Path) -> Reading {
+    let t = turnstile(dir);
+    {
+        let mut s = t.state.lock().unwrap();
+        while s.writing || s.writers_waiting > 0 {
+            s = t.changed.wait(s).unwrap();
+        }
+        s.readers += 1;
+    }
+    Reading(t)
+}
+
+/// Wait until nobody has the store at `dir`, then hold it alone. A waiting
+/// writer goes ahead of readers that arrive after it.
+pub fn writing(dir: &Path) -> Writing {
+    let t = turnstile(dir);
+    {
+        let mut s = t.state.lock().unwrap();
+        s.writers_waiting += 1;
+        while s.writing || s.readers > 0 {
+            s = t.changed.wait(s).unwrap();
+        }
+        s.writers_waiting -= 1;
+        s.writing = true;
+    }
+    Writing(t)
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().readers -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().writing = false;
+        self.0.changed.notify_all();
+    }
+}
+
 /// Open the store read-only (shared lock — many readers, or a reader beside a
 /// writer). The path must already exist.
 pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
@@ -413,6 +506,45 @@ fn safe(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn readers_share_a_store_and_a_writer_has_it_alone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("ravel-turnstile-{}", std::process::id()));
+        let (inside, overlaps) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // Two readers at once is allowed.
+        let (a, b) = (super::reading(&dir), super::reading(&dir));
+        drop((a, b));
+        let mut threads = Vec::new();
+        for k in 0..8 {
+            let (dir, inside, overlaps) = (dir.clone(), inside.clone(), overlaps.clone());
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if k % 2 == 0 {
+                        let _w = super::writing(&dir);
+                        // A writer must find nobody inside, and nobody may enter.
+                        if inside.fetch_add(1000, Ordering::SeqCst) != 0 {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        inside.fetch_sub(1000, Ordering::SeqCst);
+                    } else {
+                        let _r = super::reading(&dir);
+                        if inside.fetch_add(1, Ordering::SeqCst) >= 1000 {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(overlaps.load(Ordering::SeqCst), 0);
+    }
     use super::*;
     use crate::reader::emojikey_read;
     use crate::{Event, SourceKind, TextSpan};

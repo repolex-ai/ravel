@@ -382,7 +382,21 @@ async fn soul_health(
     })))
 }
 
-fn open_store(soul: &super::registry::Soul) -> anyhow::Result<Store> {
+/// A store open for reading, with its place at the store's turnstile
+/// (`graph::reading`). The store closes before the place is given up.
+struct Opened {
+    store: Store,
+    _hold: graph::Reading,
+}
+
+impl std::ops::Deref for Opened {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+fn open_store(soul: &super::registry::Soul) -> anyhow::Result<Opened> {
     let dir = soul.path.join(sync::STORE_SUBDIR);
     // Never create a store from a read: a mis-aimed path must refuse, not
     // litter an empty store and report a trustworthy-looking zero.
@@ -393,7 +407,11 @@ fn open_store(soul: &super::registry::Soul) -> anyhow::Result<Store> {
             dir.display()
         );
     }
-    graph::open_read_only(&dir)
+    let _hold = graph::reading(&dir);
+    Ok(Opened {
+        store: graph::open_read_only(&dir)?,
+        _hold,
+    })
 }
 
 fn literal_value(t: &Term) -> String {

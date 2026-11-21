@@ -869,6 +869,8 @@ fn refuse_a_folder_that_is_not_a_repo(repo: &Path) -> Result<()> {
 pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> {
     refuse_a_folder_that_is_not_a_repo(repo)?;
     migrate_legacy_layout(repo)?;
+    // Alone at the store for the whole pass: see `graph::writing`.
+    let _alone = graph::writing(&repo.join(STORE_SUBDIR));
     let src = match sessions_src {
         Some(p) => p.to_path_buf(),
         None => claude_sessions_dir_for(repo)?,
@@ -1765,6 +1767,7 @@ pub fn diagnose(repo: &Path, sessions_src: Option<&Path>) -> Result<Vec<DiagFind
             ),
         );
     } else {
+        let _hold = graph::reading(&store_dir);
         let store = graph::open_read_only(&store_dir)?;
         let count = |q: &str| -> Result<String> {
             use oxigraph::model::Term;

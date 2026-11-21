@@ -1033,6 +1033,7 @@ pub fn verify(repo: &Path, log: &MemoryLog) -> Result<Verified> {
     // Every cited turn is a Turn node in the soul's own store.
     let store_dir = repo.join(crate::sync::STORE_SUBDIR);
     if store_dir.join("CURRENT").exists() {
+        let _hold = crate::graph::reading(&store_dir);
         let store = crate::graph::open_read_only(&store_dir)?;
         cited.sort();
         cited.dedup();

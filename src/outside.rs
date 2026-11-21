@@ -106,6 +106,85 @@ mod tests {
     use super::*;
     use oxigraph::io::RdfFormat;
 
+    /// A writer and a reader over one store directory, as raveld runs them:
+    /// the writer opens read-write, adds a turn, flushes and closes, again
+    /// and again; the reader opens read-only and runs the query, again and
+    /// again. `RAVEL_TRIAL_STORE` must be a scratch COPY: it is written to.
+    #[test]
+    #[ignore]
+    fn real_reader_beside_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir = std::env::var("RAVEL_TRIAL_STORE").unwrap();
+        assert!(dir.contains("scratchpad"), "a scratch copy only");
+        let q = std::fs::read_to_string(std::env::var("RAVEL_TRIAL_QUERY").unwrap()).unwrap();
+        let base = std::env::var("RAVEL_TRIAL_BASE").unwrap();
+        let secs: u64 = std::env::var("RAVEL_TRIAL_SECS").map(|s| s.parse().unwrap()).unwrap_or(60);
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (dir, base, done) = (dir.clone(), base.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    // `RAVEL_TRIAL_HOLD=1`: take turns at the store, as raveld does.
+                    let _alone = std::env::var("RAVEL_TRIAL_HOLD")
+                        .is_ok()
+                        .then(|| crate::graph::writing(std::path::Path::new(&dir)));
+                    let store = crate::graph::open(std::path::Path::new(&dir)).unwrap();
+                    let g = oxigraph::model::NamedNode::new(format!("{base}ravel/NamedGraph/trial")).unwrap();
+                    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let nt = format!(
+                        "<{base}ravel/Turn/trial-{n}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> .\n\
+                         <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/timestamp> \"{ts}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .\n\
+                         <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/role> \"assistant\" .\n\
+                         <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/text> \"trial line {n}\" .\n\
+                         <{base}ravel/Turn/trial-{n}> <https://repolex.ai/ontology/ravel/parentTurn> <{base}ravel/Turn/trial-{}> .\n",
+                        n.saturating_sub(1)
+                    );
+                    let parser = oxigraph::io::RdfParser::from_format(RdfFormat::NTriples).with_default_graph(g);
+                    store.load_from_reader(parser, nt.as_bytes()).unwrap();
+                    store.flush().unwrap();
+                    drop(store);
+                    n += 1;
+                }
+                n
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let (mut runs, mut worst, mut failed) = (0u32, 0f64, 0u32);
+        while t0.elapsed().as_secs() < secs {
+            let t = std::time::Instant::now();
+            let _hold = std::env::var("RAVEL_TRIAL_HOLD")
+                .is_ok()
+                .then(|| crate::graph::reading(std::path::Path::new(&dir)));
+            match crate::graph::open_read_only(std::path::Path::new(&dir)) {
+                Ok(store) => match run(&store, &q, &base) {
+                    Ok((QueryResults::Solutions(sols), _)) => {
+                        let rows = sols.filter(|s| s.is_ok()).count();
+                        let took = t.elapsed().as_secs_f64();
+                        if took > 3.0 {
+                            eprintln!("SLOW: {took:.1}s, {rows} rows, at {:.0}s", t0.elapsed().as_secs_f64());
+                        }
+                        worst = worst.max(took);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("QUERY FAILED: {e:#}");
+                    }
+                },
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("OPEN FAILED: {e:#}");
+                }
+            }
+            runs += 1;
+        }
+        done.store(true, Ordering::Relaxed);
+        let written = writer.join().unwrap();
+        eprintln!("DONE: {runs} queries, worst {worst:.2}s, {failed} failed, {written} turns written");
+    }
+
     /// One query against a real store, read-only, timed. `RAVEL_TRIAL_STORE`
     /// is an oxigraph directory, `RAVEL_TRIAL_QUERY` a file, `RAVEL_TRIAL_BASE`
     /// the store's root address.
