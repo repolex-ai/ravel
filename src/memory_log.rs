@@ -463,8 +463,52 @@ pub fn project_into_store(repo: &Path) -> Result<()> {
         return Ok(());
     }
     let names = crate::names::Names::for_soul(repo)?;
+    // Nothing written to the log since the graph was last made from it, by
+    // this version, at these addresses: the graph is already right. Before
+    // 0.11.7 every soul's whole memory graph was dropped and loaded again
+    // every ten minutes, changed or not (13 s and 1.2 GB for 36,000 records,
+    // twenty souls in a row with sync waiting behind them).
+    let stamp_file = repo.join(MEMORY_SUBDIR).join("projected.stamp");
+    let stamp = projection_stamp(repo, &names);
     let store = crate::readdress::open_current(repo, &names)?;
-    project_into(&store, repo, &names)
+    let graph = oxigraph::model::NamedNode::new(names.memory_graph())?;
+    if stamp.is_some()
+        && std::fs::read_to_string(&stamp_file).ok() == stamp
+        && store.contains_named_graph(&graph)?
+    {
+        return Ok(());
+    }
+    project_into(&store, repo, &names)?;
+    match stamp {
+        Some(st) if repo.join(MEMORY_SUBDIR).is_dir() => std::fs::write(&stamp_file, st)
+            .with_context(|| format!("write {}", stamp_file.display()))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// What the memory graph was made from: this version of ravel, the soul's
+/// addresses, and each log file's length and time of last change. None when
+/// a log file cannot be read, which always means "make the graph".
+fn projection_stamp(repo: &Path, names: &crate::names::Names) -> Option<String> {
+    let mut out = format!("{}\t{}", env!("CARGO_PKG_VERSION"), names.root());
+    for name in ["memories.jsonl", "summaries.jsonl"] {
+        let p = repo.join(MEMORY_SUBDIR).join(name);
+        match std::fs::metadata(&p) {
+            Ok(m) => {
+                let t = m
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos();
+                out.push_str(&format!("\t{}:{t}", m.len()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push_str("\t-"),
+            Err(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// The same, into a store the caller already has open.
@@ -543,6 +587,39 @@ fn append_jsonl<T: Serialize>(p: &Path, items: &[T]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stamp_changes_when_the_log_or_the_addresses_do() {
+        let repo = std::env::temp_dir().join(format!("ravel-stamp-{}", std::process::id()));
+        std::fs::remove_dir_all(&repo).ok();
+        let dir = repo.join(super::MEMORY_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bare = crate::names::Names::bare();
+        let none_yet = super::projection_stamp(&repo, &bare).unwrap();
+        assert_eq!(super::projection_stamp(&repo, &bare).unwrap(), none_yet);
+        std::fs::write(dir.join("memories.jsonl"), "{}\n").unwrap();
+        let one = super::projection_stamp(&repo, &bare).unwrap();
+        assert_ne!(one, none_yet, "a log that appeared");
+        std::fs::write(dir.join("memories.jsonl"), "{}\n{}\n").unwrap();
+        let two = super::projection_stamp(&repo, &bare).unwrap();
+        assert_ne!(two, one, "a log that grew");
+        let named = crate::names::Names::new("squad", "someone").unwrap();
+        assert_ne!(super::projection_stamp(&repo, &named).unwrap(), two, "other addresses");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The memory graph of a real store, rewritten once, timed.
+    /// `RAVEL_TRIAL_REPO` is a scratch copy of a soul, never a live one.
+    #[test]
+    #[ignore]
+    fn real_memory_projection() {
+        let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
+        for round in ["first", "again, nothing changed"] {
+            let t = std::time::Instant::now();
+            super::project_into_store(&repo).unwrap();
+            eprintln!("PROJECTED ({round}) in {:.2}s", t.elapsed().as_secs_f64());
+        }
+    }
+
     use super::*;
 
     fn mem(i: usize) -> Memory {
