@@ -63,8 +63,22 @@ pub fn run<'a>(
     text: &str,
     base: &str,
 ) -> Result<(QueryResults<'a>, Report)> {
+    run_until(store, text, base, None)
+}
+
+/// [`run`], with a token the caller can use to stop the work part-way.
+pub fn run_until<'a>(
+    store: &'a Store,
+    text: &str,
+    base: &str,
+    stop: Option<oxigraph::sparql::CancellationToken>,
+) -> Result<(QueryResults<'a>, Report)> {
     let (query, report) = prepare(text, base)?;
-    let mut prepared = SparqlEvaluator::new().for_query(query);
+    let mut evaluator = SparqlEvaluator::new();
+    if let Some(stop) = stop {
+        evaluator = evaluator.with_cancellation_token(stop);
+    }
+    let mut prepared = evaluator.for_query(query);
     // FROM / FROM NAMED written by the caller is kept as written.
     if prepared.dataset().is_default_dataset() {
         prepared.dataset_mut().set_default_graph_as_union();

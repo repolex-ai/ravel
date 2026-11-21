@@ -544,10 +544,14 @@ enum Answer {
 
 /// Run an outside query: prepared by `crate::outside` (base, calamus,
 /// every graph in view), then evaluated on the soul's store, read-only.
-fn answer(soul: &super::registry::Soul, text: &str) -> anyhow::Result<(Answer, Vec<String>)> {
+fn answer(
+    soul: &super::registry::Soul,
+    text: &str,
+    stop: oxigraph::sparql::CancellationToken,
+) -> anyhow::Result<(Answer, Vec<String>)> {
     let store = open_store(soul)?;
     let names = crate::names::Names::for_soul(&soul.path)?;
-    let (results, report) = crate::outside::run(&store, text, names.root())?;
+    let (results, report) = crate::outside::run_until(&store, text, names.root(), Some(stop))?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
@@ -579,6 +583,129 @@ fn answer(soul: &super::registry::Soul, text: &str) -> anyhow::Result<(Answer, V
     Ok((a, notes))
 }
 
+/// How many outside queries one store runs at once. One more is refused
+/// with 503 rather than queued: a reader on a timer whose question takes
+/// longer than its interval otherwise stacks work without end (2026-11-21,
+/// an 8 s question asked every 4 s).
+const QUERIES_AT_ONCE: usize = 4;
+/// A query still running after this long is stopped and answered 503.
+const QUERY_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// A query that took at least this long is written to the log.
+const QUERY_IS_SLOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn running() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// One of a store's running queries. Held by the work itself, so a caller
+/// that walks away does not free the place while the work is still going.
+struct Seat(std::path::PathBuf);
+
+impl Seat {
+    fn take(path: &std::path::Path) -> Option<Self> {
+        let mut r = running().lock().unwrap();
+        let n = r.entry(path.to_path_buf()).or_insert(0);
+        if *n >= QUERIES_AT_ONCE {
+            return None;
+        }
+        *n += 1;
+        Some(Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        let mut r = running().lock().unwrap();
+        if let Some(n) = r.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+/// Stops the work when the handler is dropped, which is what happens when
+/// the caller hangs up before the answer.
+struct StopWhenDropped(oxigraph::sparql::CancellationToken);
+
+impl Drop for StopWhenDropped {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut cut = flat.chars().take(200).collect::<String>();
+    if flat.chars().count() > 200 {
+        cut.push('…');
+    }
+    cut
+}
+
+/// An outside query, with a place at the store, a time limit, and a line in
+/// the log when it was slow, stopped or abandoned.
+async fn ask(
+    soul: super::registry::Soul,
+    text: String,
+) -> Result<(Answer, Vec<String>), ApiError> {
+    let name = soul
+        .address()
+        .unwrap_or_else(|| soul.path.display().to_string());
+    let Some(seat) = Seat::take(&soul.path) else {
+        super::log(format!(
+            "query refused on {name}: {QUERIES_AT_ONCE} already running: {}",
+            one_line(&text)
+        ));
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "{name} already has {QUERIES_AT_ONCE} queries running; ask again when one has finished. A query asked on a timer must take less time than its interval"
+            ),
+        ));
+    };
+    let stop = oxigraph::sparql::CancellationToken::new();
+    let hung_up = StopWhenDropped(stop.clone());
+    let (for_work, shown, began) = (stop.clone(), one_line(&text), std::time::Instant::now());
+    let who = name.clone();
+    let mut work = tokio::task::spawn_blocking(move || {
+        let _seat = seat;
+        let out = answer(&soul, &text, for_work.clone());
+        let took = began.elapsed();
+        if for_work.is_cancelled() {
+            super::log(format!(
+                "query stopped on {who} after {:.1}s (time limit {}s, or the caller hung up): {shown}",
+                took.as_secs_f64(),
+                QUERY_TIME_LIMIT.as_secs()
+            ));
+        } else if took >= QUERY_IS_SLOW {
+            super::log(format!(
+                "slow query on {who}: {:.1}s: {shown}",
+                took.as_secs_f64()
+            ));
+        }
+        out
+    });
+    let out = tokio::select! {
+        r = &mut work => r,
+        _ = tokio::time::sleep(QUERY_TIME_LIMIT) => {
+            stop.cancel();
+            let _ = work.await;
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the query on {name} ran for {} seconds and was stopped; narrow it (sort fewer rows, or filter before ORDER BY)",
+                    QUERY_TIME_LIMIT.as_secs()
+                ),
+            ));
+        }
+    };
+    // Answered: nothing left to stop.
+    std::mem::forget(hung_up);
+    out.map_err(internal)?.map_err(bad)
+}
+
 /// ravel's own route, JSON in and JSON out. `notes` is present only when
 /// the query holds a name that was left as written and will likely match
 /// nothing; the answer itself cannot say so.
@@ -588,10 +715,7 @@ async fn soul_query(
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, ApiError> {
     let soul = d.soul_named(&org, &store).map_err(not_found)?.clone();
-    let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &body.query))
-        .await
-        .map_err(internal)?
-        .map_err(bad)?;
+    let (a, notes) = ask(soul, body.query).await?;
     let mut v = match a {
         Answer::Results(v) => v,
         Answer::Triples(t) => json!({ "triples": t }),
@@ -636,10 +760,7 @@ async fn store_sparql(
             ))
         }
     };
-    let (a, notes) = tokio::task::spawn_blocking(move || answer(&soul, &text))
-        .await
-        .map_err(internal)?
-        .map_err(bad)?;
+    let (a, notes) = ask(soul, text).await?;
     let (ctype, out) = match a {
         Answer::Results(v) => ("application/sparql-results+json", v.to_string()),
         Answer::Triples(t) => {
