@@ -106,6 +106,29 @@ mod tests {
     use super::*;
     use oxigraph::io::RdfFormat;
 
+    /// One query against a real store, read-only, timed. `RAVEL_TRIAL_STORE`
+    /// is an oxigraph directory, `RAVEL_TRIAL_QUERY` a file, `RAVEL_TRIAL_BASE`
+    /// the store's root address.
+    #[test]
+    #[ignore]
+    fn real_query() {
+        let dir = std::env::var("RAVEL_TRIAL_STORE").unwrap();
+        let q = std::fs::read_to_string(std::env::var("RAVEL_TRIAL_QUERY").unwrap()).unwrap();
+        let base = std::env::var("RAVEL_TRIAL_BASE").unwrap();
+        let t = std::time::Instant::now();
+        let store = crate::graph::open_read_only(std::path::Path::new(&dir)).unwrap();
+        eprintln!("OPENED in {:.2}s", t.elapsed().as_secs_f64());
+        let (r, _) = run(&store, &q, &base).unwrap();
+        let mut n = 0usize;
+        if let QueryResults::Solutions(sols) = r {
+            for s in sols {
+                s.unwrap();
+                n += 1;
+            }
+        }
+        eprintln!("ROWS {n} in {:.2}s", t.elapsed().as_secs_f64());
+    }
+
     const DATA: &str = r#"
 <https://repolex.ai/ravel/Turn/t1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> <https://repolex.ai/ravel/NamedGraph/a> .
 <https://repolex.ai/ravel/Turn/t1> <https://repolex.ai/ontology/ravel/role> "user" <https://repolex.ai/ravel/NamedGraph/a> .

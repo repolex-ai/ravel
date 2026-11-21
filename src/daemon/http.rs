@@ -683,11 +683,13 @@ impl Drop for Seat {
 /// twice a minute. Nothing is stopped: this is how a rise gets a name.
 const MEMORY_IS_NOTED: u64 = 3 << 30;
 /// raveld stops every running query when it holds this much memory.
-const MEMORY_STOPS_QUERIES: u64 = 6 << 30;
+const MEMORY_STOPS_QUERIES: u64 = 4 << 30;
 /// raveld ends itself when it holds this much: a daemon that is down is
-/// found in a minute, one that fills swap freezes the whole machine
+/// found in a minute, one that fills swap freezes the whole machine, and
+/// this Mac's memory is shared with the GPU that runs the models (12 GB
+/// until 0.11.8; goodlux, 2026-11-21: that is far too much)
 /// (2026-11-21: 84 GB held, 75 of 76 GB of swap used).
-const MEMORY_ENDS_RAVELD: u64 = 12 << 30;
+const MEMORY_ENDS_RAVELD: u64 = 6 << 30;
 
 /// A running query, as the memory watch needs to see it.
 struct Active {
