@@ -84,6 +84,7 @@ pub async fn serve(d: Shared) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", d.cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     super::log(format!("listening on http://{addr}"));
+    tokio::spawn(name_every_other_signal());
     let stop = d.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -500,6 +501,36 @@ async fn terminated() {
             s.recv().await;
         }
         Err(_) => std::future::pending().await,
+    }
+}
+
+/// Signals that would end the process without a word, caught and written to
+/// the log instead; the daemon stays up. With these named, a daemon that is
+/// gone with no last line was killed outright (SIGKILL) or crashed below Rust:
+/// on 2026-11-21 it vanished after 08:00:13 with nothing written, and nobody
+/// could say which.
+async fn name_every_other_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let kinds = [
+        ("SIGHUP", SignalKind::hangup()),
+        ("SIGQUIT", SignalKind::quit()),
+        ("SIGUSR1", SignalKind::user_defined1()),
+        ("SIGUSR2", SignalKind::user_defined2()),
+        ("SIGALRM", SignalKind::alarm()),
+    ];
+    for (name, kind) in kinds {
+        match signal(kind) {
+            Ok(mut s) => {
+                tokio::spawn(async move {
+                    while s.recv().await.is_some() {
+                        super::log(format!(
+                            "{name} received; staying up (`raveld stop` or SIGTERM stops it)"
+                        ));
+                    }
+                });
+            }
+            Err(e) => super::log(format!("cannot watch for {name}: {e}")),
+        }
     }
 }
 
