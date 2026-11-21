@@ -265,6 +265,31 @@ pub fn ingest_transcript(
         .count())
 }
 
+/// Add turns to a transcript graph that already holds the earlier ones.
+///
+/// What a pass does when a transcript has only grown at its end: the new
+/// lines' turns are loaded and nothing is cleared. A turn's address is made
+/// from its id, so loading one that is already there changes nothing.
+/// [`ingest_transcript`] is still what loads a transcript the first time,
+/// and again whenever its earlier bytes are not what was loaded before.
+pub fn append_transcript(
+    store: &Store,
+    events: &[Event],
+    anns: &[Annotation],
+    transcript_id: &str,
+    names: &Names,
+) -> Result<()> {
+    let graph_iri = transcript_graph_iri(names, transcript_id);
+    let graph = NamedNode::new(&graph_iri).context("transcript graph IRI")?;
+    let mut nt = project_nt(events, &names.turn_partition())?;
+    nt.push_str(&annotation_nt(anns, transcript_id, names)?);
+    let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
+    store.load_from_reader(parser, nt.as_bytes())?;
+    describe_graph(store, names, &graph, GraphKind::Transcript)?;
+    store.flush()?;
+    Ok(())
+}
+
 /// A cross-session query result row: one harvested emojikey with provenance.
 #[derive(Debug, Clone)]
 pub struct EmojikeyHit {

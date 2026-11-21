@@ -295,6 +295,14 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
                 );
                 unchanged += 1;
             }
+            // The usual case for a live session: the source is the mirror
+            // plus new lines. Only those bytes are copied. (A 1 GB session
+            // was copied whole for every line added to it, 2026-11-21.)
+            Ok(dst_len) if dst_len > 0 && same_bytes_before(&path, &to, dst_len) => {
+                append_after(&path, &to, dst_len)
+                    .with_context(|| format!("extend {} from {}", to.display(), path.display()))?;
+                copied += 1;
+            }
             _ => {
                 std::fs::copy(&path, &to)
                     .with_context(|| format!("copy {} → {}", path.display(), to.display()))?;
@@ -303,6 +311,78 @@ fn mirror_jsonl(src: &Path, dst: &Path) -> Result<(usize, usize)> {
         }
     }
     Ok((copied, unchanged))
+}
+
+/// How many bytes before an offset are compared or fingerprinted to decide
+/// that a file still begins the way it did.
+const LOOK_BACK: u64 = 64 * 1024;
+
+fn bytes_before(path: &Path, off: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = off.saturating_sub(LOOK_BACK);
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; (off - start) as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Whether two files hold the same last [`LOOK_BACK`] bytes before `off`.
+/// Any failure to read is a no: the caller then copies the whole file.
+fn same_bytes_before(a: &Path, b: &Path, off: u64) -> bool {
+    match (bytes_before(a, off), bytes_before(b, off)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Append to `dst` everything `src` holds after byte `off`.
+fn append_after(src: &Path, dst: &Path, off: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut from = std::fs::File::open(src)?;
+    from.seek(SeekFrom::Start(off))?;
+    let mut to = std::fs::OpenOptions::new().append(true).open(dst)?;
+    std::io::copy(&mut from, &mut to)?;
+    Ok(())
+}
+
+/// A number that stands for the [`LOOK_BACK`] bytes of `path` before `off`.
+/// Kept in the manifest beside a transcript's loaded length: the same number
+/// next pass means the part already loaded is still there unchanged.
+fn mark_before(path: &Path, off: u64) -> Option<u64> {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes_before(path, off).ok()?);
+    Some(u64::from_be_bytes(d[..8].try_into().ok()?))
+}
+
+/// The part of a transcript to load this pass.
+struct Unread {
+    /// The byte this reading starts at; 0 means the whole file.
+    from: u64,
+    /// The byte after the last complete line read.
+    upto: u64,
+    text: String,
+}
+
+/// Read `path` from `from` to its last complete line. A last line with no
+/// newline is taken when it is whole JSON and left for the next pass when it
+/// is not (the client was caught mid-write).
+fn read_unread(path: &Path, from: u64) -> Result<Unread> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    if !bytes.ends_with(b"\n") {
+        let cut = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let whole = serde_json::from_slice::<serde_json::Value>(&bytes[cut..]).is_ok();
+        if !whole {
+            bytes.truncate(cut);
+        }
+    }
+    let upto = from + bytes.len() as u64;
+    let text = String::from_utf8(bytes).context("transcript is not UTF-8")?;
+    Ok(Unread { from, upto, text })
 }
 
 /// The events of transcript `id` that no other transcript in the store holds.
@@ -883,15 +963,31 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                 stats.skipped += 1;
                 continue;
             }
-            let jsonl = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
+            // A transcript that has only grown is read from where the last
+            // pass stopped, and its new turns are added. It is read whole,
+            // and its graph replaced, the first time, and whenever the bytes
+            // just before that point are not the ones loaded then.
+            let mark_key = format!("mark:{name}");
+            let from = match manifest.get(&name).copied() {
+                Some(done)
+                    if done > 0
+                        && done < len
+                        && manifest.get(&mark_key).copied() == mark_before(&path, done) =>
+                {
+                    done
+                }
+                _ => 0,
+            };
+            let unread = match read_unread(&path, from) {
+                Ok(u) => u,
                 Err(e) => {
-                    eprintln!("[raveld] skip {}: {e}", path.display());
-                    stats.failed.push(format!("{name}: {e}"));
+                    eprintln!("[raveld] skip {}: {e:#}", path.display());
+                    stats.failed.push(format!("{name}: {e:#}"));
                     continue;
                 }
             };
-            let events = match adapter::parse_transcript(&jsonl) {
+            let jsonl = &unread.text;
+            let events = match adapter::parse_transcript(jsonl) {
                 Ok(ev) => ev,
                 Err(e) => {
                     eprintln!("[raveld] {name}: SKIPPED this pass — {e:#}");
@@ -899,15 +995,26 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
                     continue;
                 }
             };
+            let loaded = |manifest: &mut std::collections::HashMap<String, u64>| {
+                manifest.insert(name.clone(), unread.upto);
+                match mark_before(&path, unread.upto) {
+                    Some(m) => manifest.insert(mark_key.clone(), m),
+                    None => manifest.remove(&mark_key),
+                };
+            };
             if events.is_empty() {
-                manifest.insert(name, len);
+                loaded(&mut manifest);
                 continue;
             }
             let transcript_id = name.trim_end_matches(".jsonl");
             let events = owned_here(&store, &names, transcript_id, events)?;
             let anns = reader::emojikey_read(&events);
-            graph::ingest_transcript(&store, &events, &anns, transcript_id, &names)?;
-            manifest.insert(name.clone(), len);
+            if unread.from == 0 {
+                graph::ingest_transcript(&store, &events, &anns, transcript_id, &names)?;
+            } else {
+                graph::append_transcript(&store, &events, &anns, transcript_id, &names)?;
+            }
+            loaded(&mut manifest);
             stats.sessions += 1;
             stats.turns += events.len();
             stats.keys += anns.len();
@@ -1844,6 +1951,92 @@ mod tests {
         );
         drop(store);
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The 2026-11-21 fault: one line added to a 62,000-turn session made a
+    /// pass copy, read and rewrite all of it. A pass now takes only what is
+    /// new, and still starts over when the earlier bytes are not the same.
+    #[test]
+    fn a_grown_transcript_is_picked_up_where_the_last_pass_stopped() {
+        use std::io::Write;
+        let repo = std::env::temp_dir().join(format!("ravel-pickup-{}", std::process::id()));
+        fs::remove_dir_all(&repo).ok();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let src = repo.join("sessions");
+        fs::create_dir_all(&src).unwrap();
+        let rec = |n: u32| {
+            format!(
+            "{{\"type\":\"user\",\"uuid\":\"{n:08}-0000-0000-0000-000000000000\",\"timestamp\":\"2026-01-01T00:00:{:02}Z\",\"message\":{{\"role\":\"user\",\"content\":\"line {n}\"}}}}\n", n % 60)
+        };
+        let file = src.join("live.jsonl");
+        let add = |text: &str| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap()
+        };
+        let turns = || {
+            let store = graph::open_read_only(repo.join(STORE_SUBDIR)).unwrap();
+            let rows = graph::query_rows(&store, "SELECT (COUNT(DISTINCT ?t) AS ?d) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }").unwrap();
+            rows[0]["d"].parse::<u32>().unwrap()
+        };
+        let mirror = repo.join(TRANSCRIPTS_SUBDIR).join("live.jsonl");
+
+        // First sight: read whole.
+        add(&(1..=50).map(rec).collect::<String>());
+        assert_eq!(sync_soul(&repo, Some(&src)).unwrap().turns, 50);
+        assert_eq!(turns(), 50);
+
+        // One line more: one turn read, and all 51 are there.
+        add(&rec(51));
+        let st = sync_soul(&repo, Some(&src)).unwrap();
+        assert_eq!(st.turns, 1, "only the new line is read");
+        assert_eq!(turns(), 51);
+        assert_eq!(fs::read(&mirror).unwrap(), fs::read(&file).unwrap());
+
+        // Caught mid-write: the half line waits, nothing is lost or doubled.
+        let next = rec(52);
+        let (first, rest) = next.split_at(40);
+        add(first);
+        assert_eq!(sync_soul(&repo, Some(&src)).unwrap().turns, 0);
+        assert_eq!(turns(), 51);
+        add(rest);
+        assert_eq!(sync_soul(&repo, Some(&src)).unwrap().turns, 1);
+        assert_eq!(turns(), 52);
+
+        // Nothing new: nothing read.
+        let st = sync_soul(&repo, Some(&src)).unwrap();
+        assert_eq!((st.sessions, st.turns), (0, 0));
+
+        // The file is replaced by a longer one with a different past: the
+        // whole of it is read again and the turns it no longer holds are gone.
+        fs::write(&file, (100..=160).map(rec).collect::<String>()).unwrap();
+        assert_eq!(sync_soul(&repo, Some(&src)).unwrap().turns, 61);
+        assert_eq!(turns(), 61);
+        assert_eq!(fs::read(&mirror).unwrap(), fs::read(&file).unwrap());
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A pass over a real transcript, timed. `RAVEL_TRIAL_DIR` is a scratch
+    /// folder holding `sessions/`; run once to load, add lines, run again.
+    #[test]
+    #[ignore]
+    fn real_pickup() {
+        let repo = PathBuf::from(std::env::var("RAVEL_TRIAL_DIR").unwrap());
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let t = std::time::Instant::now();
+        let st = sync_soul(&repo, Some(&repo.join("sessions"))).unwrap();
+        eprintln!(
+            "PASS: {:.1}s, mirrored {}, sessions {}, turns read {}",
+            t.elapsed().as_secs_f64(),
+            st.mirrored,
+            st.sessions,
+            st.turns
+        );
     }
 
     #[test]
