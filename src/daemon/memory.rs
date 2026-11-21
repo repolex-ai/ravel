@@ -137,6 +137,7 @@ impl Daemon {
     /// Project one soul's memory logs into its `memory-v1` graph, under the
     /// gate.
     pub async fn memory_one(self: &Arc<Self>, id: &str) -> Result<()> {
+        let _d = super::doing::now(format!("memory writing for soul {id}"));
         let soul = self.soul(id)?.clone();
         let _g = self.gate.lock().await;
         let path = soul.path.clone();
@@ -400,6 +401,7 @@ impl Daemon {
             .memory
             .clone()
             .ok_or_else(|| anyhow!("no memory writer configured"))?;
+        let _d = super::doing::now(format!("memory pass for soul {id}"));
         let peers = self.peer_index().await?;
         self.write_one(id, &w, peers).await?;
         Ok(self.memory_of(id))

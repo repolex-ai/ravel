@@ -75,6 +75,7 @@ pub fn router(d: Shared) -> Router {
         .route("/ravel/{org}/{store}/memory/{node}", get(memory_open))
         .route("/ravel/{org}/{store}/health", get(soul_health))
         .route("/ravel/{org}/{store}/stats", get(soul_stats))
+        .layer(axum::middleware::from_fn(listed_while_answered))
         .layer(axum::middleware::from_fn_with_state(d.clone(), super::gate::check))
         .with_state(d)
 }
@@ -548,6 +549,15 @@ async fn terminated() {
     }
 }
 
+/// Every request is on the `doing` list from arrival to answer.
+async fn listed_while_answered(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let _d = super::doing::now(format!("{} {}", req.method(), req.uri().path()));
+    next.run(req).await
+}
+
 /// Signals that would end the process without a word, caught and written to
 /// the log instead; the daemon stays up. With these named, a daemon that is
 /// gone with no last line was killed outright (SIGKILL) or crashed below Rust:
@@ -669,6 +679,9 @@ impl Drop for Seat {
     }
 }
 
+/// At this much memory raveld writes what it is doing to the log, at most
+/// twice a minute. Nothing is stopped: this is how a rise gets a name.
+const MEMORY_IS_NOTED: u64 = 3 << 30;
 /// raveld stops every running query when it holds this much memory.
 const MEMORY_STOPS_QUERIES: u64 = 6 << 30;
 /// raveld ends itself when it holds this much: a daemon that is down is
@@ -743,9 +756,18 @@ fn watch_own_memory() {
         return;
     }
     let mut warned = false;
+    let mut noted = None;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         let Some(held) = memory_held() else { continue };
+        if held >= MEMORY_IS_NOTED && noted.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 30) {
+            noted = Some(std::time::Instant::now());
+            super::log(format!(
+                "memory note: {:.1} GB held; under way:\n  {}",
+                gb(held),
+                super::doing::list().join("\n  ")
+            ));
+        }
         if held < MEMORY_STOPS_QUERIES {
             warned = false;
             continue;
@@ -767,12 +789,13 @@ fn watch_own_memory() {
         if !warned || held >= MEMORY_ENDS_RAVELD {
             super::log(format!(
                 "MEMORY: raveld holds {:.1} GB (queries are stopped at {:.0} GB, raveld ends at {:.0} GB); \
-                 {} running, all told to stop:\n{}",
+                 {} running, all told to stop:\n{}\nunder way:\n  {}",
                 gb(held),
                 gb(MEMORY_STOPS_QUERIES),
                 gb(MEMORY_ENDS_RAVELD),
                 running.len(),
-                running.join("\n")
+                running.join("\n"),
+                super::doing::list().join("\n  ")
             ));
             warned = true;
         }

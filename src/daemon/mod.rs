@@ -11,6 +11,7 @@
 //! soul costs about a second. One pass at a time per soul; passes for
 //! different souls do not overlap either — this is a backup, not a race.
 
+pub mod doing;
 pub mod gate;
 pub mod config;
 pub mod http;
@@ -236,6 +237,7 @@ impl Daemon {
         let outcome = {
             let _g = self.gate.lock().await;
             let path = soul.path.clone();
+            let _d = doing::now(format!("import into {}", path.display()));
             tokio::task::spawn_blocking(move || sync::import_claude_ai(&path, &src))
                 .await
                 .map_err(|e| anyhow!("import task panicked: {e}"))??
@@ -257,6 +259,7 @@ impl Daemon {
         let soul = self.soul(id)?.clone();
         let _g = self.gate.lock().await;
         let path = soul.path.clone();
+        let _d = doing::now(format!("sync pass over {}", path.display()));
         let res =
             tokio::task::spawn_blocking(move || sync::sync_soul(&path, sessions_src.as_deref()))
                 .await
