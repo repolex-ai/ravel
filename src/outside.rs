@@ -118,15 +118,28 @@ mod tests {
         let t = std::time::Instant::now();
         let store = crate::graph::open_read_only(std::path::Path::new(&dir)).unwrap();
         eprintln!("OPENED in {:.2}s", t.elapsed().as_secs_f64());
-        let (r, _) = run(&store, &q, &base).unwrap();
-        let mut n = 0usize;
+        // `RAVEL_TRIAL_CANCEL_MS`: cancel the query that long after it starts,
+        // to show what a cancel does to spareval (see daemon/http.rs `answer`).
+        let stop = oxigraph::sparql::CancellationToken::new();
+        if let Ok(ms) = std::env::var("RAVEL_TRIAL_CANCEL_MS") {
+            let (stop, ms) = (stop.clone(), ms.parse::<u64>().unwrap());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                stop.cancel();
+                eprintln!("CANCELLED at {ms} ms");
+            });
+        }
+        let (r, _) = run_until(&store, &q, &base, Some(stop)).unwrap();
+        let (mut n, mut errs) = (0usize, 0usize);
         if let QueryResults::Solutions(sols) = r {
             for s in sols {
-                s.unwrap();
-                n += 1;
+                match s {
+                    Ok(_) => n += 1,
+                    Err(_) => errs += 1,
+                }
             }
         }
-        eprintln!("ROWS {n} in {:.2}s", t.elapsed().as_secs_f64());
+        eprintln!("ROWS {n}, ERRORS {errs} in {:.2}s", t.elapsed().as_secs_f64());
     }
 
     const DATA: &str = r#"
