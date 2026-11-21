@@ -605,7 +605,16 @@ fn answer(
 ) -> anyhow::Result<(Answer, Vec<String>)> {
     let store = open_store(soul)?;
     let names = crate::names::Names::for_soul(&soul.path)?;
-    let (results, report) = crate::outside::run_until(&store, text, names.root(), Some(stop))?;
+    // The token is NOT given to the evaluator. spareval (0.2.6 to 0.2.9)
+    // does not end a query when its token is cancelled: every row still to
+    // come becomes an Err(Cancelled), and its joins, left joins and ORDER BY
+    // push each one onto a Vec instead of returning (eval.rs, `errors.push`).
+    // A cancel during a 454,000-row hash build is therefore millions of
+    // buffered errors: on 2026-11-21 raveld cancelled a query at 6.2 GB and
+    // that cancel took it to 12.4 GB in 82 seconds (found by tr1pl3x). The
+    // token is kept as a flag for the log only, until a stop that works.
+    let _ = &stop;
+    let (results, report) = crate::outside::run_until(&store, text, names.root(), None)?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
@@ -696,7 +705,6 @@ struct Active {
     store: String,
     text: String,
     began: std::time::Instant,
-    stop: oxigraph::sparql::CancellationToken,
 }
 
 fn active() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Active>> {
@@ -750,7 +758,7 @@ fn gb(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// Every two seconds: past [`MEMORY_STOPS_QUERIES`], name and stop every
+/// Every two seconds: past [`MEMORY_STOPS_QUERIES`], name every
 /// running query; past [`MEMORY_ENDS_RAVELD`], say so and end the process.
 fn watch_own_memory() {
     if memory_held().is_none() {
@@ -778,7 +786,6 @@ fn watch_own_memory() {
             let a = active().lock().unwrap();
             a.values()
                 .map(|q| {
-                    q.stop.cancel();
                     format!(
                         "  {} for {:.0}s: {}",
                         q.store,
@@ -790,8 +797,8 @@ fn watch_own_memory() {
         };
         if !warned || held >= MEMORY_ENDS_RAVELD {
             super::log(format!(
-                "MEMORY: raveld holds {:.1} GB (queries are stopped at {:.0} GB, raveld ends at {:.0} GB); \
-                 {} running, all told to stop:\n{}\nunder way:\n  {}",
+                "MEMORY: raveld holds {:.1} GB (queries are named at {:.0} GB, raveld ends at {:.0} GB); \
+                 {} running, none can be stopped:\n{}\nunder way:\n  {}",
                 gb(held),
                 gb(MEMORY_STOPS_QUERIES),
                 gb(MEMORY_ENDS_RAVELD),
@@ -860,7 +867,6 @@ async fn ask(
         store: name.clone(),
         text: text.split_whitespace().collect::<Vec<_>>().join(" "),
         began,
-        stop: stop.clone(),
     });
     let mut work = tokio::task::spawn_blocking(move || {
         let (_seat, _listed) = (seat, listed);
@@ -868,7 +874,7 @@ async fn ask(
         let took = began.elapsed();
         if for_work.is_cancelled() {
             super::log(format!(
-                "query stopped on {who} after {:.1}s (time limit {}s, or the caller hung up): {shown}",
+                "query on {who} ran {:.1}s to its end after its caller was gone or its {}s limit had passed (a running query cannot be stopped): {shown}",
                 took.as_secs_f64(),
                 QUERY_TIME_LIMIT.as_secs()
             ));
@@ -883,12 +889,13 @@ async fn ask(
     let out = tokio::select! {
         r = &mut work => r,
         _ = tokio::time::sleep(QUERY_TIME_LIMIT) => {
+            // The caller is answered now; the work keeps its place at the
+            // store until it ends, so at most QUERIES_AT_ONCE ever run on.
             stop.cancel();
-            let _ = work.await;
             return Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "the query on {name} ran for {} seconds and was stopped; narrow it (sort fewer rows, or filter before ORDER BY)",
+                    "the query on {name} did not answer in {} seconds; narrow it (sort fewer rows, or filter before ORDER BY)",
                     QUERY_TIME_LIMIT.as_secs()
                 ),
             ));
