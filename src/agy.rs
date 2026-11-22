@@ -72,6 +72,22 @@ pub struct AgyParse {
     /// Rows dropped because the client appended the same line twice
     /// (byte-identical, same step_index). One turn written twice is one turn.
     pub duplicate_rows: usize,
+    /// What the next reading needs to go on from where this one ended.
+    pub carry: Carry,
+    /// Rows of a later part ([`parse_after`]) whose step comes at or before
+    /// the last step already read. Such a part cannot be added to what is
+    /// loaded: the caller reads the whole conversation again instead.
+    pub late_rows: usize,
+}
+
+/// What reading a conversation's later lines needs from the lines before
+/// them: the last step (a turn's parent is the step just before it), the
+/// model setting in force, and the tool calls still waiting for their output.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Carry {
+    pub prev_idx: Option<u64>,
+    pub setting: Option<String>,
+    pub pending: Vec<String>,
 }
 
 /// `RUNNING` is a possible TERMINAL state, not merely a transient one.
@@ -89,6 +105,16 @@ pub const RUNNING: &str = "RUNNING";
 /// `turnId` and therefore of every IRI, so it must be the real one — this
 /// function cannot recover it from the file, which never names itself.
 pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> {
+    parse_after(jsonl, conversation_id, None)
+}
+
+/// [`parse_transcript`] for lines added to a conversation since a reading
+/// that ended with `after`: the events come out as they would from the whole
+/// file. The client adds lines at the end and leaves the earlier ones alone
+/// (watched on a live session, 2026-11-22: 15 changes, each one new lines at
+/// the end, a step left `RUNNING` never rewritten), so a grown conversation
+/// need not be read from its first line again.
+pub fn parse_after(jsonl: &str, conversation_id: &str, after: Option<&Carry>) -> Result<AgyParse> {
     let mut out = AgyParse::default();
 
     // (step_index, record) — collected first so we can sort. The live file's
@@ -119,6 +145,10 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
         if o.get("truncated_fields").is_some() {
             out.truncated_rows += 1;
         }
+        if after.and_then(|c| c.prev_idx).is_some_and(|last| idx <= last) {
+            out.late_rows += 1;
+            continue;
+        }
         rows.push((idx, o));
     }
     rows.sort_by_key(|(i, _)| *i);
@@ -145,14 +175,17 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
                 "conversation {conversation_id}: duplicate step_index with DIFFERING rows — the idempotency key is not unique in this file; refusing to ingest rather than silently merging two turns"
             );
         }
-        out.gaps = (*first..=*last).filter(|i| !present.contains(i)).collect();
+        // A later part's run starts just after the last step already read.
+        let from = after.and_then(|c| c.prev_idx).map_or(*first, |p| p + 1);
+        out.gaps = (from..=*last).filter(|i| !present.contains(i)).collect();
     }
 
-    let mut prev_idx: Option<u64> = None;
-    let mut setting: Option<String> = None;
+    let before = after.cloned().unwrap_or_default();
+    let mut prev_idx: Option<u64> = before.prev_idx;
+    let mut setting: Option<String> = before.setting;
     // Tool calls a PLANNER_RESPONSE made and no tool step has answered yet,
     // in order: the steps that follow answer them in the same order (#27).
-    let mut pending: std::collections::VecDeque<String> = Default::default();
+    let mut pending: std::collections::VecDeque<String> = before.pending.into();
     for (idx, o) in &rows {
         let step_type = o.get("type").and_then(Value::as_str).unwrap_or("");
         let event_id = turn_id(conversation_id, *idx);
@@ -257,6 +290,11 @@ pub fn parse_transcript(jsonl: &str, conversation_id: &str) -> Result<AgyParse> 
             outcomes,
         });
     }
+    out.carry = Carry {
+        prev_idx,
+        setting,
+        pending: pending.into(),
+    };
 
     Ok(out)
 }
@@ -374,6 +412,66 @@ fn agy_output(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a real conversation (`RAVEL_TRIAL_FILE`, read-only): cut at many
+    /// line boundaries, the first part read whole and the rest read after
+    /// it give exactly the events the whole file gives.
+    #[test]
+    #[ignore]
+    fn real_conversation_reads_the_same_in_two_parts() {
+        let s = std::fs::read_to_string(std::env::var("RAVEL_TRIAL_FILE").unwrap()).unwrap();
+        let whole = parse_transcript(&s, "c").unwrap();
+        let cuts: Vec<usize> = s.match_indices('\n').map(|(i, _)| i + 1).collect();
+        let mut tried = 0;
+        let mut late = 0;
+        for k in (1..cuts.len()).step_by((cuts.len() / 200).max(1)) {
+            let (a, b) = s.split_at(cuts[k]);
+            let first = parse_transcript(a, "c").unwrap();
+            let rest = parse_after(b, "c", Some(&first.carry)).unwrap();
+            if rest.late_rows > 0 {
+                late += 1;
+                continue;
+            }
+            let mut both = first.events;
+            both.extend(rest.events);
+            assert_eq!(format!("{both:?}"), format!("{:?}", whole.events), "cut at line {k}");
+            assert_eq!(rest.carry, whole.carry);
+            tried += 1;
+        }
+        eprintln!("{} events; {tried} cuts read the same; {late} cuts fall back to a whole reading (a late step)", whole.events.len());
+    }
+
+    #[test]
+    fn later_lines_read_after_the_first_ones_give_the_same_events() {
+        let row = |i: u64, ty: &str, extra: &str| {
+            format!(r#"{{"step_index":{i},"type":"{ty}","source":"MODEL","status":"DONE","created_at":"2026-11-22T14:00:{i:02}Z","content":"step {i}"{extra}}}"#)
+        };
+        let lines = [
+            row(0, "USER_INPUT", ""),
+            row(1, "PLANNER_RESPONSE", r#","tool_calls":[{"name":"run_command","args":{"CommandLine":"ls"}}]"#),
+            row(2, "RUN_COMMAND", ""),
+            row(3, "PLANNER_RESPONSE", ""),
+            row(5, "PLANNER_RESPONSE", ""),
+        ];
+        let all = lines.join("\n") + "\n";
+        let whole = parse_transcript(&all, "c").unwrap();
+        assert_eq!(whole.gaps, vec![4]);
+        for k in 1..lines.len() {
+            let first = parse_transcript(&(lines[..k].join("\n") + "\n"), "c").unwrap();
+            let rest = parse_after(&(lines[k..].join("\n") + "\n"), "c", Some(&first.carry)).unwrap();
+            let mut both = first.events.clone();
+            both.extend(rest.events);
+            assert_eq!(format!("{both:?}"), format!("{:?}", whole.events), "cut before line {k}");
+            let mut gaps = first.gaps.clone();
+            gaps.extend(rest.gaps);
+            assert_eq!(gaps, whole.gaps, "cut before line {k}");
+        }
+        // A step that comes again later is not added on: the caller reads
+        // the whole conversation instead.
+        let first = parse_transcript(&all, "c").unwrap();
+        let again = parse_after(&(row(2, "RUN_COMMAND", "") + "\n"), "c", Some(&first.carry)).unwrap();
+        assert_eq!((again.late_rows, again.events.len()), (1, 0));
+    }
 
     const CONV: &str = "d6bf9dc3-c6e6-49ef-9e9b-fc70c7186501";
 

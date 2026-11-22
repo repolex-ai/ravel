@@ -770,6 +770,29 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     Ok(st)
 }
 
+/// How much of an Antigravity conversation is loaded, kept in the agy
+/// manifest as one line of JSON. (Before 0.11.14 the manifest held the
+/// file's hash; such an entry is not this, and the conversation is loaded
+/// whole once more.)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgyLoaded {
+    /// The byte after the last line loaded.
+    len: u64,
+    /// The source's last-written time when all of it was loaded; 0 otherwise.
+    mtime: u128,
+    /// Stands for the bytes just before `len` ([`mark_before`]).
+    mark: u64,
+    carry: agy::Carry,
+}
+
+fn mtime_nanos(p: &Path) -> u128 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
 /// Mirror and ingest ONE conversation. An error here is that conversation's
 /// alone: the caller records it and moves on to the next.
 fn sync_agy_one(
@@ -780,27 +803,90 @@ fn sync_agy_one(
     manifest: &mut std::collections::HashMap<String, String>,
     st: &mut AgyStats,
 ) -> Result<()> {
-    // MIRROR — by content hash. The source is rewritten in place while a
-    // session is live, so equal size proves nothing.
     let to = mirror.join(format!("{}.jsonl", c.id));
-    let src_hash = file_sha256(&c.source)?;
-    let dst_hash = to.is_file().then(|| file_sha256(&to)).transpose()?;
-    if dst_hash.as_deref() == Some(src_hash.as_str()) {
-        st.unchanged += 1;
+    let src_len = std::fs::metadata(&c.source)?.len();
+    let src_mtime = mtime_nanos(&c.source);
+    let was = manifest
+        .get(&c.id)
+        .and_then(|v| serde_json::from_str::<AgyLoaded>(v).ok())
+        .filter(|_| to.is_file());
+
+    // Nothing has touched the source since all of it was loaded. (Until
+    // 0.11.14 every conversation of every soul was hashed whole, twice,
+    // on every pass, to learn this.)
+    if let Some(w) = &was {
+        let same_bytes = w.len == src_len
+            && (w.mtime == src_mtime || mark_before(&c.source, src_len) == Some(w.mark));
+        if same_bytes {
+            st.unchanged += 1;
+            st.skipped += 1;
+            if w.mtime != src_mtime {
+                let mut w = w.clone();
+                w.mtime = src_mtime;
+                manifest.insert(c.id.clone(), serde_json::to_string(&w)?);
+            }
+            return Ok(());
+        }
+    }
+
+    // MIRROR. The usual change is new lines at the end: only those bytes are
+    // copied. Anything else (a mirror that is not the start of the source)
+    // is copied whole.
+    let dst_len = std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0);
+    if dst_len > 0 && dst_len <= src_len && same_bytes_before(&c.source, &to, dst_len) {
+        if dst_len < src_len {
+            append_after(&c.source, &to, dst_len)
+                .with_context(|| format!("extend {} from {}", to.display(), c.source.display()))?;
+            st.mirrored += 1;
+        } else {
+            st.unchanged += 1;
+        }
     } else {
         std::fs::copy(&c.source, &to)
             .with_context(|| format!("copy {} → {}", c.source.display(), to.display()))?;
         st.mirrored += 1;
     }
 
-    // INGEST — skip when this exact content is already projected.
-    if manifest.get(&c.id) == Some(&src_hash) {
-        st.skipped += 1;
-        return Ok(());
+    // INGEST. A conversation that has only grown since it was loaded, and
+    // still holds the loaded part unchanged, gives up its new lines alone;
+    // they are added to its graph. Otherwise it is read and loaded whole.
+    let grown = was
+        .as_ref()
+        .filter(|w| w.len < src_len && mark_before(&to, w.len) == Some(w.mark));
+    let mut later = None;
+    if let Some(w) = grown {
+        let unread = read_unread(&to, w.len)?;
+        let p = agy::parse_after(&unread.text, &c.id, Some(&w.carry))?;
+        // A step that arrives after later ones cannot be added on.
+        if p.late_rows == 0 {
+            later = Some((p, unread.upto));
+        }
     }
-    let jsonl = std::fs::read_to_string(&to)
-        .with_context(|| format!("read agy mirror {}", to.display()))?;
-    let parsed = agy::parse_transcript(&jsonl, &c.id)?;
+    let appended = later.is_some();
+    let (parsed, upto) = match later {
+        Some(x) => x,
+        None => {
+            let unread = read_unread(&to, 0)?;
+            (agy::parse_transcript(&unread.text, &c.id)?, unread.upto)
+        }
+    };
+    let loaded = |manifest: &mut std::collections::HashMap<String, String>,
+                  carry: &agy::Carry|
+     -> Result<()> {
+        let Some(mark) = mark_before(&to, upto) else {
+            manifest.remove(&c.id);
+            return Ok(());
+        };
+        let l = AgyLoaded {
+            len: upto,
+            // A last line still being written is read on a later pass.
+            mtime: if upto == src_len { src_mtime } else { 0 },
+            mark,
+            carry: carry.clone(),
+        };
+        manifest.insert(c.id.clone(), serde_json::to_string(&l)?);
+        Ok(())
+    };
     st.gaps += parsed.gaps.len();
     if parsed.duplicate_rows > 0 {
         eprintln!(
@@ -832,21 +918,26 @@ fn sync_agy_one(
         );
     }
     if parsed.events.is_empty() {
-        manifest.insert(c.id.clone(), src_hash);
+        // Lines with no turn in them: on the first reading nothing was
+        // loaded, on a later one the state before them still stands.
+        let carry = if appended {
+            was.as_ref().map(|w| w.carry.clone()).unwrap_or_default()
+        } else {
+            parsed.carry.clone()
+        };
+        loaded(manifest, &carry)?;
         return Ok(());
     }
     let anns = reader::emojikey_read(&parsed.events);
     // Dialect-prefixed graph name: the named graph is the provenance unit,
     // and which substrate a conversation came from is provenance.
     let transcript_id = format!("agy-{}", c.id);
-    graph::ingest_transcript(
-        store,
-        &parsed.events,
-        &anns,
-        &transcript_id,
-        names,
-    )?;
-    manifest.insert(c.id.clone(), src_hash);
+    if appended {
+        graph::append_transcript(store, &parsed.events, &anns, &transcript_id, names)?;
+    } else {
+        graph::ingest_transcript(store, &parsed.events, &anns, &transcript_id, names)?;
+    }
+    loaded(manifest, &parsed.carry)?;
     st.sessions += 1;
     st.turns += parsed.events.len();
     Ok(())
@@ -2394,6 +2485,62 @@ mod tests {
             .unwrap()
             .is_empty());
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// An Antigravity conversation is loaded whole once; after that an
+    /// untouched one costs nothing, a grown one gives up only its new lines,
+    /// and one whose earlier lines changed is loaded whole again.
+    #[test]
+    fn a_grown_agy_conversation_is_picked_up_where_the_last_pass_stopped() {
+        let dir = std::env::temp_dir().join(format!("ravel-agy-grow-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mirror = dir.join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let source = dir.join("transcript_full.jsonl");
+        let row = |i: u64, text: &str| {
+            format!(r#"{{"step_index":{i},"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","created_at":"2026-11-22T14:00:{i:02}Z","content":"{text}"}}"#) + "\n"
+        };
+        fs::write(&source, row(0, "one") + &row(1, "two")).unwrap();
+        let c = AgyConversation { id: "conv".into(), source: source.clone(), short_only: false };
+        let store = oxigraph::store::Store::new().unwrap();
+        let names = crate::names::Names::new("7r1pl3f0rc3", "kira").unwrap();
+        let mut manifest = std::collections::HashMap::new();
+        let turns = |store: &oxigraph::store::Store| {
+            graph::query_rows(store, "SELECT ?t ?x ?p WHERE { GRAPH ?g { ?t <https://repolex.ai/ontology/ravel/text> ?x OPTIONAL { ?t <https://repolex.ai/ontology/ravel/parentTurn> ?p } } } ORDER BY ?t").unwrap()
+        };
+        let pass = |manifest: &mut std::collections::HashMap<String, String>| {
+            let mut st = AgyStats::default();
+            sync_agy_one(&c, &mirror, &store, &names, manifest, &mut st).unwrap();
+            st
+        };
+
+        let st = pass(&mut manifest);
+        assert_eq!((st.sessions, st.turns, st.mirrored), (1, 2, 1));
+        // Untouched: nothing read, nothing loaded.
+        let st = pass(&mut manifest);
+        assert_eq!((st.sessions, st.turns, st.skipped), (0, 0, 1));
+
+        // Two lines more: only they are loaded, and the first of them still
+        // names the step before it as its parent.
+        let mut f = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        std::io::Write::write_all(&mut f, (row(2, "three") + &row(3, "four")).as_bytes()).unwrap();
+        drop(f);
+        let st = pass(&mut manifest);
+        assert_eq!((st.sessions, st.turns, st.mirrored), (1, 2, 1));
+        let rows = turns(&store);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let third = rows.iter().find(|r| r["x"] == "three").unwrap();
+        assert!(third["p"].ends_with(&crate::agy::turn_id("conv", 1)), "{third:?}");
+        assert_eq!(fs::read(&source).unwrap(), fs::read(mirror.join("conv.jsonl")).unwrap());
+
+        // An earlier line rewritten: the whole conversation is loaded again.
+        fs::write(&source, row(0, "one") + &row(1, "TWO") + &row(2, "three") + &row(3, "four")).unwrap();
+        let st = pass(&mut manifest);
+        assert_eq!((st.sessions, st.turns), (1, 4));
+        let rows = turns(&store);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().any(|r| r["x"] == "TWO"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The agy manifest stores a CONTENT HASH where the claude one stores a
