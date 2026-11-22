@@ -221,6 +221,45 @@ mod tests {
         eprintln!("ROWS {n}, ERRORS {errs} in {:.2}s", t.elapsed().as_secs_f64());
     }
 
+    /// On a copy of a real soul (`RAVEL_TRIAL_REPO`, in a scratchpad): list
+    /// its newest turns for the first time, then time "the newest 40 turns"
+    /// asked of that list and asked of the whole store.
+    #[test]
+    #[ignore]
+    fn real_recent() {
+        let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
+        assert!(repo.to_string_lossy().contains("scratchpad"), "a copy, never a soul");
+        let names = crate::names::Names::for_soul(&repo).unwrap();
+        let store = crate::graph::open(repo.join(crate::sync::STORE_SUBDIR)).unwrap();
+        for i in 1..=2 {
+            let t = std::time::Instant::now();
+            crate::graph::keep_recent(&store, &names, &[]).unwrap();
+            eprintln!("LISTED (call {i}) in {:.3}s", t.elapsed().as_secs_f64());
+        }
+        store.flush().unwrap();
+        let ask = |what: &str, q: &str| {
+            let t = std::time::Instant::now();
+            let (r, _) = run(&store, q, names.root()).unwrap();
+            let mut first = String::new();
+            let mut n = 0;
+            if let QueryResults::Solutions(sols) = r {
+                for s in sols {
+                    let s = s.unwrap();
+                    if n == 0 {
+                        first = s.get("ts").map(|t| t.to_string()).unwrap_or_default();
+                    }
+                    n += 1;
+                }
+            }
+            eprintln!("{what}: {n} rows, newest {first}, in {:.3}s", t.elapsed().as_secs_f64());
+        };
+        let p = "PREFIX ravel: <https://repolex.ai/ontology/ravel/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+        let rest = "?t ravel:timestamp ?ts ; ravel:role ?role . OPTIONAL { ?t ravel:text ?text } } ORDER BY DESC(?ts) LIMIT 40";
+        ask("OF THE LIST", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ GRAPH <ravel/NamedGraph/recent> {{ ?l rdfs:member ?t }} {rest}"));
+        ask("OF THE WHOLE STORE", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ ?t a ravel:Turn . {rest}"));
+        ask("OF THE LIST again", &format!("{p} SELECT ?t ?ts ?role ?text WHERE {{ GRAPH <ravel/NamedGraph/recent> {{ ?l rdfs:member ?t }} {rest}"));
+    }
+
     const DATA: &str = r#"
 <https://repolex.ai/ravel/Turn/t1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://repolex.ai/ontology/ravel/Turn> <https://repolex.ai/ravel/NamedGraph/a> .
 <https://repolex.ai/ravel/Turn/t1> <https://repolex.ai/ontology/ravel/role> "user" <https://repolex.ai/ravel/NamedGraph/a> .

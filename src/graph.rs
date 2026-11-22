@@ -49,6 +49,9 @@ pub fn transcript_graph_iri(names: &Names, transcript_id: &str) -> String {
 pub enum GraphKind {
     Transcript,
     Memory,
+    /// The list of the newest turns. A plain `ravel:NamedGraph`: it is no
+    /// transcript, and holds no statement a transcript graph also holds.
+    Recent,
 }
 
 impl GraphKind {
@@ -56,6 +59,7 @@ impl GraphKind {
         match self {
             GraphKind::Transcript => format!("{RAVEL_NS}TranscriptGraph"),
             GraphKind::Memory => format!("{RAVEL_NS}MemoryGraph"),
+            GraphKind::Recent => format!("{RAVEL_NS}NamedGraph"),
         }
     }
 }
@@ -346,6 +350,7 @@ pub fn ingest_transcript(
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
     describe_graph(store, names, &graph, GraphKind::Transcript)?;
+    keep_recent(store, names, events)?;
     store.flush()?;
 
     Ok(store
@@ -379,7 +384,139 @@ pub fn append_transcript(
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
     describe_graph(store, names, &graph, GraphKind::Transcript)?;
+    keep_recent(store, names, events)?;
     store.flush()?;
+    Ok(())
+}
+
+/// How many turns the `recent` graph lists.
+pub const RECENT_TURNS: usize = 500;
+
+const RDFS_MEMBER: &str = "http://www.w3.org/2000/01/rdf-schema#member";
+
+/// A turn's time as a number, for telling newer from older whatever zone or
+/// precision it was written in. A time that cannot be read sorts oldest.
+fn instant(ts: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|t| t.timestamp_millis())
+        .unwrap_or(i64::MIN)
+}
+
+/// Keep `{root}ravel/NamedGraph/recent` listing the store's newest
+/// [`RECENT_TURNS`] turns, given the turns just loaded.
+///
+/// Why it exists: the store has no index by time, so "the newest 40 turns"
+/// asked of the whole store reads every turn there is and sorts them (0.4 s
+/// to 4 s a question, asked every few seconds by a panel that shows them).
+/// Asked of this graph it sorts 500:
+///
+/// ```sparql
+/// SELECT ?t ?ts ?role ?text WHERE {
+///   GRAPH <ravel/NamedGraph/recent> { ?list rdfs:member ?t }
+///   ?t ravel:timestamp ?ts ; ravel:role ?role . OPTIONAL { ?t ravel:text ?text }
+/// } ORDER BY DESC(?ts) LIMIT 40
+/// ```
+///
+/// What it holds is one statement a turn, `<the graph> rdfs:member <turn>`,
+/// and nothing else. It does not hold a copy of the turns: a question with
+/// no GRAPH is asked of every graph together, and a statement stored in two
+/// graphs comes back twice, so copies would show the newest turns double in
+/// every ordinary question (tested, 2026-11-22). A turn's own statements
+/// stay only in its transcript's graph.
+///
+/// The graph is described as a `ravel:NamedGraph` with the store's owner and
+/// `private` (direction by goodlux, 2026-11-22: a sliding window in a named
+/// graph, as git-lex keeps `git-lex/NamedGraph/now`, and no per-day property).
+///
+/// Listed once from the whole store when the graph is not there yet; after
+/// that only the turns handed in are weighed against the ones listed.
+pub fn keep_recent(store: &Store, names: &Names, loaded: &[Event]) -> Result<()> {
+    use oxigraph::model::{NamedNodeRef, TermRef};
+    let graph = NamedNode::new(names.recent_graph()).context("recent graph IRI")?;
+    let g = GraphNameRef::NamedNode(graph.as_ref());
+    let member = NamedNodeRef::new_unchecked(RDFS_MEMBER);
+    let ts_p = NamedNode::new_unchecked(format!("{RAVEL_NS}timestamp"));
+    let described = store
+        .quads_for_pattern(
+            Some(NamedOrBlankNodeRef::NamedNode(graph.as_ref())),
+            Some(NamedNodeRef::new_unchecked(RDF_TYPE)),
+            None,
+            Some(GraphNameRef::DefaultGraph),
+        )
+        .next()
+        .is_some();
+    if described && loaded.is_empty() {
+        return Ok(());
+    }
+    // (turn, time) for every candidate: the turns listed now, or on the
+    // first time the store's newest; and the turns just loaded.
+    let mut cand: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if described {
+        for q in store.quads_for_pattern(None, Some(member), None, Some(g)) {
+            let oxigraph::model::Term::NamedNode(t) = q?.object else {
+                continue;
+            };
+            let when = store
+                .quads_for_pattern(
+                    Some(NamedOrBlankNodeRef::NamedNode(t.as_ref())),
+                    Some(ts_p.as_ref()),
+                    None,
+                    None,
+                )
+                .filter_map(|q| q.ok())
+                .map(|q| instant(&term_value(&q.object)))
+                .max();
+            listed.insert(t.as_str().to_string());
+            // A turn whose transcript has left the store drops off the list.
+            if let Some(when) = when {
+                cand.insert(t.into_string(), when);
+            }
+        }
+    } else {
+        let q = format!(
+            "SELECT ?t ?ts WHERE {{ GRAPH ?g {{ ?t a <{RAVEL_NS}Turn> ; <{RAVEL_NS}timestamp> ?ts }} }} \
+             ORDER BY DESC(?ts) LIMIT {}",
+            RECENT_TURNS * 2
+        );
+        if let QueryResults::Solutions(rows) =
+            SparqlEvaluator::new().parse_query(&q)?.on_store(store).execute()?
+        {
+            for row in rows {
+                let row = row?;
+                if let (Some(oxigraph::model::Term::NamedNode(t)), Some(ts)) =
+                    (row.get("t"), row.get("ts"))
+                {
+                    cand.insert(t.as_str().to_string(), instant(&term_value(ts)));
+                }
+            }
+        }
+    }
+    for e in loaded {
+        if let Some(ts) = &e.timestamp {
+            cand.insert(names.turn(&e.event_id), instant(ts));
+        }
+    }
+    let mut newest: Vec<(i64, String)> = cand.into_iter().map(|(t, w)| (w, t)).collect();
+    newest.sort_by(|a, b| b.cmp(a));
+    newest.truncate(RECENT_TURNS);
+    let keep: std::collections::HashSet<&str> = newest.iter().map(|(_, t)| t.as_str()).collect();
+    let quad = |turn: &str| {
+        Quad::new(
+            NamedOrBlankNode::NamedNode(graph.clone()),
+            member.into_owned(),
+            NamedNode::new_unchecked(turn),
+            GraphName::NamedNode(graph.clone()),
+        )
+    };
+    for gone in listed.iter().filter(|t| !keep.contains(t.as_str())) {
+        store.remove(&quad(gone))?;
+    }
+    for new in keep.iter().filter(|t| !listed.contains(**t)) {
+        store.insert(&quad(new))?;
+    }
+    describe_graph(store, names, &graph, GraphKind::Recent)?;
+    let _ = TermRef::from(member);
     Ok(())
 }
 
@@ -549,6 +686,59 @@ mod tests {
     use crate::reader::emojikey_read;
     use crate::{Event, SourceKind, TextSpan};
 
+    /// The newest turns are listed, the list slides, and listing them does
+    /// not make any turn come back twice from an ordinary question.
+    #[test]
+    fn the_recent_graph_lists_the_newest_turns_and_doubles_nothing() {
+        let store = Store::new().unwrap();
+        let names = Names::new("7r1pl3f0rc3", "spacegoat").unwrap();
+        let line = |i: usize| {
+            format!(
+                r#"{{"type":"user","uuid":"u{i:04}","timestamp":"2026-11-10T{:02}:{:02}:{:02}Z","message":{{"role":"user","content":"turn {i}"}}}}"#,
+                i / 3600,
+                (i / 60) % 60,
+                i % 60
+            )
+        };
+        let events = |r: std::ops::Range<usize>| {
+            crate::adapter::parse_transcript(&r.map(line).collect::<Vec<_>>().join("\n")).unwrap()
+        };
+        ingest_transcript(&store, &events(0..400), &[], "s1", &names).unwrap();
+        let n = |q: &str| query_rows(&store, q).unwrap().len();
+        let recent = names.recent_graph();
+        let listed = format!("SELECT ?t WHERE {{ GRAPH <{recent}> {{ ?l <{RDFS_MEMBER}> ?t }} }}");
+        assert_eq!(n(&listed), 400);
+        // A second transcript, newer: the list slides to the newest 500.
+        append_transcript(&store, &events(400..700), &[], "s2", &names).unwrap();
+        assert_eq!(n(&listed), RECENT_TURNS);
+        let ends = |order: &str| {
+            let q = format!(
+                "SELECT ?t WHERE {{ GRAPH <{recent}> {{ ?l <{RDFS_MEMBER}> ?t }} GRAPH ?g {{ ?t <{RAVEL_NS}timestamp> ?ts }} }} ORDER BY {order} LIMIT 1"
+            );
+            query_rows(&store, &q).unwrap()[0]["t"].clone()
+        };
+        assert!(ends("DESC(?ts)").ends_with("/ravel/Turn/u0699"));
+        assert!(ends("?ts").ends_with("/ravel/Turn/u0200"));
+        // Every turn is still stored once: asked of all graphs together.
+        let mut q = SparqlEvaluator::new()
+            .parse_query(&format!("SELECT ?t WHERE {{ ?t a <{RAVEL_NS}Turn> }}"))
+            .unwrap();
+        q.dataset_mut().set_default_graph_as_union();
+        let QueryResults::Solutions(rows) = q.on_store(&store).execute().unwrap() else {
+            panic!()
+        };
+        assert_eq!(rows.count(), 700);
+        // It is described as a plain named graph, private, with its owner.
+        let said: Vec<String> = query_rows(&store, &format!("SELECT ?o WHERE {{ <{recent}> ?p ?o }}"))
+            .unwrap()
+            .into_iter()
+            .map(|r| r["o"].clone())
+            .collect();
+        assert!(said.contains(&format!("{RAVEL_NS}NamedGraph")), "{said:?}");
+        assert!(said.contains(&"private".to_string()));
+        assert!(said.iter().any(|o| o.ends_with("/soul/Soul/spacegoat")));
+    }
+
     fn ev(id: &str, text: &str, kind: SourceKind) -> Event {
         let span = TextSpan {
             start: 0,
@@ -703,9 +893,10 @@ mod tests {
             ingest_transcript(&store, &evs, &[], &format!("sess-{i}"), &names).unwrap();
         }
         let n = |q: &str| query_rows(&store, q).unwrap()[0]["n"].clone();
-        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "2600");
-        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { ?g <https://repolex.ai/ontology/ravel/visibility> ?v }"), "2600");
-        assert_eq!(store.named_graphs().count(), 2600);
+        // 2,600 transcripts and the list of the newest turns.
+        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } }"), "2601");
+        assert_eq!(n("SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { ?g <https://repolex.ai/ontology/ravel/visibility> ?v }"), "2601");
+        assert_eq!(store.named_graphs().count(), 2601);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -718,7 +909,9 @@ mod tests {
         ingest_transcript(&store, &evs, &[], "sess-1", &names).unwrap();
         ingest_transcript(&store, &evs, &[], "sess-1", &names).unwrap();
         let said = |store: &Store| {
-            query_rows(store, "SELECT ?g ?p ?o WHERE { ?g ?p ?o } ORDER BY ?p").unwrap()
+            // (The list of the newest turns is described too; not what
+            // this test is about.)
+            query_rows(store, "SELECT ?g ?p ?o WHERE { ?g ?p ?o FILTER(!STRENDS(STR(?g), '/NamedGraph/recent')) } ORDER BY ?p").unwrap()
         };
         // Three statements in the unnamed graph, once, however often it is ingested.
         let rows = said(&store);
@@ -735,6 +928,7 @@ mod tests {
 
         drop_graph(&store, &NamedNode::new(g).unwrap()).unwrap();
         assert!(said(&store).is_empty(), "a dropped graph is no longer announced");
-        assert_eq!(store.len().unwrap(), 0);
+        let left = query_rows(&store, &format!("SELECT ?s WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}")).unwrap();
+        assert!(left.is_empty());
     }
 }

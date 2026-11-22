@@ -25,6 +25,8 @@ pub const BARE_ROOT: &str = "https://repolex.ai/";
 
 /// The memory graph's id. `memory-v1` until 0.10.0.
 pub const MEMORY_GRAPH: &str = "optmem";
+/// The id of the graph that lists the newest turns ([`crate::graph::keep_recent`]).
+pub const RECENT_GRAPH: &str = "recent";
 /// What the memory graph was called before; cleared wherever it is found.
 pub const OLD_MEMORY_GRAPH: &str = "memory-v1";
 
@@ -136,6 +138,11 @@ impl Names {
 
     pub fn memory_graph(&self) -> String {
         self.graph(MEMORY_GRAPH)
+    }
+
+    /// The graph that lists the store's newest turns.
+    pub fn recent_graph(&self) -> String {
+        self.graph(RECENT_GRAPH)
     }
 
     /// The soul that owns this store, as git-lex names it:

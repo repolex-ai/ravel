@@ -752,6 +752,9 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
 
     let names = crate::names::Names::for_soul(repo)?;
     let store = crate::readdress::open_current(repo, &names)?;
+    // A store that has never listed its newest turns does so now, even
+    // when this pass brings it nothing new.
+    graph::keep_recent(&store, &names, &[])?;
     let mut manifest = read_agy_manifest(repo);
 
     for c in &convs {
@@ -898,6 +901,9 @@ pub fn sync_soul(repo: &Path, sessions_src: Option<&Path>) -> Result<SyncStats> 
         let fresh = tsv_is_stale(&repo.join(INGEST_MANIFEST));
         let names = crate::names::Names::for_soul(repo)?;
     let store = crate::readdress::open_current(repo, &names)?;
+    // A store that has never listed its newest turns does so now, even
+    // when this pass brings it nothing new.
+    graph::keep_recent(&store, &names, &[])?;
         let mut manifest = read_manifest(repo);
         // Owners first: a turn belongs to the first file that brings it in,
         // so sessions load before their subagents, and older before newer,
@@ -1247,6 +1253,9 @@ pub fn sync_claude_ai(repo: &Path) -> Result<ClaudeAiStats> {
 
     let names = crate::names::Names::for_soul(repo)?;
     let store = crate::readdress::open_current(repo, &names)?;
+    // A store that has never listed its newest turns does so now, even
+    // when this pass brings it nothing new.
+    graph::keep_recent(&store, &names, &[])?;
     let mut ids: Vec<&String> = best.keys().collect();
     ids.sort();
     for id in ids {
