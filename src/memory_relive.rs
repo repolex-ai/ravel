@@ -735,6 +735,63 @@ pub fn load(repo: &Path, sp: &Speakers, peers: &PeerIndex) -> Result<Vec<Convers
     Ok(convs)
 }
 
+/// The same reader's view as [`load`], holding only conversations with turns
+/// the memory has not read, each from the place the pass before left it
+/// (`at`), and only the sends made since the oldest of those turns. What a
+/// pass costs then follows what is new, not how long the soul has lived.
+/// `souls` is every served soul as (repo, name): any of them may be a sender.
+pub fn load_unread(
+    repo: &Path,
+    sp: &Speakers,
+    done: &HashSet<String>,
+    at: &mut crate::memory_extract::ReadUpto,
+    souls: &[(std::path::PathBuf, String)],
+) -> Result<Vec<Conversation>> {
+    let unread = crate::memory_extract::conversations_unread(repo, done, at)?;
+    let first_input = |c: &Conversation| {
+        c.turns
+            .iter()
+            .find(|t| t.role == "user" && !t.text.trim().is_empty())
+            .cloned()
+    };
+    // The oldest turn whose sender has to be found: an unread turn of the
+    // human's side, or the first input of a conversation seen from its start.
+    let since = unread
+        .iter()
+        .flat_map(|n| {
+            let first = if n.from_start { first_input(&n.conv) } else { None };
+            n.conv
+                .turns
+                .iter()
+                .filter(|t| t.role == "user" && !t.text.trim().is_empty() && !done.contains(&t.id))
+                .cloned()
+                .chain(first)
+        })
+        .filter_map(|t| crate::peers::unix(&t.ts))
+        .min();
+    let idx = match since {
+        Some(t) => PeerIndex::since(souls, t),
+        None => PeerIndex::default(),
+    };
+    let mut convs = Vec::new();
+    for n in unread {
+        // The soul's own subagent: never read, and not opened again.
+        if n.from_start
+            && first_input(&n.conv).is_some_and(|t| idx.spawned(&sp.agent, &t.ts, &t.text))
+        {
+            at.is_subagent(&n);
+            continue;
+        }
+        let mut c = n.conv;
+        for t in c.turns.iter_mut().filter(|t| t.role == "user") {
+            t.peer = idx.sender_of(&sp.agent, &t.ts, &t.text);
+        }
+        convs.push(c);
+    }
+    at.save()?;
+    Ok(convs)
+}
+
 /// What is left to read before `to`: (turns, prose characters, the oldest
 /// such turn's time). How raveld decides a pass is worth a call.
 pub fn unread(convs: &[Conversation], log: &MemoryLog, to: &str) -> Result<(usize, usize, String)> {
@@ -770,11 +827,13 @@ pub fn relive(
         .into_iter()
         .filter(|s| s.turn.ts.as_str() >= from && s.turn.ts.as_str() < to)
         .collect();
-    log.write_stream_size(all.len())?;
     let st: Vec<StreamTurn> = all
         .into_iter()
         .filter(|s| !done.contains(&s.turn.id))
         .collect();
+    // The stream's size: what has been read and what this run may read.
+    // (`convs` may hold only the conversations with something unread.)
+    log.write_stream_size(done.len() + st.len())?;
     let mut calls = 0usize;
     let mut take_call = |r: &mut ReliveReport| -> bool {
         // Giving the turn up is not a failure: the rest is read next pass.
@@ -1087,6 +1146,88 @@ mod tests {
             id: id.into(),
             place: String::new(),
             turns,
+        }
+    }
+
+    /// On a real soul, read-only: the unread turns the reader is handed are
+    /// the same whether every transcript is read whole or only what is new.
+    /// `RAVEL_TRIAL_REPO` is the soul, `RAVEL_TRIAL_SOULS` every sender's
+    /// repo (colon-separated), `RAVEL_TRIAL_DIR` a folder outside any soul
+    /// for the places file. `RAVEL_TRIAL_UNREAD_SINCE` treats turns from that
+    /// time on as unread; `RAVEL_TRIAL_NEW_ONLY=1` skips the whole reading
+    /// (for measuring the new one's memory alone).
+    #[test]
+    #[ignore]
+    fn real_unread_is_the_same_read_whole_or_from_its_place() {
+        let repo = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").unwrap());
+        let dir = std::path::PathBuf::from(std::env::var("RAVEL_TRIAL_DIR").unwrap());
+        assert!(!dir.starts_with(&repo), "the trial folder must be outside the soul");
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        let souls: Vec<(std::path::PathBuf, String)> = std::env::var("RAVEL_TRIAL_SOULS")
+            .unwrap()
+            .split(':')
+            .map(|p| (p.into(), name(Path::new(p))))
+            .collect();
+        let sp = Speakers {
+            agent: name(&repo),
+            peers: souls.iter().map(|s| s.1.clone()).filter(|n| *n != name(&repo)).collect(),
+            human: "human".into(),
+        };
+        let mut done = MemoryLog::for_soul(&repo).extracted().unwrap();
+        let since = std::env::var("RAVEL_TRIAL_UNREAD_SINCE").ok();
+        let view = |convs: &[Conversation], done: &HashSet<String>| -> Vec<String> {
+            stream(convs)
+                .into_iter()
+                .filter(|s| !done.contains(&s.turn.id))
+                .map(|s| {
+                    format!(
+                        "{} {} {} {:?} [{}] {}",
+                        s.turn.ts,
+                        s.turn.id,
+                        s.turn.role,
+                        s.turn.peer,
+                        where_label(&convs[s.conv]),
+                        s.turn.text
+                    )
+                })
+                .collect()
+        };
+        let new_only = std::env::var("RAVEL_TRIAL_NEW_ONLY").is_ok();
+        let whole = if new_only {
+            None
+        } else {
+            let t = std::time::Instant::now();
+            let idx = PeerIndex::build(&souls);
+            let convs = load(&repo, &sp, &idx).unwrap();
+            if let Some(since) = &since {
+                for s in stream(&convs) {
+                    if s.turn.ts.as_str() >= since.as_str() {
+                        done.remove(&s.turn.id);
+                    }
+                }
+            }
+            let v = view(&convs, &done);
+            eprintln!("whole: {} unread turns in {:.1?}", v.len(), t.elapsed());
+            Some(v)
+        };
+        let file = dir.join("read-upto.tsv");
+        for pass in 1..=3 {
+            let t = std::time::Instant::now();
+            let mut at = crate::memory_extract::ReadUpto::open(file.clone(), 0);
+            let convs = load_unread(&repo, &sp, &done, &mut at, &souls).unwrap();
+            let v = view(&convs, &done);
+            eprintln!(
+                "pass {pass}: {} unread turns from {} conversations in {:.2?}",
+                v.len(),
+                convs.len(),
+                t.elapsed()
+            );
+            if let Some(w) = &whole {
+                for (a, b) in w.iter().zip(&v) {
+                    assert_eq!(a, b, "pass {pass}");
+                }
+                assert_eq!(w.len(), v.len(), "pass {pass}");
+            }
         }
     }
 

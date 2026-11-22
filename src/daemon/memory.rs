@@ -30,7 +30,6 @@ use crate::daemon::config::MemoryWriter;
 use crate::memory_extract::Speakers;
 use crate::memory_log::MemoryLog;
 use crate::memory_relive::{self, STRETCH_CHARS};
-use crate::peers::PeerIndex;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as Span, SecondsFormat, Utc};
 use serde::Serialize;
@@ -165,19 +164,13 @@ impl Daemon {
         })
     }
 
-    /// Every served soul's sends, for telling a peer's message from the
-    /// human's. Reads every soul's mirrors, so under the gate.
-    async fn peer_index(self: &Arc<Self>) -> Result<Arc<PeerIndex>> {
-        let souls: Vec<(std::path::PathBuf, String)> = self
-            .souls
+    /// Every served soul as (repo, name): whose transcripts may hold the send
+    /// behind a message that reached another soul.
+    fn senders(&self) -> Vec<(std::path::PathBuf, String)> {
+        self.souls
             .iter()
             .map(|s| (s.path.clone(), soul_name(&s.path)))
-            .collect();
-        let _g = self.gate.lock().await;
-        let idx = tokio::task::spawn_blocking(move || PeerIndex::build(&souls))
-            .await
-            .map_err(|e| anyhow!("peer index panicked: {e}"))?;
-        Ok(Arc::new(idx))
+            .collect()
     }
 
     /// One soul's memory pass: read, decide, write, repair.
@@ -185,7 +178,6 @@ impl Daemon {
         self: &Arc<Self>,
         id: &str,
         w: &MemoryWriter,
-        peers: Arc<PeerIndex>,
     ) -> Result<()> {
         let soul = self.soul(id)?.clone();
         let sp = Arc::new(self.speakers(id)?);
@@ -195,10 +187,16 @@ impl Daemon {
         self.memory_dirty.lock().unwrap().remove(id);
         let convs = {
             let _g = self.gate.lock().await;
-            let (path, sp, peers) = (soul.path.clone(), sp.clone(), peers.clone());
-            tokio::task::spawn_blocking(move || memory_relive::load(&path, &sp, &peers))
-                .await
-                .map_err(|e| anyhow!("memory read panicked: {e}"))??
+            let _d = super::doing::now(format!("memory writer reading soul {id}'s new turns"));
+            let (path, sp, souls) = (soul.path.clone(), sp.clone(), self.senders());
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let log_ = MemoryLog::for_soul(&path);
+                let done = log_.extracted()?;
+                let mut at = log_.read_upto();
+                memory_relive::load_unread(&path, &sp, &done, &mut at, &souls)
+            })
+            .await
+            .map_err(|e| anyhow!("memory read panicked: {e}"))??
         };
         let now = Utc::now();
         let to = stamp(now - SETTLE);
@@ -402,8 +400,7 @@ impl Daemon {
             .clone()
             .ok_or_else(|| anyhow!("no memory writer configured"))?;
         let _d = super::doing::now(format!("memory pass for soul {id}"));
-        let peers = self.peer_index().await?;
-        self.write_one(id, &w, peers).await?;
+        self.write_one(id, &w).await?;
         Ok(self.memory_of(id))
     }
 }
@@ -446,7 +443,6 @@ pub async fn run_memory_loop(d: Arc<Daemon>) {
 /// Every soul with new turns, in config order, until the subscription says
 /// stop or raveld does.
 async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
-    let mut peers: Option<Arc<PeerIndex>> = None;
     for s in d.souls.clone() {
         if d.stopping.load(Ordering::Relaxed) {
             break;
@@ -473,11 +469,7 @@ async fn write_due(d: &Arc<Daemon>, w: &MemoryWriter) -> Result<()> {
             continue;
         }
         if dirty {
-            if peers.is_none() {
-                peers = Some(d.peer_index().await?);
-            }
-            let idx = peers.clone().expect("built just above");
-            if let Err(e) = d.write_one(&s.id, w, idx).await {
+            if let Err(e) = d.write_one(&s.id, w).await {
                 d.mark(&s.id);
                 d.failed(&s.id, &e);
                 continue;

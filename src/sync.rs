@@ -349,7 +349,7 @@ fn append_after(src: &Path, dst: &Path, off: u64) -> std::io::Result<()> {
 /// A number that stands for the [`LOOK_BACK`] bytes of `path` before `off`.
 /// Kept in the manifest beside a transcript's loaded length: the same number
 /// next pass means the part already loaded is still there unchanged.
-fn mark_before(path: &Path, off: u64) -> Option<u64> {
+pub(crate) fn mark_before(path: &Path, off: u64) -> Option<u64> {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(bytes_before(path, off).ok()?);
     Some(u64::from_be_bytes(d[..8].try_into().ok()?))

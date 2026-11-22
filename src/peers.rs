@@ -39,7 +39,7 @@ pub fn flat(t: &str) -> String {
         .collect()
 }
 
-fn unix(ts: &str) -> Option<i64> {
+pub(crate) fn unix(ts: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .ok()
         .map(|t| t.timestamp())
@@ -102,17 +102,113 @@ fn body_of(cmd: &str) -> &str {
     rest.trim_start()
 }
 
+/// How long before a send its text may have been written to the file the
+/// send reads. A reading that starts at a time starts this much earlier.
+const WRITTEN_BEFORE: i64 = 6 * 3600;
+
+/// The time a transcript line carries, read without parsing the line.
+fn line_time(line: &[u8]) -> Option<i64> {
+    const KEY: &[u8] = b"\"timestamp\":\"";
+    let at = line.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let end = line[at..].iter().position(|b| *b == b'"')?;
+    unix(std::str::from_utf8(&line[at..at + end]).ok()?)
+}
+
+/// The first whole line after byte `from` that carries a time, and where it
+/// starts; None when there is none before `upto`.
+fn timed_line_after(f: &mut std::fs::File, from: u64, upto: u64) -> Option<(u64, i64)> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut rd = std::io::BufReader::new(f);
+    let mut buf = Vec::new();
+    // `from` falls inside a line: that line is not whole.
+    let mut at = from + rd.read_until(b'\n', &mut buf).ok()? as u64;
+    while at < upto {
+        buf.clear();
+        let n = rd.read_until(b'\n', &mut buf).ok()? as u64;
+        if n == 0 {
+            return None;
+        }
+        if let Some(t) = line_time(&buf) {
+            return Some((at, t));
+        }
+        at += n;
+    }
+    None
+}
+
+/// Where to start reading a Claude Code transcript so that every line written
+/// at or after `t` is read: the start of a line written before `t`, at most
+/// [`SEEK_WITHIN`] bytes early. A transcript is appended to in time order, so
+/// the place is found by halving, without reading the file (a 1 GB session
+/// was read whole every ten minutes to find sends of the last half hour,
+/// 2026-11-21).
+fn first_line_at(p: &Path, t: i64) -> u64 {
+    const SEEK_WITHIN: u64 = 1 << 20;
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return 0;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let (mut lo, mut hi) = (0u64, len);
+    while hi - lo > SEEK_WITHIN {
+        let mid = lo + (hi - lo) / 2;
+        match timed_line_after(&mut f, mid, hi) {
+            Some((at, ts)) if ts < t => lo = at,
+            _ => hi = mid,
+        }
+    }
+    lo
+}
+
 /// Every `herdr agent prompt` call in one soul's mirrored transcripts.
 pub fn sends(repo: &Path, sender: &str) -> Vec<Send> {
+    sends_since(repo, sender, None)
+}
+
+/// The sends made at or after `since` (unix seconds), or all of them. Files
+/// last written before then are not opened, and a Claude Code transcript is
+/// read from the first line of that time on.
+pub fn sends_since(repo: &Path, sender: &str, since: Option<i64>) -> Vec<Send> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let since = since.map(|t| t - WRITTEN_BEFORE);
     // (ts, command) for every shell command the soul ran; files it wrote.
     let mut cmds: Vec<(i64, String)> = Vec::new();
     let mut written: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     let mut spawns: Vec<(i64, String)> = Vec::new();
-    let mut scan = |p: &Path| {
-        let Ok(s) = std::fs::read_to_string(p) else {
+    let mut scan = |p: &Path, in_time_order: bool| {
+        let mut from = 0u64;
+        if let Some(t) = since {
+            let last_written = std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            if last_written.is_some_and(|w| w < t) {
+                return;
+            }
+            if in_time_order {
+                from = first_line_at(p, t);
+            }
+        }
+        let Ok(mut f) = std::fs::File::open(p) else {
             return;
         };
-        for line in s.lines() {
+        if f.seek(SeekFrom::Start(from)).is_err() {
+            return;
+        }
+        let mut rd = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match rd.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
             let cheap = line.contains("herdr agent prompt")
                 || line.contains("\"Write\"")
                 || line.contains("write_to_file")
@@ -184,13 +280,13 @@ pub fn sends(repo: &Path, sender: &str) -> Vec<Send> {
         }
     };
     for p in crate::sync::walk_jsonl(&repo.join(crate::sync::TRANSCRIPTS_SUBDIR)) {
-        scan(&p);
+        scan(&p, true);
     }
     let agy = repo.join(crate::sync::AGY_TRANSCRIPTS_SUBDIR);
     if let Ok(rd) = std::fs::read_dir(&agy) {
         for e in rd.flatten() {
             if e.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                scan(&e.path());
+                scan(&e.path(), false);
             }
         }
     }
@@ -264,6 +360,17 @@ impl PeerIndex {
         let mut sends: Vec<Send> = souls
             .iter()
             .flat_map(|(repo, name)| sends(repo, name))
+            .collect();
+        sends.sort_by_key(|s| s.ts);
+        PeerIndex { sends }
+    }
+
+    /// The index of sends made at or after `since` (unix seconds): enough to
+    /// name the sender of any turn from `since` on, and far less to read.
+    pub fn since(souls: &[(std::path::PathBuf, String)], since: i64) -> Self {
+        let mut sends: Vec<Send> = souls
+            .iter()
+            .flat_map(|(repo, name)| sends_since(repo, name, Some(since - BEFORE)))
             .collect();
         sends.sort_by_key(|s| s.ts);
         PeerIndex { sends }

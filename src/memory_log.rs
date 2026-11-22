@@ -127,6 +127,16 @@ impl MemoryLog {
         ))
     }
 
+    /// Where the memory writer keeps how far it has read each transcript,
+    /// and how long the list of read turns is now (it only grows; see
+    /// [`crate::memory_extract::ReadUpto`]).
+    pub fn read_upto(&self) -> crate::memory_extract::ReadUpto {
+        let len = std::fs::metadata(self.path("extracted.tsv"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        crate::memory_extract::ReadUpto::open(self.path("read-upto.tsv"), len)
+    }
+
     pub fn extracted(&self) -> Result<HashSet<String>> {
         let p = self.path("extracted.tsv");
         if !p.exists() {

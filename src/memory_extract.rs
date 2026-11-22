@@ -362,6 +362,442 @@ pub fn conversations(repo: &Path) -> Result<Vec<Conversation>> {
     Ok(out)
 }
 
+// ───────────────────── reading only what is new ─────────────────────
+
+/// Changed when a build reads transcripts differently enough that places
+/// kept by an older build must not be trusted: they are then dropped and
+/// every transcript is read whole once.
+const READ_UPTO_FORMAT: &str = "1";
+
+/// One transcript's place.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Place {
+    /// Every turn before this byte has been read by the memory writer.
+    from: u64,
+    /// Stands for the bytes just before `from` ([`crate::sync::mark_before`]):
+    /// the same number later means the file still begins the way it did.
+    mark: u64,
+    /// The file's length when a reading from `from` found nothing unread; 0
+    /// when it found something. A file still this long is not opened.
+    quiet_at: u64,
+    /// A subagent's conversation, which is never read.
+    subagent: bool,
+}
+
+/// How far into each transcript the memory writer has read everything, kept
+/// beside its log as `read-upto.tsv`. Without it a pass parsed every
+/// transcript a soul has (12.5 GB for one soul) to find the few turns added
+/// since the pass before (2026-11-21: 3.5 GB held for a minute or two, every
+/// ten minutes).
+///
+/// A place is only ever a saving: with the file missing, older than the log
+/// it sits beside, or from another build, every transcript is read whole.
+pub struct ReadUpto {
+    file: PathBuf,
+    /// The length of the log's list of read turns. The list only grows, so a
+    /// shorter one is a memory begun again, and no place holds.
+    read_list_len: u64,
+    places: HashMap<(String, String), Place>,
+}
+
+impl ReadUpto {
+    /// The places kept in `file`, for a log whose list of read turns is
+    /// `read_list_len` bytes long now.
+    pub fn open(file: PathBuf, read_list_len: u64) -> Self {
+        let mut places = HashMap::new();
+        let raw = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut lines = raw.lines();
+        let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+        let holds = head.len() == 3
+            && head[0] == "#"
+            && head[1] == READ_UPTO_FORMAT
+            && head[2].parse::<u64>().is_ok_and(|was| was <= read_list_len);
+        if holds {
+            for l in lines {
+                let f: Vec<&str> = l.split('\t').collect();
+                if f.len() != 6 {
+                    continue;
+                }
+                let (Ok(from), Ok(mark), Ok(quiet_at)) =
+                    (f[2].parse(), f[3].parse(), f[4].parse())
+                else {
+                    continue;
+                };
+                places.insert(
+                    (f[0].to_string(), f[1].to_string()),
+                    Place {
+                        from,
+                        mark,
+                        quiet_at,
+                        subagent: f[5] == "subagent",
+                    },
+                );
+            }
+        }
+        ReadUpto {
+            file,
+            read_list_len,
+            places,
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(dir) = self.file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut rows: Vec<String> = self
+            .places
+            .iter()
+            .map(|((source, id), p)| {
+                format!(
+                    "{source}\t{id}\t{}\t{}\t{}\t{}",
+                    p.from,
+                    p.mark,
+                    p.quiet_at,
+                    if p.subagent { "subagent" } else { "-" }
+                )
+            })
+            .collect();
+        rows.sort();
+        let body = format!(
+            "#\t{READ_UPTO_FORMAT}\t{}\n{}\n",
+            self.read_list_len,
+            rows.join("\n")
+        );
+        let tmp = self.file.with_extension("tsv.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &self.file)?;
+        Ok(())
+    }
+
+    /// Mark a conversation as a subagent's: it is not opened again while it
+    /// still begins the way it does now.
+    pub fn is_subagent(&mut self, n: &Unread) {
+        self.places.insert(
+            n.key.clone(),
+            Place {
+                from: n.upto,
+                mark: n.upto_mark,
+                quiet_at: n.upto,
+                subagent: true,
+            },
+        );
+    }
+}
+
+/// A conversation with turns the memory writer has not read, holding only
+/// the part of it that had to be opened to read them.
+pub struct Unread {
+    pub conv: Conversation,
+    /// Read from its first turn. Only then is its first input in `conv`, so
+    /// only then can it be told to be a subagent's conversation.
+    pub from_start: bool,
+    key: (String, String),
+    upto: u64,
+    upto_mark: u64,
+}
+
+/// A Claude Code transcript from byte `from`: its events, where each one's
+/// line starts, the working directory it names, and the byte after the last
+/// whole line. Read a line at a time, so no more than the events are held.
+fn read_from(p: &Path, from: u64) -> Result<(Vec<crate::Event>, Vec<u64>, String, u64)> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut f = std::fs::File::open(p)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut rd = std::io::BufReader::with_capacity(1 << 20, f);
+    let (mut events, mut starts) = (Vec::new(), Vec::new());
+    let place = first_cwd_in(p)
+        .map(|c| format!("working directory {c}"))
+        .unwrap_or_default();
+    let mut at = from;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = rd.read_until(b'\n', &mut buf)? as u64;
+        if n == 0 {
+            break;
+        }
+        // A last line with no newline is taken when it is whole JSON and
+        // left for the next pass when it is not: the client was mid-write.
+        if !buf.ends_with(b"\n") && serde_json::from_slice::<Value>(&buf).is_err() {
+            break;
+        }
+        if let Ok(line) = std::str::from_utf8(&buf) {
+            for mut e in crate::adapter::parse_transcript(line)? {
+                // Never read by the memory writer, and the largest part.
+                e.thinking = Default::default();
+                events.push(e);
+                starts.push(at);
+            }
+        }
+        at += n;
+    }
+    Ok((events, starts, place, at))
+}
+
+/// The first working directory a transcript names, wherever reading starts:
+/// a conversation is labelled by where it began.
+fn first_cwd_in(p: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let mut rd = std::io::BufReader::new(std::fs::File::open(p).ok()?);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if rd.read_until(b'\n', &mut buf).ok()? == 0 {
+            return None;
+        }
+        if let Some(c) = std::str::from_utf8(&buf).ok().and_then(first_cwd) {
+            return Some(c);
+        }
+    }
+}
+
+fn is_unread(t: &ProseTurn, done: &std::collections::HashSet<String>) -> bool {
+    !t.text.trim().is_empty() && !done.contains(&t.id)
+}
+
+/// Every conversation of a soul's that holds a turn not in `done`, each from
+/// the place `at` kept for it, and `at` moved on to where the next pass may
+/// start. A transcript with nothing new since a pass found it fully read is
+/// not opened.
+///
+/// A Claude Code transcript's place is always the line of something the
+/// human said (or its start): read from there, every later turn comes out
+/// exactly as it does read whole, because a turn of the human's words is
+/// where the folding of tool calls into turns begins again.
+pub fn conversations_unread(
+    repo: &Path,
+    done: &std::collections::HashSet<String>,
+    at: &mut ReadUpto,
+) -> Result<Vec<Unread>> {
+    let mut out = Vec::new();
+    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let cc = repo.join(crate::sync::TRANSCRIPTS_SUBDIR);
+    if cc.is_dir() {
+        for p in crate::sync::walk_jsonl(&cc) {
+            if p.components().any(|c| c.as_os_str() == "subagents") {
+                continue;
+            }
+            let id = p
+                .strip_prefix(&cc)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .into_owned();
+            let key = ("claude-code".to_string(), id.clone());
+            let len = len_of(&p);
+            let kept = at.places.get(&key).cloned();
+            // Exactly as long as when it was found fully read: not opened.
+            if kept.as_ref().is_some_and(|k| !k.subagent && k.quiet_at == len) {
+                continue;
+            }
+            // A place holds while the file still begins the way it did.
+            let kept = kept.filter(|k| {
+                k.from <= len && crate::sync::mark_before(&p, k.from) == Some(k.mark)
+            });
+            if kept.as_ref().is_some_and(|k| k.subagent) {
+                continue;
+            }
+            let from = kept.map_or(0, |k| k.from);
+            let Ok((events, starts, place, upto)) = read_from(&p, from) else {
+                continue;
+            };
+            let line_of: HashMap<&str, u64> = events
+                .iter()
+                .zip(&starts)
+                .rev()
+                .map(|(e, s)| (e.event_id.as_str(), *s))
+                .collect();
+            let turns = to_turns(&events, "claude-code");
+            // The place moves to the last thing the human said that has
+            // nothing unread before it.
+            let mut next = from;
+            let mut unread = false;
+            for t in turns.iter().filter(|t| !t.text.trim().is_empty()) {
+                if t.role == "user" {
+                    if let Some(l) = line_of.get(t.id.as_str()) {
+                        next = *l;
+                    }
+                }
+                if is_unread(t, done) {
+                    unread = true;
+                    break;
+                }
+            }
+            let Some(mark) = crate::sync::mark_before(&p, next) else {
+                continue;
+            };
+            at.places.insert(
+                key.clone(),
+                Place {
+                    from: next,
+                    mark,
+                    quiet_at: if unread { 0 } else { len },
+                    subagent: false,
+                },
+            );
+            if !unread {
+                continue;
+            }
+            let Some(upto_mark) = crate::sync::mark_before(&p, upto) else {
+                continue;
+            };
+            out.push(Unread {
+                conv: Conversation {
+                    source: "claude-code",
+                    id,
+                    place,
+                    turns,
+                },
+                from_start: from == 0,
+                key,
+                upto,
+                upto_mark,
+            });
+        }
+    }
+    // An Antigravity conversation is one small file, rewritten as it grows:
+    // read whole when it has changed, not at all when it has not.
+    let agy = repo.join(crate::sync::AGY_TRANSCRIPTS_SUBDIR);
+    if agy.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&agy)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        for p in files {
+            let id = p
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let key = ("agy".to_string(), id.clone());
+            let len = len_of(&p);
+            let Some(mark) = crate::sync::mark_before(&p, len) else {
+                continue;
+            };
+            if at
+                .places
+                .get(&key)
+                .is_some_and(|k| k.quiet_at == len && k.mark == mark)
+            {
+                continue;
+            }
+            let Ok(s) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(parsed) = crate::agy::parse_transcript(&s, &id) else {
+                continue;
+            };
+            let turns = to_turns(&parsed.events, "agy");
+            let unread = turns.iter().any(|t| is_unread(t, done));
+            at.places.insert(
+                key.clone(),
+                Place {
+                    from: len,
+                    mark,
+                    quiet_at: if unread { 0 } else { len },
+                    subagent: false,
+                },
+            );
+            if !unread {
+                continue;
+            }
+            out.push(Unread {
+                conv: Conversation {
+                    source: "agy",
+                    id,
+                    place: String::new(),
+                    turns,
+                },
+                from_start: true,
+                key,
+                upto: len,
+                upto_mark: mark,
+            });
+        }
+    }
+    // claude.ai exports arrive whole and rarely: read again only when the
+    // shelf holds different exports than it did when all of it was read.
+    let shelf = repo.join(crate::sync::CLAUDE_AI_SUBDIR);
+    if shelf.is_dir() {
+        let mut exports: Vec<PathBuf> = std::fs::read_dir(&shelf)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| crate::claude_ai::is_export_dir(p))
+            .collect();
+        exports.sort();
+        let mut what = String::new();
+        for e in &exports {
+            let mut size = 0;
+            for f in std::fs::read_dir(e)?.flatten() {
+                size += f.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+            what += &format!("{}\t{size}\n", e.display());
+        }
+        let mark = {
+            use sha2::{Digest, Sha256};
+            let d = Sha256::digest(what.as_bytes());
+            u64::from_be_bytes(d[..8].try_into().expect("a digest is 32 bytes"))
+        };
+        let shelf_key = ("claude.ai".to_string(), "*".to_string());
+        let count = exports.len() as u64;
+        let same = at
+            .places
+            .get(&shelf_key)
+            .is_some_and(|k| k.quiet_at == count && k.mark == mark);
+        if !same && count > 0 {
+            let mut best: HashMap<String, (String, crate::claude_ai::Conversation)> =
+                HashMap::new();
+            for e in exports {
+                for c in crate::claude_ai::read_conversations(&e)? {
+                    let k = crate::claude_ai::version_key(&c);
+                    if best.get(&c.uuid).is_none_or(|(bk, _)| k > *bk) {
+                        best.insert(c.uuid.clone(), (k, c));
+                    }
+                }
+            }
+            let mut any_unread = false;
+            for (id, (_, c)) in best {
+                let turns = to_turns(&crate::claude_ai::conversation_events(&c), "claude.ai");
+                if !turns.iter().any(|t| is_unread(t, done)) {
+                    continue;
+                }
+                any_unread = true;
+                let place = if c.name.is_empty() {
+                    "a Claude desktop chat".to_string()
+                } else {
+                    format!("a Claude desktop chat titled {:?}", c.name)
+                };
+                out.push(Unread {
+                    conv: Conversation {
+                        source: "claude.ai",
+                        id: id.clone(),
+                        place,
+                        turns,
+                    },
+                    // A chat is never a subagent's, and the shelf has one
+                    // place for all of them.
+                    from_start: false,
+                    key: ("claude.ai".to_string(), id),
+                    upto: 0,
+                    upto_mark: 0,
+                });
+            }
+            at.places.insert(
+                shelf_key,
+                Place {
+                    from: 0,
+                    mark,
+                    quiet_at: if any_unread { 0 } else { count },
+                    subagent: false,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Who can speak in a soul's conversation besides the human: the soul
 /// itself, and its peers (every other soul raveld serves).
 pub struct Speakers {
@@ -774,6 +1210,92 @@ mod tests {
 #[cfg(test)]
 mod reader_tests {
     use super::*;
+
+    /// A transcript found fully read is not opened again; when it grows it
+    /// is read from the last thing the human said before the new turns, and
+    /// those turns come out exactly as they do read whole.
+    #[test]
+    fn a_grown_transcript_is_read_from_its_place_and_reads_the_same() {
+        use std::collections::HashSet;
+        let repo = std::env::temp_dir().join(format!("ravel-upto-{}", std::process::id()));
+        let cc = repo.join(crate::sync::TRANSCRIPTS_SUBDIR);
+        std::fs::create_dir_all(&cc).unwrap();
+        let file = cc.join("s1.jsonl");
+        let user = |id: &str, n: u32, text: &str| {
+            format!(
+                r#"{{"type":"user","uuid":"{id}","cwd":"/x","timestamp":"2026-11-10T22:00:{n:02}Z","message":{{"role":"user","content":"{text}"}}}}"#
+            )
+        };
+        let soul = |id: &str, n: u32, text: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{id}","timestamp":"2026-11-10T22:00:{n:02}Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let ran = |id: &str, n: u32| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{id}","timestamp":"2026-11-10T22:00:{n:02}Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t{id}","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+            )
+        };
+        let first = [user("u1", 1, "is it built?"), soul("a1", 2, "Building."), ran("a2", 3)];
+        std::fs::write(&file, first.join("\n") + "\n").unwrap();
+        let places = repo.join("read-upto.tsv");
+        let ids = |v: &[Unread]| -> Vec<(String, String)> {
+            v.iter()
+                .flat_map(|n| n.conv.turns.iter())
+                .filter(|t| !t.text.trim().is_empty())
+                .map(|t| (t.id.clone(), t.text.clone()))
+                .collect()
+        };
+
+        let mut done: HashSet<String> = HashSet::new();
+        let mut at = ReadUpto::open(places.clone(), 0);
+        let got = conversations_unread(&repo, &done, &mut at).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].from_start);
+        at.save().unwrap();
+        done.extend(["u1".to_string(), "a1".to_string()]);
+
+        // Everything read: found quiet once, then not opened.
+        let mut at = ReadUpto::open(places.clone(), 0);
+        assert!(conversations_unread(&repo, &done, &mut at).unwrap().is_empty());
+        at.save().unwrap();
+        let quiet = at.places[&("claude-code".to_string(), "s1.jsonl".to_string())].clone();
+        assert_eq!(quiet.quiet_at, std::fs::metadata(&file).unwrap().len());
+
+        // It grows: more work, the human again, a reply after more work.
+        let more = [ran("a3", 4), user("u2", 5, "and now?"), ran("a4", 6), soul("a5", 7, "Built.")];
+        let mut all = std::fs::read_to_string(&file).unwrap();
+        all += &(more.join("\n") + "\n");
+        std::fs::write(&file, &all).unwrap();
+        let mut at = ReadUpto::open(places.clone(), 0);
+        let got = conversations_unread(&repo, &done, &mut at).unwrap();
+        let whole = to_turns(&crate::adapter::parse_transcript(&all).unwrap(), "claude-code");
+        let whole: Vec<(String, String)> = whole
+            .into_iter()
+            .filter(|t| !t.text.trim().is_empty() && !done.contains(&t.id))
+            .map(|t| (t.id, t.text))
+            .collect();
+        let new: Vec<(String, String)> = ids(&got)
+            .into_iter()
+            .filter(|(id, _)| !done.contains(id))
+            .collect();
+        assert_eq!(new, whole);
+        assert_eq!(whole.len(), 2);
+        assert!(whole[1].1.contains("[ran: ls"), "{:?}", whole[1]);
+        // The place is the human's second line, not the start.
+        let place = at.places[&("claude-code".to_string(), "s1.jsonl".to_string())].clone();
+        assert_eq!(place.from as usize, all.find(r#"{"type":"user","uuid":"u2""#).unwrap());
+
+        // A memory begun again (a shorter list of read turns) keeps no place.
+        at.save().unwrap();
+        let later = ReadUpto::open(places.clone(), 0);
+        assert!(!later.places.is_empty());
+        let at = ReadUpto::open(places.clone(), 50);
+        at.save().unwrap();
+        assert!(ReadUpto::open(places.clone(), 10).places.is_empty());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
 
     #[test]
     fn harness_records_are_no_ones_words() {
