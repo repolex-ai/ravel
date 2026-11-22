@@ -623,16 +623,18 @@ fn answer(
 ) -> anyhow::Result<(Answer, Vec<String>)> {
     let store = open_store(soul)?;
     let names = crate::names::Names::for_soul(&soul.path)?;
-    // The token is NOT given to the evaluator. spareval (0.2.6 to 0.2.9)
-    // does not end a query when its token is cancelled: every row still to
-    // come becomes an Err(Cancelled), and its joins, left joins and ORDER BY
-    // push each one onto a Vec instead of returning (eval.rs, `errors.push`).
-    // A cancel during a 454,000-row hash build is therefore millions of
-    // buffered errors: on 2026-11-21 raveld cancelled a query at 6.2 GB and
-    // that cancel took it to 12.4 GB in 82 seconds (found by tr1pl3x). The
-    // token is kept as a flag for the log only, until a stop that works.
-    let _ = &stop;
-    let (results, report) = crate::outside::run_until(&store, text, names.root(), None)?;
+    // The token is given to the evaluator, so a query past its time limit,
+    // or one whose caller has hung up, ends instead of running on in its
+    // seat. From 0.11.9 to 0.11.12 it was withheld: on 2026-11-21 a cancel
+    // was blamed for raveld going from 6.2 GB to 12.4 GB. That growth was the
+    // store's own fault (a reader beside a writer; see `graph::reading`),
+    // had begun before the cancel, and is fixed. Measured since, on a copy of
+    // a real store: a query that otherwise runs past 30 s, cancelled at 2 s,
+    // ends at 2.04 s. What spareval does on a cancel is turn each row still
+    // to come into an error, so a cancelled query can still cost a moment;
+    // raveld's own memory watch stands behind it.
+    let (results, report) =
+        crate::outside::run_until(&store, text, names.root(), Some(stop))?;
     let notes = crate::outside::notes(&report);
     let a = match results {
         QueryResults::Solutions(sols) => {
@@ -892,7 +894,7 @@ async fn ask(
         let took = began.elapsed();
         if for_work.is_cancelled() {
             super::log(format!(
-                "query on {who} ran {:.1}s to its end after its caller was gone or its {}s limit had passed (a running query cannot be stopped): {shown}",
+                "query on {who} stopped after {:.1}s: its caller was gone or its {}s limit had passed: {shown}",
                 took.as_secs_f64(),
                 QUERY_TIME_LIMIT.as_secs()
             ));
@@ -907,8 +909,8 @@ async fn ask(
     let out = tokio::select! {
         r = &mut work => r,
         _ = tokio::time::sleep(QUERY_TIME_LIMIT) => {
-            // The caller is answered now; the work keeps its place at the
-            // store until it ends, so at most QUERIES_AT_ONCE ever run on.
+            // The caller is answered now and the work is told to stop; it
+            // keeps its place at the store until it has.
             stop.cancel();
             return Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
