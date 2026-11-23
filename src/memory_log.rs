@@ -756,6 +756,7 @@ mod tests {
                 "NamedGraph",
                 "Thing",
                 "VisibilityValue",
+                "author",
                 "owner",
                 "readableBy",
                 "relatedToId",

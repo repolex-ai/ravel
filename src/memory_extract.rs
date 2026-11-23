@@ -41,7 +41,7 @@ pub struct Conversation {
     pub turns: Vec<ProseTurn>,
 }
 
-fn authored(e: &crate::Event) -> String {
+pub(crate) fn authored(e: &crate::Event) -> String {
     let Some(text) = &e.text else {
         return String::new();
     };
@@ -106,6 +106,12 @@ fn human_words(t: &str) -> String {
         return String::new();
     }
     t
+}
+
+/// True when a user turn's text is a person's own typed words: not harness
+/// noise, not a compaction summary.
+pub(crate) fn persons_own(t: &str) -> bool {
+    !t.trim_start().starts_with(COMPACTION_OPENING) && !human_words(t).trim().is_empty()
 }
 
 /// Text with every `<system-reminder>…</system-reminder>` block removed:
@@ -1198,6 +1204,7 @@ mod tests {
             thinking: None,
             model: None,
             model_setting: None,
+            wrote: crate::Wrote::Nobody,
             actions: Vec::new(),
             outcomes: Vec::new(),
         };
@@ -1340,6 +1347,7 @@ mod reader_tests {
             thinking: None,
             model: None,
             model_setting: None,
+            wrote: crate::Wrote::Nobody,
             actions: Vec::new(),
             outcomes: Vec::new(),
         };

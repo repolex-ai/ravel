@@ -106,6 +106,11 @@ pub fn conversation_events(c: &Conversation) -> Vec<Event> {
             thinking: message_thinking(m),
             model: None,
             model_setting: None,
+            wrote: match m.sender.as_str() {
+                "human" => crate::Wrote::Person,
+                "assistant" => crate::Wrote::Soul,
+                _ => crate::Wrote::Nobody,
+            },
             actions: Vec::new(),
             outcomes: Vec::new(),
         });

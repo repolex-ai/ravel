@@ -261,6 +261,7 @@ mod tests {
             thinking: None,
             model: None,
             model_setting: None,
+            wrote: crate::Wrote::Nobody,
             actions: Vec::new(),
             outcomes: Vec::new(),
         }

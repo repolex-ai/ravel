@@ -79,6 +79,8 @@ pub struct Event {
     /// made outside the conversation is not seen, so this is the setting, never
     /// a report of what ran.
     pub model_setting: Option<String>,
+    /// Who wrote this event, as far as the record itself shows.
+    pub wrote: Wrote,
     /// The tool calls this event made: what the speaker DID, as distinct from
     /// what it said. Kept so a memory reader can see a check the soul ran,
     /// not only its words about it (#27: Selkie's reruns were invisible, so
@@ -86,6 +88,20 @@ pub struct Event {
     pub actions: Vec<Action>,
     /// The results this event carries back for earlier tool calls, by call id.
     pub outcomes: Vec<Outcome>,
+}
+
+/// Who wrote an event. Each adapter decides from the record alone; the
+/// projector turns it into a name (`ravel:author`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wrote {
+    /// The soul this transcript belongs to: a model's reply.
+    Soul,
+    /// The person at the keyboard: their own typed words.
+    Person,
+    /// No one the record names: tool output, harness notices, a subagent's
+    /// prompt, a reply the harness made without a model.
+    #[default]
+    Nobody,
 }
 
 /// One tool call, as a reader needs it: what kind of thing was done, and to

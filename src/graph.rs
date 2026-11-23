@@ -297,7 +297,7 @@ pub fn ingest_annotations(
         .cloned()
         .collect();
 
-    let mut nt = project_nt(&anchor_events, &partition)?;
+    let mut nt = project_nt(&anchor_events, &partition, &crate::project::Who::of(names))?;
     nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
@@ -345,7 +345,7 @@ pub fn ingest_transcript(
     store.clear_graph(GraphNameRef::NamedNode(graph.as_ref()))?;
 
     // FULL spine: project EVERY event, not just the annotation-referenced ones.
-    let mut nt = project_nt(events, &partition)?;
+    let mut nt = project_nt(events, &partition, &crate::project::Who::of(names))?;
     nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
@@ -379,7 +379,7 @@ pub fn append_transcript(
 ) -> Result<()> {
     let graph_iri = transcript_graph_iri(names, transcript_id);
     let graph = NamedNode::new(&graph_iri).context("transcript graph IRI")?;
-    let mut nt = project_nt(events, &names.turn_partition())?;
+    let mut nt = project_nt(events, &names.turn_partition(), &crate::project::Who::of(names))?;
     nt.push_str(&annotation_nt(anns, transcript_id, names)?);
     let parser = RdfParser::from_format(RdfFormat::NTriples).with_default_graph(graph.clone());
     store.load_from_reader(parser, nt.as_bytes())?;
@@ -755,6 +755,7 @@ mod tests {
             thinking: None,
             model: None,
             model_setting: None,
+            wrote: crate::Wrote::Nobody,
             actions: Vec::new(),
             outcomes: Vec::new(),
         }

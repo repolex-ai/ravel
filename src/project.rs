@@ -5,7 +5,7 @@
 //! carrying no soul identity — soul scoping is the store). The engine
 //! treats `partition` as an opaque prefix — it does not know it means "soul".
 
-use crate::{Event, RAVEL_NS};
+use crate::{Event, Wrote, RAVEL_NS};
 use anyhow::Result;
 use oxigraph::store::Store;
 
@@ -41,6 +41,55 @@ pub fn validate_event_id(event_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The two names an author can be built from: the soul whose transcripts
+/// these are, and the person at this machine. Either may be unknown, and
+/// then no author is written for the turns it would have named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Who {
+    pub soul: Option<String>,
+    pub person: Option<String>,
+}
+
+impl Who {
+    pub fn of(names: &crate::names::Names) -> Self {
+        Self {
+            soul: names
+                .username()
+                .filter(|u| crate::names::plain_username(u))
+                .map(str::to_string),
+            person: crate::names::machine_owner(),
+        }
+    }
+}
+
+/// Who wrote a turn, as `ravel:author` states it (ruled by goodlux,
+/// 2026-11-22; subtexture.ttl 0.7.0): `{username}-on-{model}` for a reply
+/// whose record names its model, the bare username when it names none, the
+/// bare username for a person always. A herdr sender line names its own
+/// user, bare: it is that sender's word, like every `claimedSender*`. None
+/// when the record names no one; a model is never guessed.
+fn author(e: &Event, who: &Who, claim: Option<&crate::herdr::SenderClaim>) -> Option<String> {
+    if let Some(c) = claim {
+        return c
+            .user
+            .clone()
+            .filter(|u| crate::names::plain_username(u));
+    }
+    match e.wrote {
+        Wrote::Soul => {
+            let u = who.soul.as_deref()?;
+            Some(match &e.model {
+                Some(m) => format!("{u}-on-{m}"),
+                None => u.to_string(),
+            })
+        }
+        // A peer's message with no sender line names no one we can state.
+        Wrote::Person if e.text.as_deref().is_some_and(crate::herdr::unsigned_peer_line) => None,
+        Wrote::Person => who.person.clone(),
+        Wrote::Nobody => None,
+    }
+}
+
 /// Load events into a fresh in-memory Store, emitting the spine + scalar props.
 /// Returns the Store. Idempotent by construction: subject IRIs are deterministic
 /// (partition + event_id), so re-projecting the same events overwrites, never
@@ -49,7 +98,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
     let store = Store::new()?;
     store.load_from_reader(
         oxigraph::io::RdfFormat::NTriples,
-        project_nt(events, partition)?.as_bytes(),
+        project_nt(events, partition, &Who::default())?.as_bytes(),
     )?;
     Ok(store)
 }
@@ -62,7 +111,7 @@ pub fn project(events: &[Event], partition: &str) -> Result<Store> {
 /// and the federation TIME anchor (`ravel:timestamp` xsd:dateTime) is absent, so
 /// a soul+time cross-store join has soul but not time. The Turn node is what
 /// carries the time half of the anchor contract.
-pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
+pub fn project_nt(events: &[Event], partition: &str, who: &Who) -> Result<String> {
     let mut nt = String::new();
 
     let turn_class = format!("{RAVEL_NS}Turn");
@@ -71,7 +120,7 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
     let p_ts = format!("{RAVEL_NS}timestamp");
     let p_text = format!("{RAVEL_NS}text");
     let p_role = format!("{RAVEL_NS}role");
-    let p_model = format!("{RAVEL_NS}model");
+    let p_author = format!("{RAVEL_NS}author");
     let p_setting = format!("{RAVEL_NS}modelSetting");
     let xsd_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
 
@@ -102,15 +151,20 @@ pub fn project_nt(events: &[Event], partition: &str) -> Result<String> {
         if let Some(tx) = &e.text {
             nt.push_str(&format!("<{s}> <{p_text}> {} .\n", lit(tx)));
         }
-        if let Some(m) = &e.model {
-            nt.push_str(&format!("<{s}> <{p_model}> {} .\n", lit(m)));
-        }
         if let Some(m) = &e.model_setting {
             nt.push_str(&format!("<{s}> <{p_setting}> {} .\n", lit(m)));
         }
         // A herdr sender line, on input only: what the sender says of itself.
-        if e.role == "user" {
-            if let Some(c) = e.text.as_deref().and_then(crate::herdr::sender_claim) {
+        // Input only: Claude Code files it as `user`, Antigravity as
+        // `USER_EXPLICIT`. The same line in a reply is the soul quoting it.
+        let claim = (e.role == "user" || e.role == "USER_EXPLICIT")
+            .then(|| e.text.as_deref().and_then(crate::herdr::sender_claim))
+            .flatten();
+        if let Some(a) = author(e, who, claim.as_ref()) {
+            nt.push_str(&format!("<{s}> <{p_author}> {} .\n", lit(&a)));
+        }
+        {
+            if let Some(c) = claim {
                 for (name, v) in [
                     ("claimedSender", c.from),
                     ("claimedSenderPane", c.pane),
@@ -163,6 +217,7 @@ mod tests {
             thinking: None,
             model: Some("claude-opus-5-5".into()),
             model_setting: Some("Gemini 4 Argon (Medium)".into()),
+            wrote: crate::Wrote::Soul,
             actions: Vec::new(),
             outcomes: Vec::new(),
         };
@@ -181,9 +236,10 @@ mod tests {
             role: "assistant".into(),
             ..said.clone()
         };
-        let nt = project_nt(&[quoted], "urn:test:").unwrap();
+        let who = Who { soul: Some("spacegoat".into()), person: Some("goodlux".into()) };
+        let nt = project_nt(&[quoted], "urn:test:", &who).unwrap();
         assert!(!nt.contains("claimedSender"));
-        let nt = project_nt(&[e, said], "urn:test:").unwrap();
+        let nt = project_nt(&[e, said], "urn:test:", &who).unwrap();
         assert!(nt.contains("claimedSender> \"th34\""));
         assert!(nt.contains("claimedSenderSoul> \"9bdf2afa2a49bfac1b6d6ff7f5f3ab34f04ed44b\""));
         let mut terms: Vec<String> = nt
@@ -194,8 +250,9 @@ mod tests {
         terms.sort();
         terms.dedup();
         assert!(
-            terms.contains(&"model".to_string()) && terms.contains(&"modelSetting".to_string())
+            terms.contains(&"author".to_string()) && terms.contains(&"modelSetting".to_string())
         );
+        assert!(!terms.contains(&"model".to_string()), "ravel:model is retired");
         for t in terms {
             let q = format!("ASK {{ <{RAVEL_NS}{t}> a ?k }}");
             let ok = matches!(
@@ -208,6 +265,92 @@ mod tests {
                 oxigraph::sparql::QueryResults::Boolean(true)
             );
             assert!(ok, "ravel:{t} is emitted but not declared in ravel.ttl");
+        }
+    }
+
+    fn turn(id: &str, role: &str, text: &str, model: Option<&str>, wrote: Wrote) -> Event {
+        Event {
+            event_id: id.into(),
+            parent_id: None,
+            role: role.into(),
+            timestamp: None,
+            text: Some(text.into()),
+            text_provenance: vec![],
+            thinking: None,
+            model: model.map(str::to_string),
+            model_setting: None,
+            wrote,
+            actions: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn authors(nt: &str, id: &str) -> Vec<String> {
+        nt.lines()
+            .filter(|l| l.starts_with(&format!("<urn:test:{id}> <{RAVEL_NS}author> ")))
+            .map(|l| l.split('"').nth(1).unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn an_author_names_the_soul_and_its_model_or_the_person_and_guesses_nothing() {
+        let who = Who { soul: Some("s3lk13".into()), person: Some("goodlux".into()) };
+        let events = [
+            turn("a", "assistant", "hi", Some("claude-fable-5-2"), Wrote::Soul),
+            turn("b", "assistant", "hi", None, Wrote::Soul),
+            turn("c", "user", "fix it", None, Wrote::Person),
+            turn("d", "user", "tool output", None, Wrote::Nobody),
+            // A herdr line names its own user, whatever else the turn is.
+            turn("e", "user", "--herdr v=1 from=th34 pane=w9:p1 user=4m41th34--\nhello", None, Wrote::Person),
+            // A sender line with no user names no one.
+            turn("f", "user", "--herdr v=1 from=th34 pane=w9:p1--\nhello", None, Wrote::Person),
+        ];
+        let nt = project_nt(&events, "urn:test:", &who).unwrap();
+        assert_eq!(authors(&nt, "a"), ["s3lk13-on-claude-fable-5-2"]);
+        assert_eq!(authors(&nt, "b"), ["s3lk13"]);
+        assert_eq!(authors(&nt, "c"), ["goodlux"]);
+        assert!(authors(&nt, "d").is_empty());
+        assert_eq!(authors(&nt, "e"), ["4m41th34"]);
+        assert!(authors(&nt, "f").is_empty());
+        let peer = [turn("g", "user", "[kira] GREEN LIGHT", None, Wrote::Person)];
+        assert!(!project_nt(&peer, "urn:test:", &who).unwrap().contains("author>"));
+        assert!(!nt.contains(&format!("<{RAVEL_NS}model>")));
+
+        // A store with no username, on a machine with no recorded owner.
+        let nt = project_nt(&events, "urn:test:", &Who::default()).unwrap();
+        assert_eq!(nt.matches("author>").count(), 1, "only the herdr line still names someone");
+    }
+
+    /// Real transcripts, read-only: how many turns each author gets, and a
+    /// sample of the person's. `RAVEL_TRIAL_FILE` is a Claude Code jsonl,
+    /// `RAVEL_TRIAL_AGY` an Antigravity one (either may be unset).
+    #[test]
+    #[ignore]
+    fn real_authors() {
+        let who = Who { soul: Some("soul".into()), person: Some("person".into()) };
+        let mut sets: Vec<(String, Vec<Event>)> = Vec::new();
+        if let Ok(f) = std::env::var("RAVEL_TRIAL_FILE") {
+            let e = crate::adapter::parse_transcript(&std::fs::read_to_string(&f).unwrap()).unwrap();
+            sets.push((f, e));
+        }
+        if let Ok(f) = std::env::var("RAVEL_TRIAL_AGY") {
+            let e = crate::agy::parse_transcript(&std::fs::read_to_string(&f).unwrap(), "c").unwrap().events;
+            sets.push((f, e));
+        }
+        for (f, events) in sets {
+            let mut n: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut shown = 0;
+            for e in &events {
+                let claim = (e.role == "user" || e.role == "USER_EXPLICIT").then(|| e.text.as_deref().and_then(crate::herdr::sender_claim)).flatten();
+                let a = author(e, &who, claim.as_ref()).unwrap_or_else(|| format!("(none, {})", e.role));
+                if a == "person" && shown < 12 {
+                    shown += 1;
+                    let t: String = e.text.as_deref().unwrap_or("").chars().take(90).collect();
+                    println!("  PERSON: {}", t.replace('\n', " "));
+                }
+                *n.entry(a).or_default() += 1;
+            }
+            println!("{f}\n  {n:?}");
         }
     }
 }

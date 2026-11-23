@@ -43,7 +43,7 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
             .and_then(Value::as_str)
             .map(str::to_string);
         let (text, text_provenance) = extract_text(o.get("message"));
-        events.push(Event {
+        let mut e = Event {
             event_id,
             parent_id,
             role: t.to_string(),
@@ -53,9 +53,24 @@ pub fn parse_transcript(jsonl: &str) -> Result<Vec<Event>> {
             thinking: extract_thinking(o.get("message")),
             model: reported_model(o.get("message")),
             model_setting: None,
+            wrote: crate::Wrote::Nobody,
             actions: extract_actions(o.get("message")),
             outcomes: extract_outcomes(o.get("message")),
-        });
+        };
+        // A reply that names its model is the soul's. Input is a person's
+        // when it is typed words in a main conversation; in a subagent's
+        // file (`isSidechain`) the input is the parent agent's prompt.
+        let sidechain = o.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+        e.wrote = match t {
+            "assistant" if e.model.is_some() => crate::Wrote::Soul,
+            "user" if !sidechain
+                && crate::memory_extract::persons_own(&crate::memory_extract::authored(&e)) =>
+            {
+                crate::Wrote::Person
+            }
+            _ => crate::Wrote::Nobody,
+        };
+        events.push(e);
     }
     Ok(events)
 }
@@ -263,5 +278,16 @@ mod tests {
         let got: Vec<Option<&str>> = e.iter().map(|e| e.model.as_deref()).collect();
         assert_eq!(got, vec![None, Some("claude-opus-5-5"), None]);
         assert!(e.iter().all(|e| e.model_setting.is_none()));
+        assert_eq!(
+            e.iter().map(|e| e.wrote).collect::<Vec<_>>(),
+            [crate::Wrote::Person, crate::Wrote::Soul, crate::Wrote::Nobody],
+            "typed words, a model's reply, a reply the harness made itself"
+        );
+        let sub = parse_transcript(
+            r#"{"type":"user","isSidechain":true,"uuid":"s1","timestamp":"2026-10-14T12:00:00Z","message":{"role":"user","content":"find the bug"}}
+{"type":"user","uuid":"n1","timestamp":"2026-10-14T12:00:00Z","message":{"role":"user","content":"<task-notification>done</task-notification>"}}"#,
+        )
+        .unwrap();
+        assert!(sub.iter().all(|e| e.wrote == crate::Wrote::Nobody), "a subagent's prompt and a harness notice are no person's words");
     }
 }

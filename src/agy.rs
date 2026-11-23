@@ -284,8 +284,19 @@ pub fn parse_after(jsonl: &str, conversation_id: &str, after: Option<&Carry>) ->
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            model: None,
+            // Newer clients name the model on each reply (`gemini-4-neon-medium`,
+            // seen from 2026-11-19); older replies name none.
+            model: o
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
             model_setting: setting.clone(),
+            wrote: match step_type {
+                "PLANNER_RESPONSE" => crate::Wrote::Soul,
+                "USER_INPUT" => crate::Wrote::Person,
+                _ => crate::Wrote::Nobody,
+            },
             actions,
             outcomes,
         });

@@ -30,6 +30,30 @@ pub const RECENT_GRAPH: &str = "recent";
 /// What the memory graph was called before; cleared wherever it is found.
 pub const OLD_MEMORY_GRAPH: &str = "memory-v1";
 
+/// The username of the person this machine belongs to, from the last part of
+/// `owner` in `~/.lex/identity/owner.json` (git-lex writes it). None when the
+/// file is missing or does not end in a username.
+pub fn machine_owner() -> Option<String> {
+    if cfg!(test) {
+        return None; // a test never depends on whose machine runs it
+    }
+    let home = std::env::var_os("HOME")?;
+    let file = Path::new(&home).join(".lex").join("identity").join("owner.json");
+    owner_username(&std::fs::read_to_string(file).ok()?)
+}
+
+fn owner_username(owner_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(owner_json).ok()?;
+    let name = v.get("owner")?.as_str()?.rsplit('/').next()?;
+    plain_username(name).then(|| name.to_string())
+}
+
+/// A username as `ravel:author` needs it: lowercase letters and digits, no
+/// dash, so the first `-on-` in an author always ends the username.
+pub fn plain_username(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Names {
     root: String,
@@ -176,6 +200,14 @@ mod tests {
         );
         // Vocabulary and data never share a prefix.
         assert!(!n.base().starts_with(crate::RAVEL_NS));
+    }
+
+    #[test]
+    fn the_machine_owner_is_the_last_part_of_the_owner_address() {
+        let j = r#"{"owner":"https://repolex.ai/7r1pl3f0rc3/goodlux/soul/Soul/goodlux","since":1}"#;
+        assert_eq!(owner_username(j).as_deref(), Some("goodlux"));
+        assert_eq!(owner_username(r#"{"owner":"https://x/Soul/Not-Plain"}"#), None);
+        assert_eq!(owner_username("{}"), None);
     }
 
     #[test]

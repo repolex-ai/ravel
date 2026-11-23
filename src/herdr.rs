@@ -10,7 +10,8 @@
 //!
 //! alone on the first line, the body unchanged after it. Everything on it is
 //! what the sender SAYS about itself: typed text, signed by nothing. ravel
-//! records it as claimed and never as who the turn is from.
+//! records it as claimed. Its `user` also becomes the turn's `ravel:author`
+//! (goodlux, 2026-11-22), which is itself a self-reported name and no proof.
 //!
 //! Read only at the very start of a turn that arrived as input, so a line
 //! quoted further down, or inside a reply, is never taken for a sender.
@@ -47,18 +48,53 @@ fn is_slug(s: &str) -> bool {
 /// a herdr message of any length arrives inside it.
 const PASTE_OPEN: &str = "<pasted_content id=\"";
 
+/// Antigravity wraps the words of an input in this tag.
+const REQUEST_OPEN: &str = "<USER_REQUEST>";
+
+/// The first line of an input's own words, past the wrappers a harness puts
+/// before them: blank lines, Claude Code's paste line, Antigravity's request tag.
+fn first_line(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    let text = text.strip_prefix(REQUEST_OPEN).unwrap_or(text).trim_start();
+    let mut lines = text.lines();
+    let first = lines.next()?;
+    if first.starts_with(PASTE_OPEN) && first.ends_with("\">") {
+        return lines.next();
+    }
+    Some(first)
+}
+
+/// True when an input opens the way squad messages did before the sender
+/// line existed, and as some still do: `[kira] ...` or `[th34 -> spacegoat] ...`.
+/// Such a turn was typed into the pane by herdr for a peer, so it is not the
+/// person's; the bracket holds a herdr name, not a username, so it names no
+/// author either.
+pub fn unsigned_peer_line(text: &str) -> bool {
+    fn name(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 40
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+    let Some(inner) = first_line(text)
+        .and_then(|l| l.strip_prefix('['))
+        .and_then(|l| l.split_once(']'))
+        .map(|(inner, _)| inner)
+    else {
+        return false;
+    };
+    match inner.split_once(" -> ") {
+        Some((from, to)) => name(from) && name(to),
+        None => name(inner),
+    }
+}
+
 /// The sender line of `text`, when its first line is one this version reads.
 ///
 /// `None` for a turn with no such line, a version other than 1, or a line
 /// that is not exactly `--herdr <key=value> ...--`. Unknown keys, and the
 /// reserved `id`, `re` and `sig`, are skipped.
 pub fn sender_claim(text: &str) -> Option<SenderClaim> {
-    // The harness stores a wrapped input with blank lines before the wrapper.
-    let mut lines = text.trim_start().lines();
-    let mut first = lines.next()?;
-    if first.starts_with(PASTE_OPEN) && first.ends_with("\">") {
-        first = lines.next()?;
-    }
+    let first = first_line(text)?;
     let inner = first.strip_prefix("--herdr ")?.strip_suffix("--")?;
     let mut keys = inner.split(' ').filter(|k| !k.is_empty());
     if keys.next()? != "v=1" {
@@ -168,5 +204,22 @@ mod tests {
                 user: None,
             }
         );
+    }
+
+    #[test]
+    fn a_bracketed_peer_opening_is_seen_through_each_harness_wrapper() {
+        for t in [
+            "[kira] GREEN LIGHT",
+            "[th34 -> spacegoat] Window now",
+            "<USER_REQUEST>\n[forx] Hey LSPy\n</USER_REQUEST>",
+            "\n<pasted_content id=\"5463\">\n[w4r3z-lex] Skill keys renamed",
+        ] {
+            assert!(unsigned_peer_line(t), "{t}");
+        }
+        for t in ["fix it please", "[Request interrupted by user]", "[] x", "see [kira] later"] {
+            assert!(!unsigned_peer_line(t), "{t}");
+        }
+        let c = sender_claim("<USER_REQUEST>\n--herdr v=1 from=th34 user=4m41th34--\nhi").unwrap();
+        assert_eq!(c.user.as_deref(), Some("4m41th34"));
     }
 }

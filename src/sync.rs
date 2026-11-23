@@ -1230,8 +1230,9 @@ pub fn import_claude_ai(repo: &Path, src: &Path) -> Result<ImportOutcome> {
 /// unchanged file is never read twice. 2: `ravel:model`, `ravel:modelSetting`.
 /// 3: superseded dated copies leave the store. 4: subagent files drop the
 /// turns they copy from their parent session. 5: one owner per turn across
-/// all of a soul's transcripts (resumed sessions too).
-const TURN_PROJECTION: &str = "5";
+/// all of a soul's transcripts (resumed sessions too). 6: `ravel:author`
+/// replaces `ravel:model`.
+const TURN_PROJECTION: &str = "6";
 /// The manifest line that records [`TURN_PROJECTION`]. `#` cannot begin a
 /// transcript file name, a conversation id or an export key.
 const PROJECTION_KEY: &str = "#turn-projection";

@@ -913,12 +913,14 @@ WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
     lists them.
 
 THREE QUERIES THAT WORK AS WRITTEN
-  Which models answered this soul, and how often:
+  Who wrote this soul's turns, and how often:
     PREFIX ravel: <https://repolex.ai/ontology/ravel/>
-    SELECT ?model (COUNT(?t) AS ?turns)
-    WHERE { ?t a ravel:Turn ; ravel:model ?model }
-    GROUP BY ?model ORDER BY DESC(?turns)
-  (Antigravity turns carry ravel:modelSetting instead of ravel:model.)
+    SELECT ?author (COUNT(?t) AS ?turns)
+    WHERE { ?t a ravel:Turn ; ravel:author ?author }
+    GROUP BY ?author ORDER BY DESC(?turns)
+  (An author is "username-on-model" when the record names the model, else
+  the bare username; a person is always bare. One soul on every model:
+  FILTER(?author = "s3lk13" || STRSTARTS(?author, "s3lk13-on-")).)
 
   One day's turns, in order:
     PREFIX ravel: <https://repolex.ai/ontology/ravel/>
