@@ -668,6 +668,10 @@ fn agy_conversations_in(root: &Path, repo: &Path) -> Result<(Vec<AgyConversation
         }
     }
 
+    // A conversation `history.jsonl` does not name is still placed when
+    // another conversation started it: it goes wherever the one that began
+    // the chain went.
+    let typed_here = taken.clone();
     let mut unattributed: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&brain).with_context(|| format!("read {}", brain.display()))? {
         let path = entry?.path();
@@ -677,13 +681,88 @@ fn agy_conversations_in(root: &Path, repo: &Path) -> Result<(Vec<AgyConversation
         let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !placed.contains(id) && agy_transcript_for(&brain, id).is_some() {
-            unattributed.push(id.to_string());
+        if placed.contains(id) {
+            continue;
+        }
+        let Some(c) = agy_transcript_for(&brain, id) else {
+            continue;
+        };
+        match agy_first_starter(&brain, &c, &placed) {
+            Some(first) if typed_here.contains(&first) => {
+                if taken.insert(id.to_string()) {
+                    mine.push(c);
+                }
+            }
+            Some(_) => {} // started from a conversation some other folder holds
+            None => unattributed.push(id.to_string()),
         }
     }
     mine.sort_by(|a, b| a.id.cmp(&b.id));
     unattributed.sort();
     Ok((mine, unattributed))
+}
+
+/// The id of the conversation that started this one, for a conversation an
+/// agent started (Antigravity's `invoke_subagent`). Such a conversation has
+/// no line typed by a person; its first line is a `SYSTEM_MESSAGE` whose
+/// content carries `[Message] timestamp=… sender=<conversation id> …`.
+/// None for a conversation a person started, and for a first line that is
+/// not yet whole.
+pub fn agy_started_by(source: &Path) -> Option<String> {
+    use std::io::BufRead;
+    static KNOWN: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, Option<String>>>> =
+        std::sync::Mutex::new(None);
+    if let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(v) = k.get(source) {
+            return v.clone();
+        }
+    }
+    let mut line = String::new();
+    std::io::BufReader::new(std::fs::File::open(source).ok()?)
+        .read_line(&mut line)
+        .ok()?;
+    if !line.ends_with('\n') {
+        return None; // still being written; ask again next time
+    }
+    let found = starter_in_first_line(&line);
+    // A conversation's first line never changes, so it is read once.
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(source.to_path_buf(), found.clone());
+    found
+}
+
+fn starter_in_first_line(line: &str) -> Option<String> {
+    let o: serde_json::Value = serde_json::from_str(line).ok()?;
+    if o.get("type")?.as_str()? != "SYSTEM_MESSAGE" {
+        return None;
+    }
+    let content = o.get("content")?.as_str()?;
+    let message = content
+        .lines()
+        .find_map(|l| l.strip_prefix("[Message] timestamp="))?;
+    let id = message.split(' ').find_map(|w| w.strip_prefix("sender="))?;
+    let plain = id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    plain.then(|| id.to_string())
+}
+
+/// Follow [`agy_started_by`] back to a conversation `history.jsonl` names.
+/// None when the chain ends anywhere else.
+fn agy_first_starter(
+    brain: &Path,
+    c: &AgyConversation,
+    placed: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let mut at = agy_started_by(&c.source)?;
+    for _ in 0..32 {
+        if placed.contains(&at) {
+            return Some(at);
+        }
+        at = agy_started_by(&agy_transcript_for(brain, &at)?.source)?;
+    }
+    None
 }
 
 /// Hex sha256 of a file's bytes — the agy shelf's change detector.
@@ -735,7 +814,7 @@ pub fn sync_agy(repo: &Path) -> Result<AgyStats> {
     if unattributed_changed(&st.unattributed) && !st.unattributed.is_empty() {
         eprintln!(
             "[raveld] {} agy conversation(s) on disk are attributed to NO workspace and are therefore NOT backed up: {}\n\
-             [raveld]   history.jsonl does not name them (it predates them, or they logged no prompt through it).\n\
+             [raveld]   history.jsonl does not name them, and no conversation it names started them.\n\
              [raveld]   check the owner by hand: sqlite3 \"file:$HOME/.gemini/antigravity-cli/conversation_summaries.db?mode=ro\" \\\n\
              [raveld]     \"SELECT conversation_id, workspace_uris FROM conversation_summaries;\"",
             st.unattributed.len(),
@@ -2373,6 +2452,79 @@ mod tests {
 
         assert!(agy_transcript_for(&brain, "neither").is_none());
         fs::remove_dir_all(&brain).ok();
+    }
+
+    /// A conversation an agent started names no folder of its own. It goes
+    /// to the soul whose conversation began the chain, through any number of
+    /// agents in between; one whose chain ends nowhere is still reported.
+    #[test]
+    fn agy_conversations_an_agent_started_go_where_their_starter_went() {
+        let base = std::env::temp_dir().join("ravel-agy-test-started");
+        fs::remove_dir_all(&base).ok();
+        let root = base.join("store");
+        let soul = base.join("kira");
+        let other = base.join("tr1pl3x");
+        for d in [&soul, &other] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let id = |n: u8| format!("{n:08x}-0000-4000-8000-000000000000");
+        let (typed, child, grandchild, theirs, their_child, orphan, lost) =
+            (id(1), id(2), id(3), id(4), id(5), id(6), id(7));
+        let started = |by: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"step_index": 0, "source": "SYSTEM", "type": "SYSTEM_MESSAGE",
+                    "content": format!("The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T05:04:01Z sender={by} priority=MESSAGE_PRIORITY_HIGH content=paint sender=nobody")})
+            )
+        };
+        let person = "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"hi sender=x\"}\n".to_string();
+        for (c, first) in [
+            (&typed, person.clone()),
+            (&child, started(&typed)),
+            (&grandchild, started(&child)),
+            (&theirs, person.clone()),
+            (&their_child, started(&theirs)),
+            (&orphan, person.clone()),
+            (&lost, started(&id(99))),
+        ] {
+            let logs = root.join("brain").join(c).join(".system_generated/logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("transcript_full.jsonl"), first).unwrap();
+        }
+        let row = |ws: &Path, c: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"workspace": ws.to_string_lossy(), "conversationId": c})
+            )
+        };
+        fs::write(
+            root.join("history.jsonl"),
+            [row(&soul, &typed), row(&other, &theirs)].concat(),
+        )
+        .unwrap();
+
+        let (mine, unattributed) = agy_conversations_in(&root, &soul).unwrap();
+        let mut got: Vec<_> = mine.iter().map(|c| c.id.clone()).collect();
+        got.sort();
+        assert_eq!(got, vec![typed.clone(), child.clone(), grandchild.clone()]);
+        assert_eq!(unattributed, vec![orphan.clone(), lost.clone()]);
+
+        let (mine, unattributed) = agy_conversations_in(&root, &other).unwrap();
+        let mut got: Vec<_> = mine.iter().map(|c| c.id.clone()).collect();
+        got.sort();
+        assert_eq!(got, vec![theirs, their_child]);
+        assert_eq!(unattributed, vec![orphan, lost], "the same list for every soul");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// Reads the real Antigravity folder; writes nothing.
+    /// `RAVEL_TRIAL_REPO=/path/to/soul cargo test --release real_agy_owners -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_agy_owners() {
+        let repo = PathBuf::from(std::env::var("RAVEL_TRIAL_REPO").expect("RAVEL_TRIAL_REPO"));
+        let (mine, unattributed) = agy_conversations_for(&repo).unwrap();
+        println!("{}: {} conversation(s); {} on disk belong to no soul", repo.display(), mine.len(), unattributed.len());
     }
 
     /// `history.jsonl` is the agy analogue of the claude path slug: rows carry
