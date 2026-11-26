@@ -6,6 +6,12 @@
 //!   raveld start    the same as restart, kept because fingers remember it
 //!   raveld stop     kill EVERY raveld on this machine and exit
 //!   raveld status   say whether one is running, and what it has been doing
+//!   raveld reword-api <soul folder> [workers] [limit]
+//!                   one-off: rewrite that soul's merges left in an older
+//!                   wording, through the Anthropic API on the key in the
+//!                   keychain, `workers` calls at once (default 8). Billed per
+//!                   call; refuses unless `memory.reword` is off, so the
+//!                   daemon is not rewording the same memory at the same time.
 //!
 //! No flags. Everything else is in `~/.config/ravel/config.yml` (port,
 //! interval, souls). A missing file means no souls, and status says so.
@@ -49,6 +55,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         ["status"] => status(),
+        ["reword-api", path, rest @ ..] => reword_api(path, rest),
         ["--version"] | ["-V"] => {
             println!("raveld {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -233,4 +240,56 @@ fn status() -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// `raveld reword-api`: see the header.
+fn reword_api(path: &str, rest: &[&str]) -> Result<()> {
+    use ravel::{daemon::memory::soul_name, memory_log::MemoryLog, memory_relive, writer};
+    let workers: usize = rest.first().map(|s| s.parse()).transpose()?.unwrap_or(8);
+    let limit: usize = rest.get(1).map(|s| s.parse()).transpose()?.unwrap_or(usize::MAX);
+    let cfg = DaemonConfig::load()?;
+    let m = cfg
+        .memory
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no memory writer in the config"))?;
+    anyhow::ensure!(
+        m.reword == daemon::config::Reword::Off,
+        "memory.reword is on in {}: set it to off and `raveld restart` first, \
+         so raveld is not rewording this memory at the same time",
+        daemon::config::config_path().display()
+    );
+    let repo = std::fs::canonicalize(path)?;
+    let name = soul_name(&repo);
+    let log = MemoryLog::for_soul(&repo);
+    let llm = writer::AnthropicApi::from_keychain(&m.model)?;
+    let left = memory_relive::to_reword(&log)?.len();
+    println!("{name}: {left} merges in an older wording; {workers} at once, model {}", m.model);
+    let t0 = std::time::Instant::now();
+    let r = memory_relive::reword_parallel(
+        &llm,
+        &repo,
+        &name,
+        &log,
+        workers,
+        limit,
+        &Default::default(),
+        &|r, of| {
+            println!(
+                "  {} of {of} rewritten, {} tokens in, {} out, {:.0}s",
+                r.merges,
+                r.input_tokens,
+                r.output_tokens,
+                t0.elapsed().as_secs_f64()
+            )
+        },
+    )?;
+    println!(
+        "{name}: rewrote {} merges, {} left; {} tokens in, {} out{}",
+        r.merges,
+        left - r.merges,
+        r.input_tokens,
+        r.output_tokens,
+        r.stopped.map(|s| format!("; stopped: {s}")).unwrap_or_default()
+    );
+    Ok(())
 }

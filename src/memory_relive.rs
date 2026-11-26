@@ -690,6 +690,124 @@ pub fn reword(
     rebuild_blocks(llm, repo, soul, log, &todo, max_calls, stop)
 }
 
+/// [`reword`], with the merges of one size written side by side by up to
+/// `workers` calls at once. Merges of one size never read each other: each
+/// reads only its two halves, one size down, already rewritten. So a level is
+/// asked in parallel, then kept in order, and the next level starts only when
+/// it is whole. For a one-shot writer that may be called from several threads
+/// at once ([`crate::writer::AnthropicApi`]); a session writer would mix its
+/// sessions. At most `limit` merges. A failure stops the run after the level
+/// it happened in, keeping that level's good lines.
+pub fn reword_parallel(
+    llm: &dyn Llm,
+    repo: &Path,
+    soul: &str,
+    log: &MemoryLog,
+    workers: usize,
+    limit: usize,
+    stop: &std::sync::atomic::AtomicBool,
+    progress: &dyn Fn(&ReliveReport, usize),
+) -> Result<ReliveReport> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let todo: Vec<memory::Block> = to_reword(log)?.into_iter().take(limit).collect();
+    let sys = soul_system(repo, soul);
+    let memories = log.memories()?;
+    let mut sums = log.summaries()?;
+    let mut r = ReliveReport::default();
+    let mut i = 0;
+    while i < todo.len() {
+        if stop.load(Ordering::Relaxed) {
+            r.yielded = true;
+            break;
+        }
+        let size = todo[i].1 - todo[i].0;
+        let j = i + todo[i..].iter().take_while(|b| b.1 - b.0 == size).count();
+        let level = &todo[i..j];
+        let prompts = level
+            .iter()
+            .enumerate()
+            .map(|(k, &b)| memory_log::nap_prompt(&memories, &sums, b, todo.len() - 1 - (i + k)))
+            .collect::<Result<Vec<_>>>()?;
+        let next = AtomicUsize::new(0);
+        let got = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..workers.max(1).min(level.len()) {
+                s.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= level.len() || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let out = one_merge_line(llm, &sys, &prompts[k], log, soul);
+                    got.lock().unwrap().push((k, out));
+                });
+            }
+        });
+        let mut got = got.into_inner().unwrap();
+        got.sort_by_key(|(k, _)| *k);
+        for (k, out) in got {
+            let b = level[k];
+            match out {
+                Ok((Some(text), rr)) => {
+                    r.input_tokens += rr.input_tokens;
+                    r.output_tokens += rr.output_tokens;
+                    r.reasked += rr.reasked;
+                    let sm = Summary {
+                        block: memory::block_id(b),
+                        text,
+                        model: llm.model().to_string(),
+                        written: chrono::Utc::now().to_rfc3339(),
+                        wording: Some(memory_log::WORDING.to_string()),
+                    };
+                    log.append_summary(&sm)?;
+                    sums.insert(sm.block.clone(), sm);
+                    r.merges += 1;
+                }
+                Ok((None, rr)) => {
+                    r.input_tokens += rr.input_tokens;
+                    r.output_tokens += rr.output_tokens;
+                    r.stopped.get_or_insert(format!(
+                        "merge #{}: no line passing the checks after {ASKS} asks",
+                        memory::block_id(b)
+                    ));
+                }
+                Err(e) => {
+                    r.stopped.get_or_insert(format!("merge #{}: {e:#}", memory::block_id(b)));
+                }
+            }
+        }
+        progress(&r, todo.len());
+        if r.stopped.is_some() {
+            break;
+        }
+        // A level cut short by `stop` is not whole: the next one would read
+        // halves still in the old wording.
+        if r.merges < j {
+            r.yielded = true;
+            break;
+        }
+        i = j;
+    }
+    Ok(r)
+}
+
+/// One merge's line, asked and checked, not yet kept.
+fn one_merge_line(
+    llm: &dyn Llm,
+    sys: &str,
+    prompt: &str,
+    log: &MemoryLog,
+    soul: &str,
+) -> Result<(Option<String>, ReliveReport)> {
+    let mut rr = ReliveReport::default();
+    let (v, i, o) = call_or_fresh(llm, sys, prompt, &|| prompt.to_string(), &summary_schema())?;
+    log.append_usage(soul, i, o)?;
+    rr.input_tokens += i;
+    rr.output_tokens += o;
+    let first = v["text"].as_str().unwrap_or("").to_string();
+    let line = ask_line(llm, sys, first, Some(prompt), log, &mut rr, soul)?;
+    Ok((line, rr))
+}
+
 /// Build every merge due over `log`'s notes, cold, from nothing but the notes:
 /// a side-by-side test of the merge wording. `extra`, when given, is appended
 /// to the merge prompt, so the only difference between two rebuilds of the

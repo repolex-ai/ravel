@@ -388,3 +388,90 @@ mod tests {
         }
     }
 }
+
+/// Claude through the Anthropic API, billed per call against the account's
+/// API credits. **Not a memory writer**: the writer contract above forbids an
+/// API key, and the daemon never opens one. It exists for one job, run by
+/// hand: `raveld reword-api`, moving an old memory to the current merge
+/// wording all at once instead of a few merges a pass (goodlux, 2026-11-25:
+/// the rewording backlog on the Max plan's API credits, the ongoing writing
+/// stays on the subscription).
+///
+/// The key is read from the macOS keychain (`security`, account `ravel`,
+/// service [`AnthropicApi::KEYCHAIN_SERVICE`]) when the writer opens, held in
+/// memory only, and never put in the environment, so no child can inherit it.
+/// One-shot: no session, so every call carries only its own prompt.
+pub struct AnthropicApi {
+    model: String,
+    key: String,
+    http: reqwest::blocking::Client,
+}
+
+impl AnthropicApi {
+    pub const KEYCHAIN_SERVICE: &'static str = "ravel-anthropic-api-key";
+
+    pub fn from_keychain(model: &str) -> Result<Self> {
+        let out = std::process::Command::new("security")
+            .args(["find-generic-password", "-a", "ravel", "-s", Self::KEYCHAIN_SERVICE, "-w"])
+            .output()
+            .context("running `security` to read the API key")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "no API key in the keychain under account `ravel`, service `{}`",
+            Self::KEYCHAIN_SERVICE
+        );
+        let key: String = String::from_utf8(out.stdout)?.split_whitespace().collect();
+        anyhow::ensure!(!key.is_empty(), "the keychain entry `{}` is empty", Self::KEYCHAIN_SERVICE);
+        Ok(AnthropicApi {
+            model: model.to_string(),
+            key,
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?,
+        })
+    }
+}
+
+impl Llm for AnthropicApi {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn json(&self, system: &str, user: &str, schema: &Value) -> Result<(Value, u64, u64)> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            // Thinking on (adaptive, Haiku 5.5's default). Tried off at
+            // effort low, 2026-11-25: one-shot and unable to think, Haiku sent
+            // the same 309-byte line back to all twelve "too long" asks.
+            "output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": schema}},
+        });
+        let res = self
+            .http
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .context("calling the Anthropic API")?;
+        let status = res.status();
+        let v: Value = res.json().context("reading the Anthropic API's answer")?;
+        anyhow::ensure!(status.is_success(), "Anthropic API {status}: {}", v["error"]["message"]);
+        if v["stop_reason"] == "refusal" {
+            anyhow::bail!("the model can't help with this (API refusal: {})", v["stop_details"]);
+        }
+        let text = v["content"]
+            .as_array()
+            .and_then(|c| c.iter().find(|b| b["type"] == "text"))
+            .and_then(|b| b["text"].as_str())
+            .ok_or_else(|| anyhow!("Anthropic API answer has no text: stop_reason {}", v["stop_reason"]))?;
+        let u = &v["usage"];
+        let input = u["input_tokens"].as_u64().unwrap_or(0)
+            + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
+            + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let parsed: Value = serde_json::from_str(text).context("the API's answer is not JSON")?;
+        Ok((parsed, input, u["output_tokens"].as_u64().unwrap_or(0)))
+    }
+}
