@@ -17,7 +17,7 @@ ravel {version}: keeps every conversation a soul has, in every harness, as a
 graph. Talks to raveld, the background daemon, and starts it if it is not
 running.
 
-`ravel query <name>` runs a stored query: a Query document saved in your
+`ravel query '<id>'` runs a stored query: a Query document saved in your
 soul or delivered by a kit. `ravel sparql \"<text>\"` runs SPARQL you type.
 
 USAGE:
@@ -75,15 +75,16 @@ USAGE:
       real turns, the graph matching the record. Exit 1 on any failure.
       Maintenance, not reading.
 
-  ravel query [<soul>] <name> [name=value ...] [--json]
+  ravel query [<soul>] '<id>' [name=value ...] [--json]
       Run a stored query: a Query document in your soul's Soul/Query/ or
-      delivered by a kit, fetched from gitlexd with its parameters filled
-      in. Only queries whose service is ravel run here; for any other
+      delivered by a kit, named by its id exactly as stored, angle brackets
+      included and quoted for the shell: '<soul/Query/turns-on-day>'.
+      Fetched from gitlexd with its parameters filled in. Only queries whose service is ravel run here; for any other
       service ravel names the syrinx command to use. One row per line;
       --json prints W3C SPARQL JSON results.
 
   ravel query [<soul>]
-      The stored queries your soul has: name, service and title.
+      The stored queries your soul has: id, service and title.
 
   ravel sparql [<soul>] \"<sparql>\" [--json]
       Ask the transcript graph anything, in SPARQL you type. One row per
@@ -149,7 +150,7 @@ fn main() -> Result<()> {
     }
     match a.as_slice() {
         ["sparql"] => {
-            println!("ravel sparql [<soul>] \"<sparql>\" [--json]: ask the transcript graph anything, in SPARQL you type.\n`ravel sparql help` shows what can be queried, where it is stored, and three queries that work as written.\nA query saved in your soul runs with `ravel query <name>`.");
+            println!("ravel sparql [<soul>] \"<sparql>\" [--json]: ask the transcript graph anything, in SPARQL you type.\n`ravel sparql help` shows what can be queried, where it is stored, and three queries that work as written.\nA query saved in your soul runs with `ravel query '<id>'`.");
             return Ok(());
         }
         ["sparql", "help"] | ["query", "help"] => {
@@ -158,7 +159,7 @@ fn main() -> Result<()> {
         }
         // A script that passed text to `query` is told the fix in one line.
         ["query", rest @ ..] if rest.iter().any(|x| is_sparql_text(x)) => {
-            eprintln!("That is SPARQL text. `ravel query` runs a stored query by name; run text with `ravel sparql`.");
+            eprintln!("That is SPARQL text. `ravel query` runs a stored query by its id; run text with `ravel sparql`.");
             std::process::exit(2);
         }
         _ => {}
@@ -200,7 +201,7 @@ fn main() -> Result<()> {
         ["sparql", q] => query(&client, &resolve(&client, None)?, q, json),
         ["sparql", s, q] => query(&client, &resolve(&client, Some(s))?, q, json),
         ["query", rest @ ..] => {
-            // A first word that names a soul is the soul, when a query name
+            // A first word that names a soul is the soul, when a query id
             // follows it or nothing does; otherwise it is the query's name.
             let (soul, rest) = match rest {
                 [s, more @ ..]
@@ -215,7 +216,7 @@ fn main() -> Result<()> {
             let id = resolve(&client, soul)?;
             match rest {
                 [] => stored_list(&client, &id),
-                [name, params @ ..] => stored_query(&client, &id, name, params, json),
+                [qid, params @ ..] => stored_query(&client, &id, qid, params, json),
             }
         }
         _ => usage(),
@@ -794,10 +795,10 @@ fn is_sparql_text(s: &str) -> bool {
     s.contains(char::is_whitespace) || s.contains('{') || s.trim_start().starts_with('?')
 }
 
-/// `ravel query <name> [k=v ...]`: fetch the stored query from the caller's
+/// `ravel query '<id>' [k=v ...]`: fetch the stored query from the caller's
 /// soul through gitlexd, parameters bound there, never pasted here; run it
 /// only when its service is ravel.
-fn stored_query(client: &Client, id: &str, name: &str, params: &[&str], json: bool) -> Result<()> {
+fn stored_query(client: &Client, id: &str, qid: &str, params: &[&str], json: bool) -> Result<()> {
     let mut p = serde_json::Map::new();
     for kv in params {
         let (k, v) = kv.split_once('=').ok_or_else(|| {
@@ -811,25 +812,26 @@ fn stored_query(client: &Client, id: &str, name: &str, params: &[&str], json: bo
     let q = client
         .gitlexd()
         .post(
-            // `kit/name` names a kit's query; its slash is part of the name,
-            // not the path, so it travels as %2F.
-            &format!("/git-lex/{id}/query/{}", name.replace('%', "%25").replace('/', "%2F")),
-            Some(serde_json::json!({ "params": p })),
+            // The id goes in the body: `<` cannot go in an address. A bare
+            // name is refused by gitlexd, with the quoted form to copy.
+            &format!("/git-lex/{id}/query"),
+            Some(serde_json::json!({ "id": qid, "params": p })),
         )
-        .with_context(|| format!("gitlexd could not give stored query {name:?}"))?;
+        .with_context(|| format!("gitlexd could not give stored query {qid}"))?;
+    let qid = q["id"].as_str().unwrap_or(qid);
     let service = q["service"].as_str().unwrap_or("");
     if service != "ravel" {
         let service = if service.is_empty() { "(no service)" } else { service };
-        eprintln!("This query runs against {service}. Ravel runs only ravel queries.\nRun it with: syrinx query {name}");
+        eprintln!("This query runs against {service}. Ravel runs only ravel queries.\nRun it with: syrinx query '{qid}'");
         std::process::exit(2);
     }
     let sparql = q["sparql"]
         .as_str()
-        .ok_or_else(|| anyhow!("gitlexd answered for {name:?} with no SPARQL text"))?;
+        .ok_or_else(|| anyhow!("gitlexd answered for {qid} with no SPARQL text"))?;
     query(client, id, sparql, json)
 }
 
-/// `ravel query` with no name: the stored queries the caller's soul has.
+/// `ravel query` with no id: the stored queries the caller's soul has.
 fn stored_list(client: &Client, id: &str) -> Result<()> {
     let v = client
         .gitlexd()
@@ -842,14 +844,14 @@ fn stored_list(client: &Client, id: &str) -> Result<()> {
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         println!(
-            "  {:<28} {:<10} {}{}",
-            q["name"].as_str().unwrap_or("?"),
+            "  {:<36} {:<10} {}{}",
+            q["id"].as_str().unwrap_or("?"),
             q["service"].as_str().unwrap_or("(none)"),
             q["title"].as_str().unwrap_or(""),
             if params.is_empty() { String::new() } else { format!("  [{}]", params.join(", ")) }
         );
     }
-    println!("[{} stored quer{}] run one with: ravel query <name> [name=value ...]", list.len(), if list.len() == 1 { "y" } else { "ies" });
+    println!("[{} stored quer{}] run one with: ravel query '<id>' [name=value ...]", list.len(), if list.len() == 1 { "y" } else { "ies" });
     Ok(())
 }
 
@@ -1073,7 +1075,7 @@ mod tests {
         ] {
             assert!(super::is_sparql_text(text), "{text:?} is text");
         }
-        for name in ["recent", "kit/recent", "turns-by-day", "select", "since=2026-11-01"] {
+        for name in ["<soul/Query/recent>", "<copia/Query/being-description>", "recent", "since=2026-11-01"] {
             assert!(!super::is_sparql_text(name), "{name:?} is a name or a parameter");
         }
     }
