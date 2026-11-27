@@ -811,7 +811,9 @@ fn stored_query(client: &Client, id: &str, name: &str, params: &[&str], json: bo
     let q = client
         .gitlexd()
         .post(
-            &format!("/git-lex/{id}/query/{name}"),
+            // `kit/name` names a kit's query; its slash is part of the name,
+            // not the path, so it travels as %2F.
+            &format!("/git-lex/{id}/query/{}", name.replace('%', "%25").replace('/', "%2F")),
             Some(serde_json::json!({ "params": p })),
         )
         .with_context(|| format!("gitlexd could not give stored query {name:?}"))?;
@@ -835,11 +837,16 @@ fn stored_list(client: &Client, id: &str) -> Result<()> {
         .context("gitlexd could not list the stored queries")?;
     let list = v["queries"].as_array().or_else(|| v.as_array()).cloned().unwrap_or_default();
     for q in &list {
+        let params: Vec<&str> = q["parameters"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
         println!(
-            "  {:<28} {:<8} {}",
+            "  {:<28} {:<10} {}{}",
             q["name"].as_str().unwrap_or("?"),
             q["service"].as_str().unwrap_or("(none)"),
-            q["title"].as_str().unwrap_or("")
+            q["title"].as_str().unwrap_or(""),
+            if params.is_empty() { String::new() } else { format!("  [{}]", params.join(", ")) }
         );
     }
     println!("[{} stored quer{}] run one with: ravel query <name> [name=value ...]", list.len(), if list.len() == 1 { "y" } else { "ies" });
