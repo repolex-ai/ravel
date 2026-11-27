@@ -8,6 +8,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// gitlexd, git-lex's daemon. The address git-lex and Pan use too.
+pub const GITLEXD: &str = "http://127.0.0.1:7880";
+
 pub struct Client {
     base: String,
     http: reqwest::blocking::Client,
@@ -74,6 +77,18 @@ impl Client {
                 "{}",
                 v["error"].as_str().unwrap_or(status.as_str())
             ))
+        }
+    }
+
+    /// The same caller, speaking to gitlexd instead of raveld: stored
+    /// queries live in git-lex repositories, and every tool fetches them
+    /// from gitlexd with its parameters already filled in (stored-query
+    /// spec, goodlux 2026-11-27). The same token says who is asking.
+    pub fn gitlexd(&self) -> Self {
+        Self {
+            base: GITLEXD.to_string(),
+            http: self.http.clone(),
+            token: self.token.clone(),
         }
     }
 

@@ -17,6 +17,9 @@ ravel {version}: keeps every conversation a soul has, in every harness, as a
 graph. Talks to raveld, the background daemon, and starts it if it is not
 running.
 
+`ravel query <name>` runs a stored query: a Query document saved in your
+soul or delivered by a kit. `ravel sparql \"<text>\"` runs SPARQL you type.
+
 USAGE:
 
   ravel
@@ -72,10 +75,21 @@ USAGE:
       real turns, the graph matching the record. Exit 1 on any failure.
       Maintenance, not reading.
 
-  ravel query [<soul>] \"<sparql>\"
-      Ask the transcript graph anything, in SPARQL. One row per line.
+  ravel query [<soul>] <name> [name=value ...] [--json]
+      Run a stored query: a Query document in your soul's Soul/Query/ or
+      delivered by a kit, fetched from gitlexd with its parameters filled
+      in. Only queries whose service is ravel run here; for any other
+      service ravel names the syrinx command to use. One row per line;
+      --json prints W3C SPARQL JSON results.
 
-  ravel query help
+  ravel query [<soul>]
+      The stored queries your soul has: name, service and title.
+
+  ravel sparql [<soul>] \"<sparql>\" [--json]
+      Ask the transcript graph anything, in SPARQL you type. One row per
+      line; --json prints W3C SPARQL JSON results.
+
+  ravel sparql help
       What can be queried and where it is stored: every class and property,
       the graph layout a query must name, and three queries that work as
       written. About 4,000 characters. Read it before a first query.
@@ -104,7 +118,14 @@ fn usage() -> ! {
 const OPTMEM_IS: &str = "optmem: ravel's adaptation of OptMem, the memory architecture by Victor Taelin (https://github.com/VictorTaelin/OptMem)";
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--json` is the one flag, and only `query` and `sparql` take it
+    // (stored-query spec, goodlux 2026-11-27).
+    let json = matches!(args.first().map(String::as_str), Some("query" | "sparql"))
+        && args.iter().any(|x| x == "--json");
+    if json {
+        args.retain(|x| x != "--json");
+    }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
         ["--version"] | ["-V"] => {
@@ -127,13 +148,18 @@ fn main() -> Result<()> {
         _ => {}
     }
     match a.as_slice() {
-        ["query"] => {
-            println!("ravel query [<soul>] \"<sparql>\": ask the transcript graph anything, in SPARQL.\n`ravel query help` shows what can be queried, where it is stored, and three queries that work as written.");
+        ["sparql"] => {
+            println!("ravel sparql [<soul>] \"<sparql>\" [--json]: ask the transcript graph anything, in SPARQL you type.\n`ravel sparql help` shows what can be queried, where it is stored, and three queries that work as written.\nA query saved in your soul runs with `ravel query <name>`.");
             return Ok(());
         }
-        ["query", "help"] => {
+        ["sparql", "help"] | ["query", "help"] => {
             print!("{}", query_help()?);
             return Ok(());
+        }
+        // A script that passed text to `query` is told the fix in one line.
+        ["query", rest @ ..] if rest.iter().any(|x| is_sparql_text(x)) => {
+            eprintln!("That is SPARQL text. `ravel query` runs a stored query by name; run text with `ravel sparql`.");
+            std::process::exit(2);
         }
         _ => {}
     }
@@ -171,8 +197,27 @@ fn main() -> Result<()> {
         ["optmem", s] if !["wake", "open", "recall", "check"].contains(s) => {
             optmem(&client, &resolve(&client, Some(s))?)
         }
-        ["query", q] => query(&client, &resolve(&client, None)?, q),
-        ["query", s, q] => query(&client, &resolve(&client, Some(s))?, q),
+        ["sparql", q] => query(&client, &resolve(&client, None)?, q, json),
+        ["sparql", s, q] => query(&client, &resolve(&client, Some(s))?, q, json),
+        ["query", rest @ ..] => {
+            // A first word that names a soul is the soul, when a query name
+            // follows it or nothing does; otherwise it is the query's name.
+            let (soul, rest) = match rest {
+                [s, more @ ..]
+                    if !s.contains('=')
+                        && more.first().map_or(true, |m| !m.contains('='))
+                        && names_soul(&client, s) =>
+                {
+                    (Some(*s), more)
+                }
+                _ => (None, rest),
+            };
+            let id = resolve(&client, soul)?;
+            match rest {
+                [] => stored_list(&client, &id),
+                [name, params @ ..] => stored_query(&client, &id, name, params, json),
+            }
+        }
         _ => usage(),
     }
 }
@@ -743,13 +788,79 @@ fn optmem_check(client: &Client, id: &str) -> Result<()> {
     std::process::exit(1);
 }
 
-fn query(client: &Client, id: &str, q: &str) -> Result<()> {
+/// Whether a word given to `query` is SPARQL text rather than a query's
+/// name. A name is one word: no space, no brace, no `?variable`.
+fn is_sparql_text(s: &str) -> bool {
+    s.contains(char::is_whitespace) || s.contains('{') || s.trim_start().starts_with('?')
+}
+
+/// `ravel query <name> [k=v ...]`: fetch the stored query from the caller's
+/// soul through gitlexd, parameters bound there, never pasted here; run it
+/// only when its service is ravel.
+fn stored_query(client: &Client, id: &str, name: &str, params: &[&str], json: bool) -> Result<()> {
+    let mut p = serde_json::Map::new();
+    for kv in params {
+        let (k, v) = kv.split_once('=').ok_or_else(|| {
+            anyhow!("{kv:?} is not a parameter. Parameters are name=value, for example since=2026-11-01.")
+        })?;
+        if k.is_empty() {
+            anyhow::bail!("{kv:?} has no parameter name before the =.");
+        }
+        p.insert(k.to_string(), Value::String(v.to_string()));
+    }
+    let q = client
+        .gitlexd()
+        .post(
+            &format!("/git-lex/{id}/query/{name}"),
+            Some(serde_json::json!({ "params": p })),
+        )
+        .with_context(|| format!("gitlexd could not give stored query {name:?}"))?;
+    let service = q["service"].as_str().unwrap_or("");
+    if service != "ravel" {
+        let service = if service.is_empty() { "(no service)" } else { service };
+        eprintln!("This query runs against {service}. Ravel runs only ravel queries.\nRun it with: syrinx query {name}");
+        std::process::exit(2);
+    }
+    let sparql = q["sparql"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gitlexd answered for {name:?} with no SPARQL text"))?;
+    query(client, id, sparql, json)
+}
+
+/// `ravel query` with no name: the stored queries the caller's soul has.
+fn stored_list(client: &Client, id: &str) -> Result<()> {
+    let v = client
+        .gitlexd()
+        .get(&format!("/git-lex/{id}/query"))
+        .context("gitlexd could not list the stored queries")?;
+    let list = v["queries"].as_array().or_else(|| v.as_array()).cloned().unwrap_or_default();
+    for q in &list {
+        println!(
+            "  {:<28} {:<8} {}",
+            q["name"].as_str().unwrap_or("?"),
+            q["service"].as_str().unwrap_or("(none)"),
+            q["title"].as_str().unwrap_or("")
+        );
+    }
+    println!("[{} stored quer{}] run one with: ravel query <name> [name=value ...]", list.len(), if list.len() == 1 { "y" } else { "ies" });
+    Ok(())
+}
+
+fn query(client: &Client, id: &str, q: &str, json: bool) -> Result<()> {
     let v = client.post(
         &format!("/ravel/{id}/query"),
         Some(serde_json::json!({ "query": q })),
     )?;
     for n in v["notes"].as_array().into_iter().flatten() {
         eprintln!("note: {}", n.as_str().unwrap_or(""));
+    }
+    if json {
+        let mut out = v.clone();
+        if let Some(o) = out.as_object_mut() {
+            o.remove("notes");
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
     }
     if let Some(b) = v["boolean"].as_bool() {
         println!("{b}");
@@ -787,7 +898,7 @@ fn query(client: &Client, id: &str, q: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ravel query help`: what a query can ask, read from the ontology built
+/// `ravel sparql help`: what a query can ask, read from the ontology built
 /// into this binary, so it can never drift from what ravel declares. The
 /// layout and the examples are what the ontology cannot say, and what a first
 /// query trips on: without `GRAPH`, nothing matches (goodlux, 2026-11-12).
@@ -849,7 +960,7 @@ fn query_help() -> Result<String> {
         c.trim().to_string()
     };
     let mut out = String::from(
-        "ravel query help: what the transcript graph holds, and how to ask it.\n\n\
+        "ravel sparql help: what the transcript graph holds, and how to ask it.\n\n\
          VOCABULARY (from ravel's ontology; prefix ravel: <https://repolex.ai/ontology/ravel/>)\n",
     );
     let classes: Vec<&String> = terms
@@ -889,7 +1000,7 @@ fn query_help() -> Result<String> {
         }
     }
     out += r#"
-WHERE THINGS ARE STORED (each soul has its own store; `ravel query <soul> ...`)
+WHERE THINGS ARE STORED (each soul has its own store; `ravel sparql <soul> ...`)
   A pattern outside GRAPH sees every graph in the store at once. Write
   GRAPH only to narrow a question to one graph, or to learn which graph a
   thing is in (GRAPH ?g { ... }).
@@ -944,6 +1055,22 @@ THREE QUERIES THAT WORK AS WRITTEN
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_tells_sparql_text_from_a_stored_querys_name() {
+        for text in [
+            "SELECT ?t WHERE { ?t a ?c }",
+            "select*{?s ?p ?o}",
+            "PREFIX ravel: <x>",
+            "ASK{}",
+            "?t",
+        ] {
+            assert!(super::is_sparql_text(text), "{text:?} is text");
+        }
+        for name in ["recent", "kit/recent", "turns-by-day", "select", "since=2026-11-01"] {
+            assert!(!super::is_sparql_text(name), "{name:?} is a name or a parameter");
+        }
+    }
+
     #[test]
     fn a_span_drops_only_a_repeated_year() {
         assert_eq!(super::span("2026-04-03", "2026-04-08"), "2026-04-03..04-08");

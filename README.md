@@ -56,10 +56,10 @@ ravel
 # 2. Inside a soul repo: its backup's health, its store, its memory. Exit 1 means look.
 ravel status
 
-# 3. What the graph holds: `ravel query help` shows every class and property,
+# 3. What the graph holds: `ravel sparql help` shows every class and property,
 #    where things are stored (every pattern goes inside GRAPH), and three examples
-ravel query help
-ravel query 'SELECT (COUNT(DISTINCT ?t) AS ?turns) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }'
+ravel sparql help
+ravel sparql 'SELECT (COUNT(DISTINCT ?t) AS ?turns) WHERE { GRAPH ?g { ?t a <https://repolex.ai/ontology/ravel/Turn> } }'
 
 # 4. Another soul, by its six-character id or a path
 ravel status 700c5b

@@ -1,4 +1,4 @@
-//! A query that arrives from outside: `ravel query` and raveld's query
+//! A query that arrives from outside: `ravel sparql`, `ravel query` and raveld's query
 //! routes. It is prepared here before the store sees it.
 //!
 //! Three things happen, in calamus's order (parse, rewrite, evaluate):
